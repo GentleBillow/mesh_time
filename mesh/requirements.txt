@@ -1,0 +1,4 @@
+aiocoap[all]
+Flask
+gpiozero
+RPi.GPIO

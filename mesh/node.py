@@ -31,11 +31,17 @@ class MeshNode:
             if nid in global_cfg and "ip" in global_cfg[nid]
         }
 
+        # ------------------------------------------------------------------
+        # Sync-Config (global, optional)
+        # ------------------------------------------------------------------
+        sync_cfg = global_cfg.get("sync", {})
+
         # Sync module: handles mesh_time(), beacons, offsets etc.
         self.sync = SyncModule(
             node_id=node_id,
             neighbors=neighbors,
             neighbor_ips=neighbor_ips,
+            sync_cfg=sync_cfg,
         )
 
         # ------------------------------------------------------------------

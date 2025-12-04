@@ -1,4 +1,4 @@
-aiocoap[all]
-Flask
-gpiozero
-RPi.GPIO
+aiocoap==0.4.7
+Flask==2.2.5
+gpiozero==2.0
+RPi.GPIO==0.7.1

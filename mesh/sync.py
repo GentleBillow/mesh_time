@@ -5,29 +5,37 @@ import asyncio
 import random
 import platform
 import math
+import json
 from typing import List, Dict, Optional
 
 import aiocoap
-import json
 
 IS_WINDOWS = platform.system() == "Windows"
 
 
 class SyncModule:
     """
-    Time sync module.
+    Baryzentrische Time-Sync für das Mesh.
 
-    - mesh_time() = monotonic + offset
-    - offset wird aus 4-Timestamp-Messungen zu den Nachbarn geschätzt
-    - Unter Windows ist send_beacons() ein No-Op (Dev-Mode ohne echte Peers)
+    Grundidee:
+      - Jede Node hat eine lokale Zeit: mono(t) = time.monotonic()
+      - Mesh-Zeit:  mesh_time(t) = mono(t) + offset
+      - Die Offsets werden durch paarweise Messungen θ_ij iterativ angepasst.
+
+    Ziel:
+      Minimiere für alle Kanten (i, j):
+
+          Σ w_ij * ( (o_j - o_i) - θ_ij )²
+
+      d.h. die Differenz der Offsets soll zu den gemessenen
+      relativen Offsets θ_ij passen (NTP 4-Timestamp-Schätzung).
 
     Features:
-      - per-peer RTT history
+      - Rolling RTT-Historie pro Peer
       - IQR-basierte Jitter-Schätzung σ_ij
-      - inverse-variance Fusion über alle Peers
-      - slew-limited Offset-Updates
-
-    Parameter kommen (optional) aus einer globalen "sync"-Config.
+      - Gewichtete Updates (1/σ²)
+      - Slew-Limit in Sekunden pro Sekunde
+      - Debug-freundlicher Status-Snapshot
     """
 
     def __init__(
@@ -39,46 +47,51 @@ class SyncModule:
     ):
         self.node_id = node_id
         self.neighbors = neighbors
-        self.neighbor_ips = neighbor_ips  # e.g. {"B": "192.168.1.21", ...}
+        self.neighbor_ips = neighbor_ips
 
         # --------------------------------------------------------------
-        # Parameter aus globaler Config (falls vorhanden)
+        # Konfiguration
         # --------------------------------------------------------------
         if sync_cfg is None:
             sync_cfg = {}
 
-        # Range für zufälligen Start-Offset (± initial_offset_ms)
+        # Zufälliger Start-Offset in ± initial_offset_ms
         initial_offset_ms = float(sync_cfg.get("initial_offset_ms", 200.0))
 
-        # Rolling-Window-Grösse für RTT / Jitter
+        # Rolling-Window-Größe für RTT / Jitter
         self._jitter_window = int(sync_cfg.get("jitter_window", 30))
 
         # Ab wie vielen Samples IQR/σ berechnet wird
-        self._min_samples_for_jitter = int(sync_cfg.get("min_samples_for_jitter", 10))
+        self._min_samples_for_jitter = int(
+            sync_cfg.get("min_samples_for_jitter", 10)
+        )
 
-        # Slew-Limit in ms/s → Sekunden/s
+        # Lernrate η für symmetrisches Update (0 < eta <= 1)
+        self._eta = float(sync_cfg.get("eta", 0.5))
+
+        # Slew-Limit in ms/s -> Sekunden/Sekunde
         max_slew_ms = float(sync_cfg.get("max_slew_per_second_ms", 5.0))
-        self._max_slew_per_second = max_slew_ms / 1000.0  # s Offset pro s
+        self._max_slew_per_second = max_slew_ms / 1000.0
 
         # CoAP-Timeout (Sekunden) für Beacon-Requests
         self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 0.5))
 
-        # Zufälliger Initial-Offset, damit Konvergenz sichtbar ist
+        # Zufälliger Initial-Offset (in Sekunden)
         self._offset = random.uniform(
             -initial_offset_ms / 1000.0,
             +initial_offset_ms / 1000.0,
         )
 
-        # Letzte Offset-Schätzung pro Nachbar (θ_ij)
-        self._peer_offsets: Dict[str, float] = {}
+        # Letzte NTP-Offset-Schätzungen θ_ij pro Nachbar
+        self._peer_offsets = {}  # type: Dict[str, float]
 
-        # Rolling RTT-Samples pro Nachbar (δ_ij)
-        self._peer_rtt_samples: Dict[str, list[float]] = {}
+        # Rolling RTT-Samples pro Nachbar
+        self._peer_rtt_samples = {}  # type: Dict[str, List[float]]
 
         # Geschätzter Jitter σ_ij (Sekunden) pro Nachbar
-        self._peer_sigma: Dict[str, float] = {}
+        self._peer_sigma = {}  # type: Dict[str, float]
 
-        # Für zeitbasierte Slew-Limitierung
+        # Für zeitbasiertes Slew-Limit
         self._last_update_time = time.monotonic()
 
     # ------------------------------------------------------------------
@@ -86,11 +99,18 @@ class SyncModule:
     # ------------------------------------------------------------------
 
     def mesh_time(self) -> float:
-        """Return the node's current mesh time."""
+        """Aktuelle Mesh-Zeit in Sekunden (monotonic + Offset)."""
         return time.monotonic() + self._offset
 
-    def inject_disturbance(self, delta: float):
-        """Chaos-Button: Offset direkt stören (z.B. über /sync/disturb)."""
+    def get_offset(self) -> float:
+        """Aktuellen Offset in Sekunden zurückgeben (für Beacon-Response)."""
+        return self._offset
+
+    def inject_disturbance(self, delta: float) -> None:
+        """
+        Chaos-Button: Offset direkt stören (delta in Sekunden).
+        Praktisch zum Testen der Konvergenz.
+        """
         self._offset += delta
         self._last_update_time = time.monotonic()
         print(
@@ -100,23 +120,61 @@ class SyncModule:
         )
 
     def status_snapshot(self) -> dict:
-        """For /status endpoint."""
+        """
+        Status-Snapshot für /status Endpoint.
+
+        Liefert:
+          - node_id
+          - offset_estimate (Sekunden)
+          - offset_estimate_ms (Millisekunden)
+          - mesh_time
+          - monotonic_now
+          - peer_offsets (θ_ij in s + ms)
+          - peer_sigma (σ_ij in s + ms)
+          - neighbors
+          - sync_config (relevante Parameter)
+        """
+        monotonic_now = time.monotonic()
+
+        peer_offsets_s = dict(self._peer_offsets)
+        peer_offsets_ms = {
+            k: v * 1000.0 for (k, v) in self._peer_offsets.items()
+        }
+
+        peer_sigma_s = dict(self._peer_sigma)
+        peer_sigma_ms = {
+            k: v * 1000.0 for (k, v) in self._peer_sigma.items()
+        }
+
         return {
             "node_id": self.node_id,
             "offset_estimate": self._offset,
-            "mesh_time": self.mesh_time(),   # <--- neu
-            "peer_offsets": self._peer_offsets,
-            "peer_sigma": self._peer_sigma,
-            "neighbors": self.neighbors,
+            "offset_estimate_ms": self._offset * 1000.0,
+            "mesh_time": self.mesh_time(),
+            "monotonic_now": monotonic_now,
+            "peer_offsets": peer_offsets_s,
+            "peer_offsets_ms": peer_offsets_ms,
+            "peer_sigma": peer_sigma_s,
+            "peer_sigma_ms": peer_sigma_ms,
+            "neighbors": list(self.neighbors),
+            "sync_config": {
+                "jitter_window": self._jitter_window,
+                "min_samples_for_jitter": self._min_samples_for_jitter,
+                "eta": self._eta,
+                "max_slew_per_second": self._max_slew_per_second,
+                "coap_timeout_s": self._coap_timeout,
+            },
         }
 
     # ------------------------------------------------------------------
-    # Interne Helfer: Statistik & Fusion
+    # Statistik-Helfer
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_iqr(samples: list) -> float:
-        """Compute IQR (Q3 - Q1) mit einfacher linearer Interpolation."""
+    def _compute_iqr(samples: List[float]) -> float:
+        """
+        Compute IQR (Q3 - Q1) mit einfacher linearer Interpolation.
+        """
         n = len(samples)
         if n < 2:
             return 0.0
@@ -124,7 +182,6 @@ class SyncModule:
         xs = sorted(samples)
 
         def quantile(q: float) -> float:
-            # q in [0,1]
             if n == 1:
                 return xs[0]
             pos = q * (n - 1)
@@ -139,106 +196,98 @@ class SyncModule:
         q3 = quantile(0.75)
         return q3 - q1
 
-    def _update_peer_stats(self, peer: str, theta: float, rtt: float):
+    def _update_rtt_sigma(self, peer: str, rtt: float) -> None:
         """
-        Update per-peer θ_ij, RTT-Historie, Jitter σ_ij
-        und danach globale Offset-Fusion mit Slew-Limit.
-        """
-        # Letzte Offset-Schätzung für diesen Peer
-        self._peer_offsets[peer] = theta
+        Update RTT-Historie und Jitter σ_ij pro Peer.
 
-        # RTT-Historie aktualisieren
+        rtt: Round-Trip-Time in Sekunden.
+        """
         buf = self._peer_rtt_samples.setdefault(peer, [])
         buf.append(rtt)
         if len(buf) > self._jitter_window:
-            buf.pop(0)  # nur die letzten N Werte behalten
+            buf.pop(0)
 
-        # Wenn genug Samples vorhanden sind → σ_ij über IQR schätzen
         if len(buf) >= self._min_samples_for_jitter:
             iqr = self._compute_iqr(buf)
-            # Robuste σ-Schätzung aus IQR (für ungefähr normalverteilten Lärm)
-            sigma = 0.7413 * iqr
-            sigma = max(sigma, 1e-6)  # Degenerates vermeiden
-            self._peer_sigma[peer] = sigma
-        # sonst: alte σ beibehalten (falls vorhanden), Peer wird wie "gleich" gewichtet
+            sigma = 0.7413 * iqr  # IQR -> σ Approximation
+            self._peer_sigma[peer] = max(sigma, 1e-6)
 
-        # Danach globalen Offset neu berechnen
-        self._recompute_fused_offset()
+    # ------------------------------------------------------------------
+    # Symmetrisches Update (Herzstück)
+    # ------------------------------------------------------------------
 
-    def _recompute_fused_offset(self):
+    def _symmetrical_update(self, peer: str, peer_offset: float, theta: float) -> None:
         """
-        Fused Offset θ̂(i) via inverse-variance Fusion:
+        Symmetrisches pairwise Update zur Minimierung von:
 
-            θ̂(i) = Σ_j θ_ij / σ_ij²  /  Σ_j 1 / σ_ij²
+            E_ij = ( (o_j - o_i) - θ_ij )²
 
-        Falls noch keine σ_ij vorhanden → einfacher Mittelwert der Peers.
+        Dabei:
+          - self._offset = o_i
+          - peer_offset  = o_j
+          - theta        = θ_ij (NTP-Schätzung)
 
-        Dann Slew-Limit anwenden: max X ms/s anhand der vergangenen Zeit.
+        error = (o_j - o_i) - θ_ij
+
+        Wir machen einen Gradienten-Schritt in Richtung error
+        und begrenzen ihn per Slew-Limit.
         """
-        if not self._peer_offsets:
-            return  # noch keine Messungen
+        # Fehler relativ zur Messung
+        error = (peer_offset - self._offset) - theta
 
-        # 1) Inverse-Variance-Gewichtung für Peers mit gültigem σ_ij
-        weighted_sum = 0.0
-        weight_total = 0.0
-
-        for peer, theta in self._peer_offsets.items():
-            sigma = self._peer_sigma.get(peer)
-            if sigma is not None and sigma > 1e-6 and math.isfinite(sigma):
-                w = 1.0 / (sigma * sigma)
-                weighted_sum += theta * w
-                weight_total += w
-
-        if weight_total > 0.0:
-            target_offset = weighted_sum / weight_total
+        # Gewichtung nach Link-Qualität (optional)
+        sigma = self._peer_sigma.get(peer)
+        if sigma is not None and sigma > 1e-6:
+            weight = 1.0 / (sigma * sigma)
         else:
-            # 2) Fallback: einfacher Mittelwert aller θ_ij
-            target_offset = sum(self._peer_offsets.values()) / float(len(self._peer_offsets))
+            weight = 1.0
 
-        # 3) Slew-Limit basierend auf vergangener Zeit
+        # Gradient-Schritt
+        delta = self._eta * weight * error
+
+        # Slew-Limit in Abhängigkeit von echter Zeit
         now = time.monotonic()
         dt = now - self._last_update_time
         if dt <= 0.0:
-            dt = 1e-3  # kleine positive Zeit, um Edge-Cases zu vermeiden
+            dt = 1e-3
 
-        max_delta = self._max_slew_per_second * dt  # maximaler Offset-Schritt (Sekunden)
+        max_delta = self._max_slew_per_second * dt
+        if delta > max_delta:
+            delta = max_delta
+        elif delta < -max_delta:
+            delta = -max_delta
 
-        delta = target_offset - self._offset
-        if abs(delta) <= max_delta:
-            # wir können das Ziel direkt erreichen
-            self._offset = target_offset
-        else:
-            # nur max_delta in Richtung Ziel bewegen
-            self._offset += math.copysign(max_delta, delta)
-
+        # Offset anpassen
+        self._offset += delta
         self._last_update_time = now
 
-        # Debug-Ausgabe (bei Bedarf auskommentieren)
         print(
-            "[{}] fused offset update: target={:.2f} ms, new_offset={:.2f} ms, dt={:.3f}s".format(
+            "[{}] sym-update with {}: error={:.3f} ms, delta={:.3f} ms, offset={:.3f} ms".format(
                 self.node_id,
-                target_offset * 1000.0,
+                peer,
+                error * 1000.0,
+                delta * 1000.0,
                 self._offset * 1000.0,
-                dt,
             )
         )
 
     # ------------------------------------------------------------------
-    # Beacon sending (public async API)
+    # Beacon-Versand
     # ------------------------------------------------------------------
 
-    async def send_beacons(self, client_ctx: aiocoap.Context):
+    async def send_beacons(self, client_ctx: aiocoap.Context) -> None:
         """
-        Wird periodisch aus MeshNode.sync_loop() aufgerufen.
+        Periodische Beacons zu allen Nachbarn senden.
 
-        Für jeden Nachbarn:
-          - POST /sync/beacon mit t1 und src id senden
-          - Antwort mit t2, t3 empfangen
-          - t4 lokal messen
-          - θ_ij und δ_ij (RTT) berechnen
-          - Rolling-Statistiken und fused Offset updaten
+        Für jeden Nachbarn j:
+          - t1 = monotonic()
+          - POST /sync/beacon mit {src, dst, t1, offset_i}
+          - Antwort: {t2, t3, offset_j}
+          - t4 = monotonic()
+          - NTP-Formeln -> θ_ij, RTT
+          - Jitter-Update, symmetrisches Offset-Update
 
-        Unter Windows ist das ein No-Op (Dev-Mode).
+        Unter Windows: Dev-Mode -> no-op.
         """
         if IS_WINDOWS:
             return
@@ -255,6 +304,7 @@ class SyncModule:
                 "src": self.node_id,
                 "dst": peer,
                 "t1": t1,
+                "offset": self._offset,
             }
 
             req = aiocoap.Message(
@@ -264,16 +314,17 @@ class SyncModule:
             )
 
             try:
-                # CoAP-Request mit Timeout
                 req_ctx = client_ctx.request(req)
                 resp = await asyncio.wait_for(
                     req_ctx.response,
                     timeout=self._coap_timeout,
                 )
             except asyncio.TimeoutError:
-                print("[{}] beacon to {} timed out after {:.3f}s".format(
-                    self.node_id, peer, self._coap_timeout
-                ))
+                print(
+                    "[{}] beacon to {} timed out after {:.3f}s".format(
+                        self.node_id, peer, self._coap_timeout
+                    )
+                )
                 continue
             except Exception as e:
                 print("[{}] beacon to {} failed: {}".format(self.node_id, peer, e))
@@ -281,33 +332,44 @@ class SyncModule:
 
             t4 = time.monotonic()
 
+            # Antwort dekodieren
             try:
                 data = json.loads(resp.payload.decode("utf-8"))
                 t2 = float(data["t2"])
                 t3 = float(data["t3"])
+                peer_offset = float(data["offset"])
             except Exception as e:
-                print("[{}] invalid beacon reply from {}: {}".format(self.node_id, peer, e))
+                print(
+                    "[{}] invalid beacon reply from {}: {}".format(
+                        self.node_id, peer, e
+                    )
+                )
                 continue
 
-            # NTP-Style 4-Timestamp Formeln
-            rtt = (t4 - t1) - (t3 - t2)            # δ_ij (round-trip minus serverzeit)
-            theta = ((t2 - t1) + (t3 - t4)) / 2.0  # θ_ij (Offset-Schätzung)
+            # NTP-Formeln
+            rtt = (t4 - t1) - (t3 - t2)
+            theta = ((t2 - t1) + (t3 - t4)) / 2.0
 
-            # Per-Peer-Statistiken + fused Offset updaten
-            self._update_peer_stats(peer, theta, rtt)
+            # Statistik-Update
+            self._update_rtt_sigma(peer, rtt)
+            self._peer_offsets[peer] = theta
 
-            # Debug-Ausgabe für diesen Link
-            sigma_str = "n/a"
+            # Symmetrisches Offset-Update
+            self._symmetrical_update(peer, peer_offset, theta)
+
+            # Debug-Kurzsummary
             if peer in self._peer_sigma:
-                sigma_str = "{:.2f} ms".format(self._peer_sigma[peer] * 1000.0)
+                sigma_ms = self._peer_sigma[peer] * 1000.0
+                sigma_str = "{:.3f} ms".format(sigma_ms)
+            else:
+                sigma_str = "n/a"
 
             print(
-                "[{}] sync with {}: theta={:.2f} ms, rtt={:.2f} ms, sigma={}, offset={:.2f} ms".format(
+                "[{}] sync with {}: theta={:.3f} ms, rtt={:.3f} ms, sigma={}".format(
                     self.node_id,
                     peer,
                     theta * 1000.0,
                     rtt * 1000.0,
                     sigma_str,
-                    self._offset * 1000.0,
                 )
             )

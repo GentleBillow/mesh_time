@@ -12,12 +12,29 @@ class SyncBeaconResource(resource.Resource):
     POST /sync/beacon
 
     Request payload (JSON):
-      { "src": "A", "dst": "B", "t1": <float> }
+      {
+        "src": "<sender_node_id>",
+        "dst": "<receiver_node_id>",
+        "t1":  <sender_monotonic>,
+        "offset": <sender_offset_seconds>
+      }
 
     Response payload (JSON):
-      { "src": "B", "dst": "A", "t2": <float>, "t3": <float> }
+      {
+        "src": "<receiver_node_id>",
+        "dst": "<sender_node_id>",
+        "t2":  <receiver_monotonic_before_processing>,
+        "t3":  <receiver_monotonic_before_reply>,
+        "offset": <receiver_offset_seconds>,
 
-    All times are local monotonic seconds (time.monotonic()).
+        # reine Debug-Felder:
+        "receiver_id": "<receiver_node_id>",
+        "sender_id":   "<sender_node_id>",
+        "sender_offset": <sender_offset_seconds>
+      }
+
+    Alle Zeiten sind lokale monotonic-Sekunden (time.monotonic()).
+    Offsets sind Sekunden (float).
     """
 
     def __init__(self, node):
@@ -25,6 +42,7 @@ class SyncBeaconResource(resource.Resource):
         self.node = node
 
     async def render_post(self, request):
+        # t2: Eingang
         t2 = time.monotonic()
 
         try:
@@ -34,8 +52,9 @@ class SyncBeaconResource(resource.Resource):
 
         src = data.get("src", None)
         dst = data.get("dst", self.node.id)
+        sender_offset = data.get("offset", None)
 
-        # t3 = time we send the reply (close to t2, one extra monotonic call)
+        # t3: kurz vor Antwort
         t3 = time.monotonic()
 
         resp_payload = {
@@ -43,6 +62,12 @@ class SyncBeaconResource(resource.Resource):
             "dst": src or "unknown",
             "t2": t2,
             "t3": t3,
+            "offset": self.node.sync.get_offset(),  # <- wichtiger Teil für SyncModule
+
+            # Bonus-Infos für Debugging
+            "receiver_id": self.node.id,
+            "sender_id": src,
+            "sender_offset": sender_offset,
         }
 
         payload_bytes = json.dumps(resp_payload).encode("utf-8")
@@ -62,7 +87,7 @@ class DisturbResource(resource.Resource):
     Payload JSON:
       { "delta": <float seconds> }
 
-    If no payload or invalid, does nothing.
+    delta wird 1:1 an SyncModule.inject_disturbance(delta) weitergegeben.
     """
 
     def __init__(self, node):
@@ -86,7 +111,11 @@ class StatusResource(resource.Resource):
     """
     GET /status
 
-    Returns JSON with current offset, neighbors, etc.
+    Gibt den Status-Snapshot von SyncModule zurück, inkl.
+    - offset_estimate / offset_estimate_ms
+    - mesh_time, monotonic_now
+    - peer_offsets(_ms), peer_sigma(_ms)
+    - neighbors, sync_config
     """
 
     def __init__(self, node):
@@ -109,7 +138,7 @@ class RelayIngestSensorResource(resource.Resource):
     """
     POST /relay/ingest/sensor
 
-    MVP: just print payload. Later, on node C, this will write into SQLite.
+    MVP: einfach Payload loggen. Später auf C -> SQLite.
     """
 
     def __init__(self, node):

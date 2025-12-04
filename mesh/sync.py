@@ -148,9 +148,9 @@ class SyncModule:
 
         return {
             "node_id": self.node_id,
+            "mesh_time": self.mesh_time(),
             "offset_estimate": self._offset,
             "offset_estimate_ms": self._offset * 1000.0,
-            "mesh_time": self.mesh_time(),
             "monotonic_now": monotonic_now,
             "peer_offsets": peer_offsets_s,
             "peer_offsets_ms": peer_offsets_ms,
@@ -233,7 +233,7 @@ class SyncModule:
         und begrenzen ihn per Slew-Limit.
         """
         # Fehler relativ zur Messung
-        error = (peer_offset - self._offset) - theta
+        error = (peer_offset - self._offset) + theta
 
         # Gewichtung nach Link-Qualität (optional)
         sigma = self._peer_sigma.get(peer)

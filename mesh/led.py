@@ -9,12 +9,12 @@ class DummyLED:
     On a real Pi, this will wrap a GPIO LED instead.
     """
 
-    def __init__(self, pin: int):
+    def __init__(self, pin):
         self.pin = pin
         self._last_state = False
         self._last_print = 0.0
 
-    def update(self, t_mesh: float, period: float = 0.5, epsilon: float = 0.01):
+    def update(self, t_mesh, period=0.5, epsilon=0.01):
         """
         Blink when mesh time crosses multiples of 'period' seconds.
         Here we just print transitions, not a continuous on/off signal.
@@ -26,7 +26,7 @@ class DummyLED:
 
         now = time.time()
         if on and not self._last_state and (now - self._last_print) > 0.1:
-            print(f"[LED pin {self.pin}] BLINK at mesh_time={t_mesh:.3f}")
+            print("[LED pin {}] BLINK at mesh_time={:.3f}".format(self.pin, t_mesh))
             self._last_print = now
 
         self._last_state = on

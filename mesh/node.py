@@ -2,7 +2,7 @@
 
 import asyncio
 import platform
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import aiocoap
 
@@ -60,8 +60,8 @@ class MeshNode:
         self._stop = asyncio.Event()
 
         # CoAP server + client contexts
-        self._coap_ctx: aiocoap.Context | None = None
-        self._coap_client_ctx: aiocoap.Context | None = None
+        self._coap_ctx = None  # type: Optional[aiocoap.Context]
+        self._coap_client_ctx = None  # type: Optional[aiocoap.Context]
 
     # ----------------------------------------------------------------------
     # Async loops
@@ -73,7 +73,7 @@ class MeshNode:
         On Windows, send_beacons() is effectively a no-op (guarded in SyncModule),
         so the loop still runs but doesn’t touch the network.
         """
-        print(f"[{self.id}] sync_loop started")
+        print("[{}] sync_loop started".format(self.id))
         while not self._stop.is_set():
             if self._coap_client_ctx is not None:
                 await self.sync.send_beacons(self._coap_client_ctx)
@@ -84,18 +84,22 @@ class MeshNode:
         Sample the sensor periodically and (later) forward readings.
         For now, just print them with mesh timestamps.
         """
-        print(f"[{self.id}] sensor_loop started")
+        print("[{}] sensor_loop started".format(self.id))
         while not self._stop.is_set():
             value = self.sensor.read()
             t_mesh = self.sync.mesh_time()
-            print(f"[{self.id}] sensor reading: value={value:.3f}, t_mesh={t_mesh:.3f}")
+            print(
+                "[{}] sensor reading: value={:.3f}, t_mesh={:.3f}".format(
+                    self.id, value, t_mesh
+                )
+            )
             await asyncio.sleep(1.0)
 
     async def led_loop(self):
         """
         Update LED blink based on mesh time every 10 ms.
         """
-        print(f"[{self.id}] led_loop started")
+        print("[{}] led_loop started".format(self.id))
         while not self._stop.is_set():
             t_mesh = self.sync.mesh_time()
             self.led.update(t_mesh)
@@ -109,7 +113,7 @@ class MeshNode:
         in that case we just skip the server so the rest of the node can run.
         """
         if IS_WINDOWS:
-            print(f"[{self.id}] Windows dev mode: skipping CoAP server startup")
+            print("[{}] Windows dev mode: skipping CoAP server startup".format(self.id))
             # Just sleep forever; keeps the task alive
             while True:
                 await asyncio.sleep(3600)
@@ -120,10 +124,10 @@ class MeshNode:
         try:
             # Let aiocoap choose the right bind config for the platform
             self._coap_ctx = await aiocoap.Context.create_server_context(site)
-            print(f"[{self.id}] CoAP server started on udp/5683")
+            print("[{}] CoAP server started on udp/5683".format(self.id))
             await asyncio.Future()  # run forever
         except Exception as e:
-            print(f"[{self.id}] Failed to start CoAP server: {e}")
+            print("[{}] Failed to start CoAP server: {}".format(self.id, e))
             # Fallback: keep going without CoAP, but don't crash the node
             while True:
                 await asyncio.sleep(3600)
@@ -132,16 +136,16 @@ class MeshNode:
         """
         Start all node tasks.
         """
-        print(f"[{self.id}] MeshNode starting with cfg: {self.cfg}")
+        print("[{}] MeshNode starting with cfg: {}".format(self.id, self.cfg))
 
         # --------------------------------------------------------------
         # 1) Create CoAP CLIENT context (for outgoing POSTs)
         # --------------------------------------------------------------
         try:
             self._coap_client_ctx = await aiocoap.Context.create_client_context()
-            print(f"[{self.id}] CoAP client context created")
+            print("[{}] CoAP client context created".format(self.id))
         except Exception as e:
-            print(f"[{self.id}] Failed to create CoAP client context: {e}")
+            print("[{}] Failed to create CoAP client context: {}".format(self.id, e))
             self._coap_client_ctx = None
 
         # --------------------------------------------------------------
@@ -158,4 +162,4 @@ class MeshNode:
         try:
             asyncio.run(self.run_async())
         except KeyboardInterrupt:
-            print(f"[{self.id}] shutting down (KeyboardInterrupt)")
+            print("[{}] shutting down (KeyboardInterrupt)".format(self.id))

@@ -21,7 +21,7 @@ class SyncBeaconResource(resource.Resource):
     """
 
     def __init__(self, node):
-        super().__init__()
+        super(SyncBeaconResource, self).__init__()
         self.node = node
 
     async def render_post(self, request):
@@ -66,7 +66,7 @@ class DisturbResource(resource.Resource):
     """
 
     def __init__(self, node):
-        super().__init__()
+        super(DisturbResource, self).__init__()
         self.node = node
 
     async def render_post(self, request):
@@ -90,7 +90,7 @@ class StatusResource(resource.Resource):
     """
 
     def __init__(self, node):
-        super().__init__()
+        super(StatusResource, self).__init__()
         self.node = node
 
     async def render_get(self, request):
@@ -113,7 +113,7 @@ class RelayIngestSensorResource(resource.Resource):
     """
 
     def __init__(self, node):
-        super().__init__()
+        super(RelayIngestSensorResource, self).__init__()
         self.node = node
 
     async def render_post(self, request):
@@ -122,12 +122,12 @@ class RelayIngestSensorResource(resource.Resource):
         except Exception:
             data = {}
 
-        print(f"[{self.node.id}] relay/ingest/sensor: {data}")
+        print("[{}] relay/ingest/sensor: {}".format(self.node.id, data))
 
         return aiocoap.Message(code=aiocoap.CHANGED)
 
 
-def build_site(node) -> resource.Site:
+def build_site(node):
     """
     Build the CoAP resource tree for a node.
     """

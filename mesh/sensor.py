@@ -2,7 +2,6 @@
 
 import math
 import time
-from typing import Optional
 
 
 class DummySensor:
@@ -12,11 +11,11 @@ class DummySensor:
     Useful for testing the data path & plotting.
     """
 
-    def __init__(self, sensor_type: str = "dummy"):
+    def __init__(self, sensor_type="dummy"):
         self.sensor_type = sensor_type
         self._start = time.monotonic()
 
-    def read(self) -> float:
+    def read(self):
         t = time.monotonic() - self._start
         # slow sine wave, period ~60s
         value = 10.0 + 5.0 * math.sin(2 * math.pi * t / 60.0)

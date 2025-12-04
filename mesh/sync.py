@@ -4,7 +4,7 @@ import time
 import random
 import platform
 import math
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import aiocoap
 import json
@@ -34,7 +34,7 @@ class SyncModule:
         node_id: str,
         neighbors: List[str],
         neighbor_ips: Dict[str, str],
-        sync_cfg: Dict[str, float] | None = None,
+        sync_cfg: Optional[Dict[str, float]] = None,
     ):
         self.node_id = node_id
         self.neighbors = neighbors
@@ -90,8 +90,9 @@ class SyncModule:
         self._offset += delta
         self._last_update_time = time.monotonic()
         print(
-            f"[{self.node_id}] inject_disturbance: delta={delta*1000:.1f} ms, "
-            f"new offset={self._offset*1000:.1f} ms"
+            "[{}] inject_disturbance: delta={:.1f} ms, new offset={:.1f} ms".format(
+                self.node_id, delta * 1000.0, self._offset * 1000.0
+            )
         )
 
     def status_snapshot(self) -> dict:
@@ -109,7 +110,7 @@ class SyncModule:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_iqr(samples: list[float]) -> float:
+    def _compute_iqr(samples: list) -> float:
         """Compute IQR (Q3 - Q1) mit einfacher linearer Interpolation."""
         n = len(samples)
         if n < 2:
@@ -187,7 +188,7 @@ class SyncModule:
             target_offset = weighted_sum / weight_total
         else:
             # 2) Fallback: einfacher Mittelwert aller θ_ij
-            target_offset = sum(self._peer_offsets.values()) / len(self._peer_offsets)
+            target_offset = sum(self._peer_offsets.values()) / float(len(self._peer_offsets))
 
         # 3) Slew-Limit basierend auf vergangener Zeit
         now = time.monotonic()
@@ -209,10 +210,12 @@ class SyncModule:
 
         # Debug-Ausgabe (bei Bedarf auskommentieren)
         print(
-            f"[{self.node_id}] fused offset update: "
-            f"target={target_offset*1000:.2f} ms, "
-            f"new_offset={self._offset*1000:.2f} ms, "
-            f"dt={dt:.3f}s"
+            "[{}] fused offset update: target={:.2f} ms, new_offset={:.2f} ms, dt={:.3f}s".format(
+                self.node_id,
+                target_offset * 1000.0,
+                self._offset * 1000.0,
+                dt,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -240,7 +243,7 @@ class SyncModule:
             if not ip:
                 continue
 
-            uri = f"coap://{ip}/sync/beacon"
+            uri = "coap://{}/sync/beacon".format(ip)
 
             t1 = time.monotonic()
             payload = {
@@ -258,7 +261,7 @@ class SyncModule:
             try:
                 resp = await client_ctx.request(req).response
             except Exception as e:
-                print(f"[{self.node_id}] beacon to {peer} failed: {e}")
+                print("[{}] beacon to {} failed: {}".format(self.node_id, peer, e))
                 continue
 
             t4 = time.monotonic()
@@ -268,11 +271,11 @@ class SyncModule:
                 t2 = float(data["t2"])
                 t3 = float(data["t3"])
             except Exception as e:
-                print(f"[{self.node_id}] invalid beacon reply from {peer}: {e}")
+                print("[{}] invalid beacon reply from {}: {}".format(self.node_id, peer, e))
                 continue
 
             # NTP-Style 4-Timestamp Formeln
-            rtt = (t4 - t1) - (t3 - t2)           # δ_ij (round-trip minus serverzeit)
+            rtt = (t4 - t1) - (t3 - t2)            # δ_ij (round-trip minus serverzeit)
             theta = ((t2 - t1) + (t3 - t4)) / 2.0  # θ_ij (Offset-Schätzung)
 
             # Per-Peer-Statistiken + fused Offset updaten
@@ -281,12 +284,15 @@ class SyncModule:
             # Debug-Ausgabe für diesen Link
             sigma_str = "n/a"
             if peer in self._peer_sigma:
-                sigma_str = f"{self._peer_sigma[peer]*1000:.2f} ms"
+                sigma_str = "{:.2f} ms".format(self._peer_sigma[peer] * 1000.0)
 
             print(
-                f"[{self.node_id}] sync with {peer}: "
-                f"theta={theta*1000:.2f} ms, "
-                f"rtt={rtt*1000:.2f} ms, "
-                f"sigma={sigma_str}, "
-                f"offset={self._offset*1000:.2f} ms"
+                "[{}] sync with {}: theta={:.2f} ms, rtt={:.2f} ms, sigma={}, offset={:.2f} ms".format(
+                    self.node_id,
+                    peer,
+                    theta * 1000.0,
+                    rtt * 1000.0,
+                    sigma_str,
+                    self._offset * 1000.0,
+                )
             )

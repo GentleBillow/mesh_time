@@ -1,6 +1,7 @@
 # mesh/sync.py
 
 import time
+import asyncio
 import random
 import platform
 import math
@@ -58,6 +59,9 @@ class SyncModule:
         # Slew-Limit in ms/s → Sekunden/s
         max_slew_ms = float(sync_cfg.get("max_slew_per_second_ms", 5.0))
         self._max_slew_per_second = max_slew_ms / 1000.0  # s Offset pro s
+
+        # CoAP-Timeout (Sekunden) für Beacon-Requests
+        self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 0.5))
 
         # Zufälliger Initial-Offset, damit Konvergenz sichtbar ist
         self._offset = random.uniform(
@@ -259,7 +263,17 @@ class SyncModule:
             )
 
             try:
-                resp = await client_ctx.request(req).response
+                # CoAP-Request mit Timeout
+                req_ctx = client_ctx.request(req)
+                resp = await asyncio.wait_for(
+                    req_ctx.response,
+                    timeout=self._coap_timeout,
+                )
+            except asyncio.TimeoutError:
+                print("[{}] beacon to {} timed out after {:.3f}s".format(
+                    self.node_id, peer, self._coap_timeout
+                ))
+                continue
             except Exception as e:
                 print("[{}] beacon to {} failed: {}".format(self.node_id, peer, e))
                 continue

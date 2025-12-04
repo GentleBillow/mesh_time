@@ -100,10 +100,11 @@ class SyncModule:
         )
 
     def status_snapshot(self) -> dict:
-        """Für /status Endpoint."""
+        """For /status endpoint."""
         return {
             "node_id": self.node_id,
             "offset_estimate": self._offset,
+            "mesh_time": self.mesh_time(),   # <--- neu
             "peer_offsets": self._peer_offsets,
             "peer_sigma": self._peer_sigma,
             "neighbors": self.neighbors,

@@ -225,17 +225,19 @@ class SyncModule:
         """
         Symmetrisches pairwise Update zur Minimierung von:
 
-            E_ij = ( (o_j - o_i) - θ_ij )²
+            E_ij = ( (o_i - o_j) - θ_ij )²
 
-        Dabei:
-          - self._offset = o_i
-          - peer_offset  = o_j
-          - theta        = θ_ij (NTP-Schätzung)
+        Idealbedingung:
+            off_i - off_j ≈ θ_ij
 
-        error = (o_j - o_i) - θ_ij
+        Wir machen einen Gradienten-Schritt auf o_i:
+
+            error = (off_i - off_j) - θ_ij
+            off_i <- off_i - η * w * error
         """
-        # Fehler relativ zur Messung (KORRIGIERTES VORZEICHEN)
-        error = (peer_offset - self._offset) - theta
+
+        # Fehler relativ zur Zielbedingung off_i - off_j ≈ θ_ij
+        error = (self._offset - peer_offset) - theta
 
         # Gewichtung nach Link-Qualität (optional)
         sigma = self._peer_sigma.get(peer)
@@ -244,8 +246,8 @@ class SyncModule:
         else:
             weight = 1.0
 
-        # Gradient-Schritt
-        delta = self._eta * weight * error
+        # Gradient-Schritt in *negative* Fehler-Richtung
+        delta = -self._eta * weight * error
 
         # Slew-Limit in Abhängigkeit von echter Zeit
         now = time.monotonic()
@@ -261,6 +263,18 @@ class SyncModule:
 
         # Offset anpassen
         self._offset += delta
+        self._last_update_time = now
+
+        print(
+            "[{}] sym-update with {}: error={:.3f} ms, delta={:.3f} ms, offset={:.3f} ms".format(
+                self.node_id,
+                peer,
+                error * 1000.0,
+                delta * 1000.0,
+                self._offset * 1000.0,
+            )
+        )
+
 
         # --- Globaler Drift-Dämpfer: offset sanft gegen 0 ziehen ---
         if self._drift_damping > 0.0:

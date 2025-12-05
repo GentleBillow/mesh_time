@@ -1,12 +1,12 @@
 {
     "sync": {
-      "jitter_window": 30,
+      "jitter_window": 50,
       "min_samples_for_jitter": 10,
-      "max_slew_per_second_ms": 200.0,
+      "max_slew_per_second_ms": 5.0,
       "initial_offset_ms": 200.0,
-      "eta": 1,
+      "eta": 0.3,
       "coap_timeout_s": 0.5,
-      "drift_damping": 0.0
+      "drift_damping": 0.001
     },
 
   "A": {

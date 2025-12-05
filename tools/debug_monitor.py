@@ -3,251 +3,177 @@
 
 import asyncio
 import json
-import argparse
+import sys
+import time
 from pathlib import Path
-from typing import Dict, Any
 
 import aiocoap
-
 from rich.console import Console
-from rich.table import Table
 from rich.live import Live
-
+from rich.table import Table
 
 console = Console()
 
+# ------------------------------------------------------------
+# Config-Handling: suche nach config.json ODER config/nodes.json
+# ------------------------------------------------------------
 
-async def fetch_status(
-    client_ctx: aiocoap.Context,
-    node_id: str,
-    ip: str,
-    timeout: float,
-) -> Dict[str, Any]:
+CONFIG_CANDIDATES = [
+    Path("config.json"),
+    Path("config/nodes.json"),
+    Path("nodes.json"),
+]
+
+
+def load_config():
+    for path in CONFIG_CANDIDATES:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            console.print(f"[green]Using config:[/green] {path}")
+            return cfg, path
+    console.print("[red]Config not found:[/red] tried " +
+                  ", ".join(str(p) for p in CONFIG_CANDIDATES))
+    sys.exit(1)
+
+
+def extract_nodes(cfg: dict) -> dict:
     """
-    Hole /status von einem Node.
-    Gibt immer ein Dict zurück, mit _ok Flag und optional _error.
+    Erzeugt ein dict {node_id: ip} aus deinem nodes.json Layout.
+
+    Erwartet:
+      - ein "sync"-Block oben
+      - dann A, B, C, D... mit jeweils "ip"
     """
+    nodes = {}
+    for key, value in cfg.items():
+        if key == "sync":
+            continue
+        if isinstance(value, dict) and "ip" in value:
+            nodes[key] = value["ip"]
+    return nodes
+
+
+# ------------------------------------------------------------
+# CoAP Status holen
+# ------------------------------------------------------------
+
+async def fetch_status(client_ctx: aiocoap.Context, node_id: str, ip: str, timeout: float = 0.7):
     uri = f"coap://{ip}/status"
     req = aiocoap.Message(code=aiocoap.GET, uri=uri)
-
     try:
         req_ctx = client_ctx.request(req)
         resp = await asyncio.wait_for(req_ctx.response, timeout=timeout)
         data = json.loads(resp.payload.decode("utf-8"))
         data["_ok"] = True
         data["_ip"] = ip
-        return data
+        return node_id, data
     except Exception as e:
-        return {
-            "node_id": node_id,
+        return node_id, {
             "_ok": False,
             "_ip": ip,
-            "_error": str(e),
+            "error": str(e),
         }
 
 
-def build_table(snapshots):
-    """
-    Baut eine hübsche Tabelle aus den Snapshots.
-    """
-    table = Table(title="Mesh Time Debug Monitor", show_lines=False)
+# ------------------------------------------------------------
+# Darstellung als Tabelle
+# ------------------------------------------------------------
+
+def build_table(status_by_node: dict) -> Table:
+    table = Table(title="Mesh Time Sync Monitor", expand=True)
 
     table.add_column("Node", style="bold")
     table.add_column("IP")
-    table.add_column("mesh_time", justify="right")
-    table.add_column("Δmesh [ms]", justify="right")
-    table.add_column("offset [ms]", justify="right")
-    table.add_column("peers θ [ms]", justify="left")
-    table.add_column("peers σ [ms]", justify="left")
-    table.add_column("status", justify="left")
+    table.add_column("OK?")
+    table.add_column("mesh_time [s]")
+    table.add_column("offset [ms]")
+    table.add_column("Δmono-mesh [ms]")
+    table.add_column("peers θ [ms]")
+    table.add_column("σ [ms]")
 
-    # Nur erfolgreiche Snapshots für Referenz-Δ
-    valid = [s for s in snapshots if s.get("_ok")]
-    if valid:
-        min_mesh = min(s.get("mesh_time", 0.0) for s in valid)
-    else:
-        min_mesh = 0.0
+    now = time.time()
 
-    for snap in snapshots:
-        node_id = snap.get("node_id", "?")
-        ip = snap.get("_ip", "?")
+    for node_id, st in sorted(status_by_node.items()):
+        ip = st.get("_ip", "?")
 
-        if not snap.get("_ok", False):
+        if not st.get("_ok", False):
             table.add_row(
                 node_id,
                 ip,
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                f"[red]ERROR: {snap.get('_error', 'no response')}[/red]",
+                "[red]NO[/red]",
+                "-", "-", "-", "-",
+                st.get("error", "?"),
             )
             continue
 
-        mesh_time = snap.get("mesh_time", 0.0)
-        offset_s = snap.get("offset_estimate", 0.0)
-        offset_ms = snap.get("offset_estimate_ms", offset_s * 1000.0)
+        mesh_time = st.get("mesh_time", 0.0)
+        offset = st.get("offset_estimate", 0.0)
+        mono_now = st.get("monotonic_now", 0.0)
+        delta_mono_mesh_ms = (mesh_time - mono_now) * 1000.0
 
-        # Δmesh in ms relativ zum minimalen mesh_time
-        delta_mesh_ms = (mesh_time - min_mesh) * 1000.0
+        peers = st.get("peer_offsets_ms") or {}
+        sigmas = st.get("peer_sigma_ms") or {}
 
-        # Peer-Offsets & Sigma (ms)
-        peer_offsets_ms = snap.get("peer_offsets_ms")
-        if peer_offsets_ms is None:
-            # Fallback: aus Sekunden rechnen, falls nur peer_offsets vorhanden
-            peer_offsets = snap.get("peer_offsets", {})
-            peer_offsets_ms = {k: v * 1000.0 for k, v in peer_offsets.items()}
-
-        peer_sigma_ms = snap.get("peer_sigma_ms")
-        if peer_sigma_ms is None:
-            peer_sigma = snap.get("peer_sigma", {})
-            peer_sigma_ms = {k: v * 1000.0 for k, v in peer_sigma.items()}
-
-        if peer_offsets_ms:
-            peers_theta_str = ", ".join(
-                f"{peer}:{val:.2f}"
-                for peer, val in sorted(peer_offsets_ms.items())
-            )
-        else:
-            peers_theta_str = "-"
-
-        if peer_sigma_ms:
-            peers_sigma_str = ", ".join(
-                f"{peer}:{val:.2f}"
-                for peer, val in sorted(peer_sigma_ms.items())
-            )
-        else:
-            peers_sigma_str = "-"
-
-        status_str = "[green]OK[/green]"
+        peers_str = ", ".join(f"{k}:{v:.1f}" for k, v in peers.items()) or "-"
+        sigma_str = ", ".join(f"{k}:{v:.2f}" for k, v in sigmas.items()) or "-"
 
         table.add_row(
             node_id,
             ip,
-            f"{mesh_time:.3f}",
-            f"{delta_mesh_ms:.2f}",
-            f"{offset_ms:.2f}",
-            peers_theta_str,
-            peers_sigma_str,
-            status_str,
+            "[green]OK[/green]",
+            f"{mesh_time:10.3f}",
+            f"{offset*1000.0:8.1f}",
+            f"{delta_mono_mesh_ms:8.1f}",
+            peers_str,
+            sigma_str,
         )
 
     return table
 
 
-def load_config(config_path: Path) -> Dict[str, Any]:
-    """
-    Lädt die globale Mesh-Config (die gleiche, die du für run_node.py nutzt).
-    Erwartet eine JSON-Map { "A": {...}, "B": {...}, "sync": {...}, ... }.
-    """
-    data = json.loads(config_path.read_text(encoding="utf-8"))
-    return data
+# ------------------------------------------------------------
+# Main-Loop
+# ------------------------------------------------------------
 
+async def monitor_loop():
+    cfg, cfg_path = load_config()
+    nodes = extract_nodes(cfg)
 
-def extract_nodes(global_cfg: Dict[str, Any], only_nodes=None) -> Dict[str, str]:
-    """
-    Extrahiert Node→IP Map aus der globalen Config.
-    expected:
-      {
-        "A": {"ip": "172.16.32.x", ...},
-        "B": {"ip": "172.16.32.y", ...},
-        "sync": {...}
-      }
-    """
-    nodes = {}
-    for nid, cfg in global_cfg.items():
-        if nid == "sync":
-            continue
-        if only_nodes is not None and nid not in only_nodes:
-            continue
-        if isinstance(cfg, dict) and "ip" in cfg:
-            nodes[nid] = cfg["ip"]
-
-    return nodes
-
-
-async def main_async(args):
-    config_path = Path(args.config).expanduser()
-    if not config_path.exists():
-        console.print(f"[red]Config not found:[/red] {config_path}")
-        return
-
-    global_cfg = load_config(config_path)
-
-    only_nodes = None
-    if args.nodes:
-        only_nodes = args.nodes.split(",")
-
-    nodes = extract_nodes(global_cfg, only_nodes=only_nodes)
     if not nodes:
         console.print("[red]No nodes with 'ip' found in config.[/red]")
-        return
+        sys.exit(1)
 
-    console.print(
-        f"[bold]Monitoring nodes:[/bold] "
-        + ", ".join(f"{nid}@{ip}" for nid, ip in nodes.items())
-    )
-    console.print(f"Interval: {args.interval:.2f}s, Timeout: {args.timeout:.2f}s")
-    console.print("Press Ctrl+C to stop.\n")
+    console.print("[cyan]Monitoring nodes:[/cyan] " +
+                  ", ".join(f"{nid}({ip})" for nid, ip in nodes.items()))
 
-    client_ctx = await aiocoap.Context.create_client_context()
+    refresh_interval = 1.0
 
-    try:
-        with Live(console=console, refresh_per_second=4) as live:
+    async with aiocoap.Context.create_client_context() as client_ctx:
+        status_by_node = {}
+
+        with Live(refresh_per_second=4, console=console) as live:
             while True:
                 tasks = [
-                    fetch_status(client_ctx, nid, ip, args.timeout)
+                    fetch_status(client_ctx, nid, ip)
                     for nid, ip in nodes.items()
                 ]
-                snapshots = await asyncio.gather(*tasks, return_exceptions=False)
-                table = build_table(snapshots)
+                results = await asyncio.gather(*tasks)
+
+                for nid, st in results:
+                    status_by_node[nid] = st
+
+                table = build_table(status_by_node)
                 live.update(table)
-                await asyncio.sleep(args.interval)
-    except KeyboardInterrupt:
-        console.print("\n[bold]Stopping monitor (KeyboardInterrupt).[/bold]")
-    finally:
-        try:
-            await client_ctx.shutdown()
-        except Exception:
-            pass
+
+                await asyncio.sleep(refresh_interval)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Live Mesh Time Debug Monitor (CoAP /status)"
-    )
-    parser.add_argument(
-        "--config",
-        "-c",
-        type=str,
-        default="config.json",
-        help="Path to global mesh config JSON (default: config.json)",
-    )
-    parser.add_argument(
-        "--nodes",
-        "-n",
-        type=str,
-        default="",
-        help="Comma-separated list of node IDs to monitor (default: all in config)",
-    )
-    parser.add_argument(
-        "--interval",
-        "-i",
-        type=float,
-        default=1.0,
-        help="Polling interval in seconds (default: 1.0)",
-    )
-    parser.add_argument(
-        "--timeout",
-        "-t",
-        type=float,
-        default=0.5,
-        help="CoAP timeout per request in seconds (default: 0.5)",
-    )
-
-    args = parser.parse_args()
-    asyncio.run(main_async(args))
+    try:
+        asyncio.run(monitor_loop())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Stopped by user.[/yellow]")
 
 
 if __name__ == "__main__":

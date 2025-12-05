@@ -3,7 +3,7 @@
       "jitter_window": 30,
       "min_samples_for_jitter": 10,
       "max_slew_per_second_ms": 20.0,
-      "initial_offset_ms": 200.0,
+      "initial_offset_ms": 150000.0,
       "eta": 0.5,
       "coap_timeout_s": 0.5
 },

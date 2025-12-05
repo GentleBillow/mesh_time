@@ -36,6 +36,7 @@ class SyncModule:
       - IQR-basierte Jitter-Schätzung σ_ij
       - Gewichtete Updates (1/σ²)
       - Slew-Limit in Sekunden pro Sekunde
+      - Optionaler Drift-Dämpfer: Offsets werden sanft gegen 0 gezogen
       - Debug-freundlicher Status-Snapshot
     """
 
@@ -77,6 +78,9 @@ class SyncModule:
         # CoAP-Timeout (Sekunden) für Beacon-Requests
         self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 0.5))
 
+        # Globaler Drift-Dämpfer (0 = aus, 0.001 = 0.1% pro Update)
+        self._drift_damping = float(sync_cfg.get("drift_damping", 0.001))
+
         # Zufälliger Initial-Offset (in Sekunden)
         self._offset = random.uniform(
             -initial_offset_ms / 1000.0,
@@ -84,13 +88,13 @@ class SyncModule:
         )
 
         # Letzte NTP-Offset-Schätzungen θ_ij pro Nachbar
-        self._peer_offsets = {}  # type: Dict[str, float]
+        self._peer_offsets: Dict[str, float] = {}
 
         # Rolling RTT-Samples pro Nachbar
-        self._peer_rtt_samples = {}  # type: Dict[str, List[float]]
+        self._peer_rtt_samples: Dict[str, List[float]] = {}
 
         # Geschätzter Jitter σ_ij (Sekunden) pro Nachbar
-        self._peer_sigma = {}  # type: Dict[str, float]
+        self._peer_sigma: Dict[str, float] = {}
 
         # Für zeitbasiertes Slew-Limit
         self._last_update_time = time.monotonic()
@@ -126,8 +130,7 @@ class SyncModule:
 
         Liefert:
           - node_id
-          - offset_estimate (Sekunden)
-          - offset_estimate_ms (Millisekunden)
+          - offset_estimate (Sekunden + ms)
           - mesh_time
           - monotonic_now
           - peer_offsets (θ_ij in s + ms)
@@ -164,6 +167,7 @@ class SyncModule:
                 "eta": self._eta,
                 "max_slew_per_second": self._max_slew_per_second,
                 "coap_timeout_s": self._coap_timeout,
+                "drift_damping": self._drift_damping,
             },
         }
 
@@ -229,12 +233,9 @@ class SyncModule:
           - theta        = θ_ij (NTP-Schätzung)
 
         error = (o_j - o_i) - θ_ij
-
-        Wir machen einen Gradienten-Schritt in Richtung error
-        und begrenzen ihn per Slew-Limit.
         """
-        # Fehler relativ zur Messung
-        error = (peer_offset - self._offset) + theta
+        # Fehler relativ zur Messung (KORRIGIERTES VORZEICHEN)
+        error = (peer_offset - self._offset) - theta
 
         # Gewichtung nach Link-Qualität (optional)
         sigma = self._peer_sigma.get(peer)
@@ -260,6 +261,19 @@ class SyncModule:
 
         # Offset anpassen
         self._offset += delta
+
+        # --- Globaler Drift-Dämpfer: offset sanft gegen 0 ziehen ---
+        if self._drift_damping > 0.0:
+            # offset_i ← offset_i - η_global * offset_i
+            #          = offset_i * (1 - η_global)
+            before = self._offset
+            self._offset *= (1.0 - self._drift_damping)
+            after = self._offset
+            # Optional: sehr kompakte Debug-Ausgabe
+            # print("[{}] drift-damp: {:.3f} ms -> {:.3f} ms".format(
+            #     self.node_id, before * 1000.0, after * 1000.0
+            # ))
+
         self._last_update_time = now
 
         print(

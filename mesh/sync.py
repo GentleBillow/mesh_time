@@ -51,6 +51,14 @@ class SyncModule:
         self.neighbors = neighbors
         self.neighbor_ips = neighbor_ips
 
+        # Bootstrap-Flag: einmaliger harter Sprung in die "richtige Region"
+        self._bootstrapped = False
+
+        # Optionaler Bootstrap-Threshold, um völlig kaputte Messungen zu ignorieren
+        self._bootstrap_theta_max = float(sync_cfg.get("bootstrap_theta_max_s", 1.0))
+        # 1.0 s = wir erlauben einen harten Sprung, solange |theta| < 1s
+
+
         # --------------------------------------------------------------
         # Konfiguration
         # --------------------------------------------------------------
@@ -216,6 +224,42 @@ class SyncModule:
             iqr = self._compute_iqr(buf)
             sigma = 0.7413 * iqr  # IQR -> σ Approximation
             self._peer_sigma[peer] = max(sigma, 1e-6)
+
+    def _try_bootstrap(self, peer: str, peer_offset: float, theta: float) -> bool:
+        """
+        Führt einmalig einen harten Bootstrap-Schritt aus, wenn:
+          - noch nicht gebootstrapped
+          - |theta| < bootstrap_theta_max_s (Messung scheint plausibel)
+
+        Setzt o_i so, dass (peer_offset - o_i) + theta ≈ 0 gilt:
+            o_i = peer_offset + theta
+
+        Gibt True zurück, wenn Bootstrap gemacht wurde.
+        """
+        if self._bootstrapped:
+            return False
+
+        if abs(theta) > self._bootstrap_theta_max:
+            # Messung zu wild, kein Bootstrap
+            return False
+
+        new_offset = peer_offset + theta
+        old_offset = self._offset
+        self._offset = new_offset
+        self._last_update_time = time.monotonic()
+        self._bootstrapped = True
+
+        print(
+            "[{}] BOOTSTRAP with {}: theta={:.3f} ms, old_offset={:.3f} ms, new_offset={:.3f} ms".format(
+                self.node_id,
+                peer,
+                theta * 1000.0,
+                old_offset * 1000.0,
+                new_offset * 1000.0,
+            )
+        )
+        return True
+
 
     # ------------------------------------------------------------------
     # Symmetrisches Update (Herzstück)
@@ -383,8 +427,12 @@ class SyncModule:
             self._update_rtt_sigma(peer, rtt)
             self._peer_offsets[peer] = theta
 
-            # Symmetrisches Offset-Update
-            self._symmetrical_update(peer, peer_offset, theta)
+            # ZUERST: Bootstrap versuchen (einmaliger harter Sprung in die richtige Region)
+            did_bootstrap = self._try_bootstrap(peer, peer_offset, theta)
+
+            # Danach: reguläres symmetrisches Update (feines Nachregeln)
+            if not did_bootstrap:
+                self._symmetrical_update(peer, peer_offset, theta)
 
             # Debug-Kurzsummary
             if peer in self._peer_sigma:

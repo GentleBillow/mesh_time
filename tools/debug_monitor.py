@@ -149,10 +149,18 @@ async def monitor_loop():
 
     refresh_interval = 1.0
 
-    async with aiocoap.Context.create_client_context() as client_ctx:
-        status_by_node = {}
+    # Create client context ONCE (old aiocoap does not support async with)
+    try:
+        client_ctx = await aiocoap.Context.create_client_context()
+    except Exception as e:
+        console.print(f"[red]Failed to create CoAP client context:[/red] {e}")
+        sys.exit(1)
 
-        with Live(refresh_per_second=4, console=console) as live:
+    status_by_node = {}
+
+    # Live table runs forever, even if nodes are offline initially
+    with Live(refresh_per_second=4, console=console) as live:
+        try:
             while True:
                 tasks = [
                     fetch_status(client_ctx, nid, ip)
@@ -167,6 +175,12 @@ async def monitor_loop():
                 live.update(table)
 
                 await asyncio.sleep(refresh_interval)
+        finally:
+            # Best-effort shutdown
+            try:
+                await client_ctx.shutdown()
+            except Exception:
+                pass
 
 
 def main():

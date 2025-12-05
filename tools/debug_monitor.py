@@ -13,6 +13,8 @@ from rich.live import Live
 from rich.table import Table
 
 import argparse
+from rich.text import Text
+
 
 
 console = Console()
@@ -164,6 +166,10 @@ async def monitor_loop(selected_nodes=None):
 
     status_by_node = {}
 
+    # History der globalen Δmesh_time (Sekunden)
+    delta_history = []
+    max_history = 40  # wie viele Punkte in der Sparkline
+
     # Live table runs forever, even if nodes are offline initially
     with Live(refresh_per_second=4, console=console) as live:
         try:
@@ -177,7 +183,63 @@ async def monitor_loop(selected_nodes=None):
                 for nid, st in results:
                     status_by_node[nid] = st
 
+                # --- globale Δmesh_time berechnen ---
+                alive = [st for st in status_by_node.values() if st is not None]
+                if alive:
+                    mesh_times = [s["mesh_time"] for s in alive]
+                    delta_mesh = max(mesh_times) - min(mesh_times)
+                else:
+                    delta_mesh = None
+
+                # --- History updaten ---
+                if delta_mesh is not None:
+                    delta_history.append(delta_mesh)
+                    if len(delta_history) > max_history:
+                        delta_history.pop(0)
+
                 table = build_table(status_by_node)
+
+                # --- Caption: farbige Sparkline + aktueller Wert ---
+                if delta_mesh is not None and delta_history:
+                    # Einheit: ms für menschliche Lesbarkeit
+                    latest_ms = delta_mesh * 1000.0
+
+                    # Farbe nach Thresholds
+                    if latest_ms < 10.0:
+                        color = "green"
+                    elif latest_ms < 50.0:
+                        color = "orange1"
+                    else:
+                        color = "red"
+
+                    # Sparkline normalisieren auf vorhandene History
+                    vmin = min(delta_history)
+                    vmax = max(delta_history)
+                    span = vmax - vmin
+                    if span <= 0.0:
+                        span = 1e-6
+
+                    blocks = "▁▂▃▄▅▆▇█"
+                    chars = []
+                    for v in delta_history:
+                        norm = (v - vmin) / span
+                        idx = int(norm * (len(blocks) - 1))
+                        if idx < 0:
+                            idx = 0
+                        elif idx >= len(blocks):
+                            idx = len(blocks) - 1
+                        chars.append(blocks[idx])
+
+                    spark = "".join(chars)
+
+                    caption = Text()
+                    caption.append(f"Δmesh_time = {latest_ms:.2f} ms  ", style=color)
+                    caption.append(spark, style=color)
+
+                    table.caption = caption
+                else:
+                    table.caption = "Δmesh_time = n/a"
+
                 live.update(table)
 
                 await asyncio.sleep(refresh_interval)

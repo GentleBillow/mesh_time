@@ -2,7 +2,7 @@
     "sync": {
       "jitter_window": 30,
       "min_samples_for_jitter": 10,
-      "max_slew_per_second_ms": 500.0,
+      "max_slew_per_second_ms": 20.0,
       "initial_offset_ms": 200.0,
       "eta": 0.5,
       "coap_timeout_s": 0.5
@@ -16,7 +16,7 @@
     "button_pin": null
   },
   "B": {
-    "ip": "172.16.32.136",
+    "ip": "192.168.178.49",
     "parent": "C",
     "neighbors": ["C"],
     "sensor_type": "potentiometer",
@@ -24,7 +24,7 @@
     "button_pin": null
   },
   "C": {
-    "ip": "172.16.32.164",
+    "ip": "192.168.178.48",
     "parent": null,
     "neighbors": ["B"],
     "sensor_type": "potentiometer",

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # mesh/node.py
 
 import asyncio

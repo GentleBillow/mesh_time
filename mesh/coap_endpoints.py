@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # mesh/coap_endpoints.py
 
 import json

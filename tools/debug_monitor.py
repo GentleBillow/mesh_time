@@ -12,6 +12,9 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+import argparse
+
+
 console = Console()
 
 # ------------------------------------------------------------
@@ -136,13 +139,16 @@ def build_table(status_by_node: dict) -> Table:
 # Main-Loop
 # ------------------------------------------------------------
 
-async def monitor_loop():
+async def monitor_loop(selected_nodes=None):
     cfg, cfg_path = load_config()
     nodes = extract_nodes(cfg)
 
-    if not nodes:
-        console.print("[red]No nodes with 'ip' found in config.[/red]")
-        sys.exit(1)
+    # Apply filtering
+    if selected_nodes:
+        nodes = {nid: ip for nid, ip in nodes.items() if nid in selected_nodes}
+        if not nodes:
+            console.print("[red]No matching nodes found in config.[/red]")
+            sys.exit(1)
 
     console.print("[cyan]Monitoring nodes:[/cyan] " +
                   ", ".join(f"{nid}({ip})" for nid, ip in nodes.items()))
@@ -184,10 +190,31 @@ async def monitor_loop():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="MeshTime live debug monitor")
+    parser.add_argument(
+        "--nodes",
+        nargs="*",            # allows: --nodes A B C
+        help="Only monitor specific node IDs (e.g. --nodes B C)",
+    )
+    parser.add_argument(
+        "--nodes-csv",
+        type=str,
+        help="Alternative: comma separated list (e.g. --nodes-csv B,C)"
+    )
+    args = parser.parse_args()
+
+    # Parse node filter if provided
+    selected_nodes = None
+    if args.nodes:
+        selected_nodes = set(args.nodes)
+    elif args.nodes_csv:
+        selected_nodes = set(n.strip() for n in args.nodes_csv.split(","))
+
     try:
-        asyncio.run(monitor_loop())
+        asyncio.run(monitor_loop(selected_nodes))
     except KeyboardInterrupt:
         console.print("\n[yellow]Stopped by user.[/yellow]")
+
 
 
 if __name__ == "__main__":

@@ -281,7 +281,7 @@ class SyncModule:
         """
 
         # Fehler relativ zur Zielbedingung off_i - off_j ≈ θ_ij
-        error = (self._offset - peer_offset) + theta
+        error = (self._offset - peer_offset) - theta
 
         # Gewichtung nach Link-Qualität (optional)
         sigma = self._peer_sigma.get(peer)

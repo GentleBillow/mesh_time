@@ -4,6 +4,7 @@
 import json
 import math
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -105,19 +106,25 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
             t_wall, delta_ms
       - jitter_pairs: Boxplot-Stats der ΔMesh-Time pro Paar
             {pair_id: {min,q1,median,q3,max}}
-    ΔMesh-Time wird aus den Fehlern err_mesh_vs_wall berechnet, d.h.
-    Δ_ij ≈ (mesh_i - wall) - (mesh_j - wall) = err_i - err_j.
-    Wallclock fällt also raus, wir nutzen es nur als gemeinsame Referenz.
+
+    ΔMesh-Time wird aus den Fehlern err_mesh_vs_wall berechnet:
+      Δ_ij ≈ (mesh_i - wall) - (mesh_j - wall) = err_i - err_j.
+    Wallclock fällt raus, dient nur als gemeinsame Referenz.
     """
     conn = get_conn()
     cur = conn.cursor()
+
+    cutoff = time.time() - float(window_seconds)
 
     rows = cur.execute(
         """
         SELECT node_id, t_wall, t_mesh, offset, err_mesh_vs_wall, created_at
         FROM ntp_reference
-        ORDER BY id ASC
-        """
+        WHERE created_at >= ?
+        ORDER BY created_at ASC
+        LIMIT ?
+        """,
+        (cutoff, max_points),
     ).fetchall()
     conn.close()
 
@@ -127,11 +134,6 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
             "pairs": {},
             "jitter_pairs": {},
         }
-
-    # wir beschränken das Fenster in Python (letzte window_seconds)
-    newest_ts = max(float(r["created_at"]) for r in rows)
-    cutoff = newest_ts - float(window_seconds)
-    rows = [r for r in rows if float(r["created_at"]) >= cutoff]
 
     # nach Node gruppieren
     per_node = {}
@@ -176,8 +178,6 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
         err_ms = float(r["err_mesh_vs_wall"]) * 1000.0
         last_err_ms[node] = err_ms
 
-        # sobald wir mindestens zwei Nodes gesehen haben, können wir
-        # für alle bekannten Paare Δ berechnen
         nodes_now = sorted(last_err_ms.keys())
         if len(nodes_now) < 2:
             continue
@@ -465,11 +465,11 @@ TEMPLATE = r"""
 
   <script>
     const colors = [
-      'rgba(46, 204, 113, 0.9)',
-      'rgba(52, 152, 219, 0.9)',
-      'rgba(231, 76, 60, 0.9)',
-      'rgba(241, 196, 15, 0.9)',
-      'rgba(155, 89, 182, 0.9)'
+      'rgba(46, 204, 113, 0.5)',
+      'rgba(52, 152, 219, 0.5)',
+      'rgba(231, 76, 60, 0.5)',
+      'rgba(241, 196, 15, 0.5)',
+      'rgba(155, 89, 182, 0.5)'
     ];
 
     let pairChart, offsetDeltaChart, jitterBoxChart;
@@ -491,7 +491,7 @@ TEMPLATE = r"""
             y: {
               ticks: {
                 color: '#aaa',
-                callback: (v) => v.toFixed ? v.toFixed(1) + ' ' + yLabel : v + ' ' + yLabel
+                callback: (v) => (v.toFixed ? v.toFixed(1) : v) + ' ' + yLabel
               },
               grid: { color: 'rgba(255,255,255,0.05)' }
             }
@@ -527,7 +527,7 @@ TEMPLATE = r"""
             label: 'ΔMesh-Time',
             data: [],
             backgroundColor: 'rgba(52, 152, 219, 0.6)',
-            borderColor: 'rgba(52, 152, 219, 1)',
+            borderColor: 'rgba(52, 152, 219, 1)'
           }]
         },
         options: {
@@ -579,7 +579,8 @@ TEMPLATE = r"""
       const pairIds = Object.keys(pairs).sort();
       chart.data.datasets = [];
       pairIds.forEach((pairId, idx) => {
-        const baseColor = colors[idx % colors.length]; // z.B. rgba(...,0.9)
+        const baseColor = colors[idx % colors.length];
+        const strokeColor = baseColor.replace('0.5', '0.9');
         const points = pairs[pairId].map(p => ({
           x: new Date(p.t_wall * 1000),
           y: p.delta_ms
@@ -587,7 +588,7 @@ TEMPLATE = r"""
         chart.data.datasets.push({
           label: pairId,
           data: points,
-          borderColor: baseColor,
+          borderColor: strokeColor,
           backgroundColor: baseColor,
           fill: false,
           pointRadius: 0,
@@ -596,12 +597,13 @@ TEMPLATE = r"""
       });
       chart.update();
     }
-    
+
     function updateOffsetDeltaChart(chart, series) {
       const nodeIds = Object.keys(series).sort();
       chart.data.datasets = [];
       nodeIds.forEach((nodeId, idx) => {
-        const color = colors[idx % colors.length];
+        const baseColor = colors[idx % colors.length];
+        const strokeColor = baseColor.replace('0.5', '0.9');
         const points = series[nodeId].map(p => ({
           x: new Date(p.t_wall * 1000),
           y: p.delta_offset_ms
@@ -609,8 +611,8 @@ TEMPLATE = r"""
         chart.data.datasets.push({
           label: `Node ${nodeId}`,
           data: points,
-          borderColor: color,
-          backgroundColor: color,
+          borderColor: strokeColor,
+          backgroundColor: baseColor,
           fill: false,
           pointRadius: 0,
           borderWidth: 1.5
@@ -717,8 +719,6 @@ TEMPLATE = r"""
           fetchNtpData(),
           fetchTopology()
         ]);
-        
-        console.log("NTP DATA", ntpData);  // <--- Debug
 
         const series = ntpData.series || {};
         const pairs = ntpData.pairs || {};
@@ -728,10 +728,8 @@ TEMPLATE = r"""
         updateOffsetDeltaChart(offsetDeltaChart, series);
         updateJitterBoxChart(jitterBoxChart, jitter_pairs);
 
-        // aktive Nodes = alle, die Daten haben
         const activeNodes = new Set(Object.keys(series || {}));
         const meshCanvas = document.getElementById('meshCanvas');
-        // Canvas-Size anpassen
         meshCanvas.width  = meshCanvas.clientWidth;
         meshCanvas.height = meshCanvas.clientHeight;
         drawMesh(meshCanvas, topo, activeNodes);

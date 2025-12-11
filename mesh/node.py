@@ -4,6 +4,7 @@
 import asyncio
 import time
 import platform
+import json
 from typing import Dict, Any
 
 import aiocoap
@@ -198,8 +199,9 @@ class MeshNode:
         # Ziel-Knoten für Telemetrie bestimmen: parent oder explizit 'C'
         sink_id = self.cfg.get("telemetry_sink") or self.parent or "C"
         sink_ip = None
-        if sink_id in self.global_cfg and "ip" in self.global_cfg[sink_id]:
+        if sink_id != self.id and sink_id in self.global_cfg and "ip" in self.global_cfg[sink_id]:
             sink_ip = self.global_cfg[sink_id]["ip"]
+
 
         while not self._stop.is_set():
             t_wall = time.time()

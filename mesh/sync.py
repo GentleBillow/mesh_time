@@ -47,16 +47,16 @@ class SyncModule:
         neighbor_ips: Dict[str, str],
         sync_cfg: Optional[Dict[str, float]] = None,
     ):
+
+        self.node_id = node_id
+        self.neighbors = neighbors
+        self.neighbor_ips = neighbor_ips
+
         # --------------------------------------------------------------
         # Konfiguration
         # --------------------------------------------------------------
         if sync_cfg is None:
             sync_cfg = {}
-
-
-        self.node_id = node_id
-        self.neighbors = neighbors
-        self.neighbor_ips = neighbor_ips
 
         # Bootstrap-Flag: einmaliger harter Sprung in die "richtige Region"
         self._bootstrapped = False
@@ -267,78 +267,65 @@ class SyncModule:
 
     def _symmetrical_update(self, peer: str, peer_offset: float, theta: float) -> None:
         """
-        Symmetrisches pairwise Update zur Minimierung von:
+        Symmetrisches pairwise Update zur Minimierung von
 
-            E_ij = ( (o_i - o_j) - θ_ij )²
+            E_ij = ((o_i - o_j) - θ_ij)^2
 
-        Idealbedingung:
-            off_i - off_j ≈ θ_ij
+        Zielbedingung:
+            o_i - o_j ≈ θ_ij
 
         Wir machen einen Gradienten-Schritt auf o_i:
 
-            error = (off_i - off_j) - θ_ij
-            off_i <- off_i - η * w * error
-        """
+            error = (o_i - o_j) - θ_ij
+            o_i   <- o_i - η * w * error
 
-        # Fehler relativ zur Zielbedingung off_i - off_j ≈ θ_ij
+        mit optionalem Slew-Limit und Drift-Dämpfer.
+        """
+        # Fehler relativ zur Zielbedingung
         error = (self._offset - peer_offset) - theta
 
-        # Gewichtung nach Link-Qualität (optional)
+        # Gewichtung nach Link-Qualität (falls σ bekannt)
         sigma = self._peer_sigma.get(peer)
         if sigma is not None and sigma > 1e-6:
             weight = 1.0 / (sigma * sigma)
         else:
             weight = 1.0
 
-        # Gradient-Schritt in *negative* Fehler-Richtung
-        delta = -self._eta * weight * error
+        # "theoretischer" Gradient-Schritt (ohne Slew-Limit)
+        raw_delta = -self._eta * weight * error
 
-        # Slew-Limit in Abhängigkeit von echter Zeit
+        # Slew-Limit relativ zu echter Zeit
         now = time.monotonic()
         dt = now - self._last_update_time
         if dt <= 0.0:
             dt = 1e-3
 
         max_delta = self._max_slew_per_second * dt
-        if delta > max_delta:
+        if raw_delta > max_delta:
             delta = max_delta
-        elif delta < -max_delta:
+        elif raw_delta < -max_delta:
             delta = -max_delta
+        else:
+            delta = raw_delta
 
         # Offset anpassen
         self._offset += delta
-        self._last_update_time = now
 
-        print(
-            "[{}] sym-update with {}: error={:.3f} ms, delta={:.3f} ms, offset={:.3f} ms".format(
-                self.node_id,
-                peer,
-                error * 1000.0,
-                delta * 1000.0,
-                self._offset * 1000.0,
-            )
-        )
-
-
-        # --- Globaler Drift-Dämpfer: offset sanft gegen 0 ziehen ---
+        # Optional: globaler Drift-Dämpfer (zieht offset langsam Richtung 0)
         if self._drift_damping > 0.0:
-            # offset_i ← offset_i - η_global * offset_i
-            #          = offset_i * (1 - η_global)
-            before = self._offset
             self._offset *= (1.0 - self._drift_damping)
-            after = self._offset
-            # Optional: sehr kompakte Debug-Ausgabe
-            # print("[{}] drift-damp: {:.3f} ms -> {:.3f} ms".format(
-            #     self.node_id, before * 1000.0, after * 1000.0
-            # ))
 
+        # Zeitstempel updaten
         self._last_update_time = now
 
+        # Debug-Output (einmal)
         print(
-            "[{}] sym-update with {}: error={:.3f} ms, delta={:.3f} ms, offset={:.3f} ms".format(
+            "[{}] sym-update with {}: error={:.3f} ms, raw_delta={:.3f} ms, "
+            "delta={:.3f} ms, offset={:.3f} ms".format(
                 self.node_id,
                 peer,
                 error * 1000.0,
+                raw_delta * 1000.0,
                 delta * 1000.0,
                 self._offset * 1000.0,
             )

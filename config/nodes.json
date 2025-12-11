@@ -35,7 +35,10 @@
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "button_pin": null,
-    "db_path": "mesh_data.sqlite"
+    "db_path": "mesh_data.sqlite",
+    "sync": {
+      "is_root": true
+    }
   },
   "D": {
     "ip": "192.168.xx.xx",

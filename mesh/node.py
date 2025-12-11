@@ -10,18 +10,9 @@ import aiocoap
 
 from .sync import SyncModule
 from .sensor import DummySensor
-from .led import DummyLED
-from .coap_endpoints import build_site
-
 from .led import DummyLED, GrovePiLED
-
-from .sync import SyncModule
-from .sensor import DummySensor
-from .led import DummyLED, GrovePiLED  # falls du das schon so drin hast
 from .coap_endpoints import build_site
-from .storage import Storage     # <--- NEU
-
-
+from .storage import Storage
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -32,58 +23,15 @@ class MeshNode:
         self.cfg = node_cfg
         self.global_cfg = global_cfg
 
-        # Hardware abstractions (currently dummy; later Grove)
-        self.sensor = DummySensor(sensor_type=node_cfg.get("sensor_type", "dummy"))
-
-        led_pin = node_cfg.get("led_pin", None)
-        if led_pin is None:
-            self.led = None
-        else:
-            if IS_WINDOWS:
-                self.led = DummyLED(pin=led_pin)
-            else:
-                try:
-                    self.led = GrovePiLED(pin=led_pin)
-                except Exception as e:
-                    print(f"[{node_id}] GrovePiLED failed ({e}) → falling back to DummyLED")
-                    self.led = DummyLED(pin=led_pin)
-
-        # --------------------------------------------------------------
-        # Optionale lokale DB (z.B. nur auf Node C)
-        # --------------------------------------------------------------
-        self.storage = None
-        db_path = node_cfg.get("db_path")
-        if db_path:
-            print(f"[{self.id}] Initializing local DB at {db_path}")
-            self.storage = Storage(db_path)
-
-
-
-
         # ------------------------------------------------------------------
-        # Neighbors & their IPs (from global config)
-        # ------------------------------------------------------------------
-        neighbors = node_cfg.get("neighbors", [])
-
-        neighbor_ips = {}
-        for nid in neighbors:
-            if nid in global_cfg and "ip" in global_cfg[nid]:
-                neighbor_ips[nid] = global_cfg[nid]["ip"]
-
-        # Sync module: handles mesh_time(), beacons, offsets etc.
-        self.sync = SyncModule(
-            node_id=node_id,
-            neighbors=neighbors,
-            neighbor_ips=neighbor_ips,
-            sync_cfg=global_cfg.get("sync", {}),
-        )
-
-        # ------------------------------------------------------------------
-        # Hardware abstractions (currently dummy; later Grove)
+        # Sensor
         # ------------------------------------------------------------------
         self.sensor = DummySensor(sensor_type=node_cfg.get("sensor_type", "dummy"))
-        led_pin = node_cfg.get("led_pin", None)
 
+        # ------------------------------------------------------------------
+        # LED
+        # ------------------------------------------------------------------
+        led_pin = node_cfg.get("led_pin", None)
         if led_pin is None:
             print(f"[{node_id}] no led_pin configured → LED disabled")
             self.led = None
@@ -98,10 +46,46 @@ class MeshNode:
                     print(f"[{node_id}] GrovePiLED failed ({e}) → falling back to DummyLED")
                     self.led = DummyLED(pin=led_pin)
 
-        # Routing parent for multi-hop data (used later)
+        # ------------------------------------------------------------------
+        # Optional lokale DB (z.B. nur auf Node C)
+        # ------------------------------------------------------------------
+        self.storage = None
+        db_path = node_cfg.get("db_path")
+        if db_path:
+            print(f"[{self.id}] Initializing local DB at {db_path}")
+            self.storage = Storage(db_path)
+
+        # ------------------------------------------------------------------
+        # Neighbors & their IPs (from global config)
+        # ------------------------------------------------------------------
+        neighbors = node_cfg.get("neighbors", [])
+
+        neighbor_ips: Dict[str, str] = {}
+        for nid in neighbors:
+            if nid in global_cfg and "ip" in global_cfg[nid]:
+                neighbor_ips[nid] = global_cfg[nid]["ip"]
+
+        # ------------------------------------------------------------------
+        # Sync-Konfiguration: global + node-spezifisch mergen
+        # ------------------------------------------------------------------
+        base_sync_cfg = global_cfg.get("sync", {}) or {}
+        node_sync_cfg = node_cfg.get("sync", {}) or {}
+
+        sync_cfg = dict(base_sync_cfg)   # Kopie der globalen Defaults
+        sync_cfg.update(node_sync_cfg)   # node-spezifische Overrides (z.B. is_root)
+
+        # Sync module: handles mesh_time(), beacons, offsets etc.
+        self.sync = SyncModule(
+            node_id=node_id,
+            neighbors=neighbors,
+            neighbor_ips=neighbor_ips,
+            sync_cfg=sync_cfg,
+        )
+
+        # Routing parent für spätere Multi-Hop-Daten
         self.parent = node_cfg.get("parent")
 
-        # Optional disturbance button (e.g. on node D)
+        # Optional disturbance button (z.B. auf Node D)
         self.button_pin = node_cfg.get("button_pin")
 
         # Stop flag if ever needed
@@ -117,11 +101,6 @@ class MeshNode:
     async def sync_loop(self):
         """
         Periodically send sync beacons.
-
-        Design choice:
-          - We create a fresh aiocoap client context on each iteration.
-          - This avoids issues where a single ICMP "port unreachable" or
-            other socket-level error poisons a long-lived context.
         """
         print("[{}] sync_loop started".format(self.id))
         while not self._stop.is_set():
@@ -142,7 +121,6 @@ class MeshNode:
             except Exception as e:
                 print("[{}] sync_loop: error in send_beacons: {}".format(self.id, e))
 
-            # Cleanly shut down the client context so sockets are released
             try:
                 await client_ctx.shutdown()
             except Exception:
@@ -171,15 +149,13 @@ class MeshNode:
         print("[{}] led_loop started".format(self.id))
         while not self._stop.is_set():
             t_mesh = self.sync.mesh_time()
-            self.led.update(t_mesh)
+            if self.led is not None:
+                self.led.update(t_mesh)
             await asyncio.sleep(0.01)
 
     async def coap_loop(self):
         """
         Start the CoAP server.
-
-        On Windows dev machines, aiocoap may not support binding to any-address;
-        in that case we just skip the server so the rest of the node can run.
         """
         if IS_WINDOWS:
             print("[{}] Windows dev mode: skipping CoAP server startup".format(self.id))
@@ -189,7 +165,6 @@ class MeshNode:
         site = build_site(self)
 
         try:
-            # Explicitly bind to IPv4 on all interfaces
             self._coap_ctx = await aiocoap.Context.create_server_context(
                 site,
                 bind=("0.0.0.0", 5683),
@@ -203,15 +178,9 @@ class MeshNode:
 
     async def ntp_monitor_loop(self, interval: float = 5.0):
         """
-        Periodisch NTP-Referenzwerte loggen:
-          - t_wall = time.time()
-          - t_mono = time.monotonic()
-          - t_mesh = self.sync.mesh_time()
-          - offset = self.sync.get_offset()
-          - err_mesh_vs_wall = t_mesh - t_wall
+        Periodisch NTP-Referenzwerte loggen.
         """
         if self.storage is None:
-            # Kein lokales DB-Backend → Loop einfach schlafen lassen
             while True:
                 await asyncio.sleep(3600.0)
 
@@ -237,7 +206,6 @@ class MeshNode:
 
             await asyncio.sleep(interval)
 
-
     async def run_async(self):
         """
         Start all node tasks.
@@ -256,7 +224,6 @@ class MeshNode:
             tasks.append(self.ntp_monitor_loop())
 
         await asyncio.gather(*tasks)
-
 
     def run(self):
         try:

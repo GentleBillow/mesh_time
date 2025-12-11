@@ -65,6 +65,9 @@ class SyncModule:
         if sync_cfg is None:
             sync_cfg = {}
 
+        # Root-Flag (z.B. für Node C)
+        self._is_root = bool(sync_cfg.get("is_root", False))
+
         # ----------------------------------------------------------
         # Konfiguration aus JSON
         # ----------------------------------------------------------
@@ -98,14 +101,17 @@ class SyncModule:
             sync_cfg.get("bootstrap_theta_max_s", 0.0)  # 0 = immer erste Messung
         )
 
-        # Zufälliger Initial-Offset (Sekunden)
-        self._offset: float = random.uniform(
-            -initial_offset_ms / 1000.0,
-            +initial_offset_ms / 1000.0,
-        )
-
-        # Bootstrapping-Flag
-        self._bootstrapped: bool = False
+        # Zufälliger Initial-Offset (Sekunden) nur für Nicht-Root
+        if self._is_root:
+            # Root: Offset fest auf 0 (Meshzeit = Monotonic)
+            self._offset = 0.0
+            self._bootstrapped = True  # Root braucht keinen Bootstrap
+        else:
+            self._offset = random.uniform(
+                -initial_offset_ms / 1000.0,
+                +initial_offset_ms / 1000.0,
+            )
+            self._bootstrapped = False
 
         # letzte θ (NTP-Schätzung: o_peer - o_self) pro Peer
         self._peer_theta: Dict[str, float] = {}
@@ -251,6 +257,10 @@ class SyncModule:
 
             o_self <- o_peer - θ
         """
+        # Root lässt seinen Offset nie von Peers verändern
+        if self._is_root:
+            return False
+
         if self._bootstrapped:
             return False
 
@@ -297,6 +307,9 @@ class SyncModule:
 
         Alle Größen (Offsets, θ, error, delta) sind in Sekunden.
         """
+
+        if self._is_root:
+            return  # Root macht kein symmetrisches Update
 
         # Fehler (Sekunden)
         target = peer_offset - theta
@@ -376,6 +389,9 @@ class SyncModule:
         """
         if IS_WINDOWS:
             return
+
+        if self._is_root:
+            return  # Root ist nur Server, kein Client für Sync
 
         for peer in self.neighbors:
             ip = self.neighbor_ips.get(peer)

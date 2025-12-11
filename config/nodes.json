@@ -1,7 +1,7 @@
 {
     "sync": {
       "jitter_window": 50,
-      "min_samples_for_jitter": 10,
+      "min_samples_for_jitter": 15,
       "max_slew_per_second_ms": 10.0,
       "initial_offset_ms": 0.0,
       "eta": 0.02,

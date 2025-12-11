@@ -267,7 +267,7 @@ class SyncModule:
 
     def _symmetrical_update(self, peer: str, peer_offset: float, theta: float) -> None:
         """
-        Symmetrisches pairwise Update zur Minimierung von
+        Symmetrisches pairwise Update zur Minimierung
 
             E_ij = ((o_i - o_j) - θ_ij)^2
 
@@ -279,46 +279,59 @@ class SyncModule:
             error = (o_i - o_j) - θ_ij
             o_i   <- o_i - η * w * error
 
-        mit optionalem Slew-Limit und Drift-Dämpfer.
+        Alle Größen (offsets, theta, error, delta) sind in *Sekunden*.
+        max_slew_per_second_ms ist eine Rate in ms/s (Konfig-Einheit).
         """
-        # Fehler relativ zur Zielbedingung
-        error = (self._offset - peer_offset) - theta
 
-        # Gewichtung nach Link-Qualität (falls σ bekannt)
+        # --- Fehler: wie weit sind wir von o_i - o_j ≈ θ_ij entfernt? ---
+        error = (self._offset - peer_offset) - theta  # Sekunden
+
+        # --- Gewichtung nach Link-Qualität (falls σ bekannt, in Sekunden) ---
         sigma = self._peer_sigma.get(peer)
         if sigma is not None and sigma > 1e-6:
             weight = 1.0 / (sigma * sigma)
         else:
             weight = 1.0
 
-        # "theoretischer" Gradient-Schritt (ohne Slew-Limit)
-        raw_delta = -self._eta * weight * error
+        # --- optionales Bootstrap-Clamping für große Thetas ---
+        if self._bootstrap_theta_max_s > 0.0:
+            theta_clamped = max(-self._bootstrap_theta_max_s,
+                                min(theta, self._bootstrap_theta_max_s))
+            error = (self._offset - peer_offset) - theta_clamped
 
-        # Slew-Limit relativ zu echter Zeit
+        # --- "theoretischer" Gradient-Schritt (ohne Slew-Limit) ---
+        raw_delta = -self._eta * weight * error  # Sekunden
+
+        # --- dt pro *Peer* ---
         now = time.monotonic()
-        dt = now - self._last_update_time
+        last = self._last_update_ts.get(peer, now)
+        dt = now - last
         if dt <= 0.0:
-            dt = 1e-3
+            dt = 1e-3  # 1 ms Mindest-dt
+        self._last_update_ts[peer] = now
 
-        max_delta = self._max_slew_per_second * dt
-        if raw_delta > max_delta:
-            delta = max_delta
-        elif raw_delta < -max_delta:
-            delta = -max_delta
+        # --- Slew-Limit: max_slew_per_second_ms → Sekunden ---
+        if self._max_slew_per_second_ms > 0.0:
+            max_step_s = (self._max_slew_per_second_ms / 1000.0) * dt
+            if raw_delta > max_step_s:
+                delta = max_step_s
+            elif raw_delta < -max_step_s:
+                delta = -max_step_s
+            else:
+                delta = raw_delta
         else:
             delta = raw_delta
 
-        # Offset anpassen
-        self._offset += delta
+        # --- Offset aktualisieren ---
+        self._offset += delta  # Sekunden
 
-        # Optional: globaler Drift-Dämpfer (zieht offset langsam Richtung 0)
+        # --- Drift-Dämpfung (proportional zur Zeit) ---
         if self._drift_damping > 0.0:
-            self._offset *= (1.0 - self._drift_damping)
+            # Dämpfung ~ exp(-λ dt) linearisiert:
+            factor = max(0.0, 1.0 - self._drift_damping * dt)
+            self._offset *= factor
 
-        # Zeitstempel updaten
-        self._last_update_time = now
-
-        # Debug-Output (einmal)
+        # --- Debug-Output in ms ---
         print(
             "[{}] sym-update with {}: error={:.3f} ms, raw_delta={:.3f} ms, "
             "delta={:.3f} ms, offset={:.3f} ms".format(

@@ -20,7 +20,7 @@
   },
   "B": {
     "color": "red",
-    "ip": "172.16.32.164",
+    "ip": "192.168.178.48",
     "parent": "C",
     "neighbors": ["C"],
     "sensor_type": "potentiometer",
@@ -29,7 +29,7 @@
   },
   "C": {
     "color": "purple",
-    "ip": "172.16.32.136",
+    "ip": "192.168.178.49",
     "parent": null,
     "neighbors": ["B"],
     "sensor_type": "potentiometer",

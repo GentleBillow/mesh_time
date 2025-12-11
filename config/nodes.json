@@ -1,14 +1,14 @@
 {
-    "sync": {
-      "jitter_window": 50,
-      "min_samples_for_jitter": 15,
-      "max_slew_per_second_ms": 10.0,
-      "initial_offset_ms": 0.0,
-      "eta": 0.02,
-      "bootstrap_theta_max_s": 0.5,
-      "coap_timeout_s": 0.5,
-      "drift_damping": 0.01
-    },
+  "sync": {
+    "jitter_window": 30,
+    "min_samples_for_jitter": 15,
+    "max_slew_per_second_ms": 10.0,
+    "initial_offset_ms": 200.0,
+    "eta": 0.02,
+    "bootstrap_theta_max_s": 0.5,
+    "coap_timeout_s": 0.5,
+    "drift_damping": 0.01
+  },
 
   "A": {
     "ip": "192.168.xx.xx",

@@ -16,28 +16,27 @@ IS_WINDOWS = platform.system() == "Windows"
 
 class SyncModule:
     """
-    Baryzentrische Time-Sync für das Mesh.
+    Baryzentrischer Time-Sync für das Mesh.
 
-    Grundidee:
-      - Jede Node hat eine lokale Zeit: mono(t) = time.monotonic()
-      - Mesh-Zeit:  mesh_time(t) = mono(t) + offset
-      - Die Offsets werden durch paarweise Messungen θ_ij iterativ angepasst.
+    Idee:
+      - Lokale Zeit: mono(t) = time.monotonic()
+      - Mesh-Zeit:   mesh_time(t) = mono(t) + offset
 
-    Ziel:
-      Minimiere für alle Kanten (i, j):
+    Die Offsets o_i werden über NTP-artige 4-Timestamp-Messungen θ_ij
+    iterativ angepasst:
 
-          Σ w_ij * ( (o_j - o_i) - θ_ij )²
+        E_ij = ((o_i - o_j) - θ_ij)^2
 
-      d.h. die Differenz der Offsets soll zu den gemessenen
-      relativen Offsets θ_ij passen (NTP 4-Timestamp-Schätzung).
+    Zielbedingung:
+        o_i - o_j ≈ θ_ij
 
     Features:
       - Rolling RTT-Historie pro Peer
       - IQR-basierte Jitter-Schätzung σ_ij
       - Gewichtete Updates (1/σ²)
-      - Slew-Limit in Sekunden pro Sekunde
-      - Optionaler Drift-Dämpfer: Offsets werden sanft gegen 0 gezogen
-      - Debug-freundlicher Status-Snapshot
+      - Slew-Limit (ms/s)
+      - Optionaler Drift-Dämpfer
+      - Bootstrap: einmaliger harter Sprung in die "richtige Region"
     """
 
     def __init__(
@@ -46,26 +45,19 @@ class SyncModule:
         neighbors: List[str],
         neighbor_ips: Dict[str, str],
         sync_cfg: Optional[Dict[str, float]] = None,
-    ):
+    ) -> None:
 
         self.node_id = node_id
         self.neighbors = neighbors
         self.neighbor_ips = neighbor_ips
 
-        # --------------------------------------------------------------
-        # Konfiguration
-        # --------------------------------------------------------------
         if sync_cfg is None:
             sync_cfg = {}
 
-        # Bootstrap-Flag: einmaliger harter Sprung in die "richtige Region"
-        self._bootstrapped = False
-
-        # Optionaler Bootstrap-Threshold, um völlig kaputte Messungen zu ignorieren
-        self._bootstrap_theta_max = float(sync_cfg.get("bootstrap_theta_max_s", 1.0))
-        # 1.0 s = wir erlauben einen harten Sprung, solange |theta| < 1s
-
-        # Zufälliger Start-Offset in ± initial_offset_ms
+        # ----------------------------------------------------------
+        # Konfiguration aus JSON
+        # ----------------------------------------------------------
+        # Zufälliger Initial-Offset in ± initial_offset_ms
         initial_offset_ms = float(sync_cfg.get("initial_offset_ms", 200.0))
 
         # Rolling-Window-Größe für RTT / Jitter
@@ -76,47 +68,56 @@ class SyncModule:
             sync_cfg.get("min_samples_for_jitter", 10)
         )
 
-        # Lernrate η für symmetrisches Update (0 < eta <= 1)
-        self._eta = float(sync_cfg.get("eta", 0.5))
+        # Lernrate η (0 < eta <= 1, aber realistisch << 1)
+        self._eta = float(sync_cfg.get("eta", 0.02))
 
-        # Slew-Limit in ms/s -> Sekunden/Sekunde
-        max_slew_ms = float(sync_cfg.get("max_slew_per_second_ms", 5.0))
-        self._max_slew_per_second = max_slew_ms / 1000.0
+        # Slew-Limit in ms/s (Konfig-Einheit), intern merken wir uns den ms/s-Wert
+        self._max_slew_per_second_ms = float(
+            sync_cfg.get("max_slew_per_second_ms", 10.0)
+        )
 
-        # CoAP-Timeout (Sekunden) für Beacon-Requests
+        # CoAP-Timeout in Sekunden
         self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 0.5))
 
-        # Globaler Drift-Dämpfer (0 = aus, 0.001 = 0.1% pro Update)
-        self._drift_damping = float(sync_cfg.get("drift_damping", 0.001))
+        # Globaler Drift-Dämpfer (0 = aus, z.B. 0.01 = 1%/s)
+        self._drift_damping = float(sync_cfg.get("drift_damping", 0.0))
 
-        # Zufälliger Initial-Offset (in Sekunden)
-        self._offset = random.uniform(
+        # Bootstrap-Threshold in Sekunden: |theta| <= threshold -> harter Bootstrap erlaubt
+        self._bootstrap_theta_max_s = float(
+            sync_cfg.get("bootstrap_theta_max_s", 0.5)
+        )
+
+        # Zufälliger Initial-Offset (Sekunden)
+        self._offset: float = random.uniform(
             -initial_offset_ms / 1000.0,
             +initial_offset_ms / 1000.0,
         )
 
-        # Letzte NTP-Offset-Schätzungen θ_ij pro Nachbar
+        # Bootstrapping-Flag
+        self._bootstrapped: bool = False
+
+        # letzte Offsets θ_ij (Sekunden) pro Peer
         self._peer_offsets: Dict[str, float] = {}
 
-        # Rolling RTT-Samples pro Nachbar
+        # RTT-Samples (Sekunden)
         self._peer_rtt_samples: Dict[str, List[float]] = {}
 
-        # Geschätzter Jitter σ_ij (Sekunden) pro Nachbar
+        # Jitter σ_ij (Sekunden)
         self._peer_sigma: Dict[str, float] = {}
 
-        # Für zeitbasiertes Slew-Limit
-        self._last_update_time = time.monotonic()
+        # Zeitstempel des letzten Updates pro Peer (für dt und Slew-Limit)
+        self._last_update_ts: Dict[str, float] = {}
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
     def mesh_time(self) -> float:
         """Aktuelle Mesh-Zeit in Sekunden (monotonic + Offset)."""
         return time.monotonic() + self._offset
 
     def get_offset(self) -> float:
-        """Aktuellen Offset in Sekunden zurückgeben (für Beacon-Response)."""
+        """Aktuellen Offset in Sekunden (für Beacon-Response)."""
         return self._offset
 
     def inject_disturbance(self, delta: float) -> None:
@@ -125,7 +126,6 @@ class SyncModule:
         Praktisch zum Testen der Konvergenz.
         """
         self._offset += delta
-        self._last_update_time = time.monotonic()
         print(
             "[{}] inject_disturbance: delta={:.1f} ms, new offset={:.1f} ms".format(
                 self.node_id, delta * 1000.0, self._offset * 1000.0
@@ -138,25 +138,21 @@ class SyncModule:
 
         Liefert:
           - node_id
-          - offset_estimate (Sekunden + ms)
           - mesh_time
+          - offset_estimate (Sekunden + ms)
           - monotonic_now
-          - peer_offsets (θ_ij in s + ms)
-          - peer_sigma (σ_ij in s + ms)
+          - peer_offsets / peer_offsets_ms
+          - peer_sigma / peer_sigma_ms
           - neighbors
-          - sync_config (relevante Parameter)
+          - sync_config (wichtige Parameter)
         """
         monotonic_now = time.monotonic()
 
         peer_offsets_s = dict(self._peer_offsets)
-        peer_offsets_ms = {
-            k: v * 1000.0 for (k, v) in self._peer_offsets.items()
-        }
+        peer_offsets_ms = {k: v * 1000.0 for k, v in peer_offsets_s.items()}
 
         peer_sigma_s = dict(self._peer_sigma)
-        peer_sigma_ms = {
-            k: v * 1000.0 for (k, v) in self._peer_sigma.items()
-        }
+        peer_sigma_ms = {k: v * 1000.0 for k, v in peer_sigma_s.items()}
 
         return {
             "node_id": self.node_id,
@@ -173,15 +169,16 @@ class SyncModule:
                 "jitter_window": self._jitter_window,
                 "min_samples_for_jitter": self._min_samples_for_jitter,
                 "eta": self._eta,
-                "max_slew_per_second": self._max_slew_per_second,
+                "max_slew_per_second_ms": self._max_slew_per_second_ms,
                 "coap_timeout_s": self._coap_timeout,
                 "drift_damping": self._drift_damping,
+                "bootstrap_theta_max_s": self._bootstrap_theta_max_s,
             },
         }
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # Statistik-Helfer
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
     @staticmethod
     def _compute_iqr(samples: List[float]) -> float:
@@ -222,31 +219,37 @@ class SyncModule:
 
         if len(buf) >= self._min_samples_for_jitter:
             iqr = self._compute_iqr(buf)
-            sigma = 0.7413 * iqr  # IQR -> σ Approximation
+            sigma = 0.7413 * iqr  # IQR -> σ Approx.
             self._peer_sigma[peer] = max(sigma, 1e-6)
+
+    # --------------------------------------------------------------
+    # Bootstrap
+    # --------------------------------------------------------------
 
     def _try_bootstrap(self, peer: str, peer_offset: float, theta: float) -> bool:
         """
         Führt einmalig einen harten Bootstrap-Schritt aus, wenn:
           - noch nicht gebootstrapped
-          - |theta| < bootstrap_theta_max_s (Messung scheint plausibel)
+          - |theta| <= bootstrap_theta_max_s
 
-        Setzt o_i so, dass (peer_offset - o_i) + theta ≈ 0 gilt:
-            o_i = peer_offset + theta
+        Setzt o_i so, dass (o_i - o_j) ≈ θ_ij:
+
+            o_i = o_j + θ_ij
 
         Gibt True zurück, wenn Bootstrap gemacht wurde.
         """
         if self._bootstrapped:
             return False
 
-        if abs(theta) > self._bootstrap_theta_max:
-            # Messung zu wild, kein Bootstrap
+        if self._bootstrap_theta_max_s <= 0.0:
             return False
 
-        new_offset = peer_offset + theta
+        if abs(theta) > self._bootstrap_theta_max_s:
+            return False
+
         old_offset = self._offset
+        new_offset = peer_offset + theta
         self._offset = new_offset
-        self._last_update_time = time.monotonic()
         self._bootstrapped = True
 
         print(
@@ -260,10 +263,9 @@ class SyncModule:
         )
         return True
 
-
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # Symmetrisches Update (Herzstück)
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
     def _symmetrical_update(self, peer: str, peer_offset: float, theta: float) -> None:
         """
@@ -274,43 +276,36 @@ class SyncModule:
         Zielbedingung:
             o_i - o_j ≈ θ_ij
 
-        Wir machen einen Gradienten-Schritt auf o_i:
+        Gradient-Schritt:
 
             error = (o_i - o_j) - θ_ij
             o_i   <- o_i - η * w * error
 
-        Alle Größen (offsets, theta, error, delta) sind in *Sekunden*.
-        max_slew_per_second_ms ist eine Rate in ms/s (Konfig-Einheit).
+        Alle Größen (offsets, theta, error, delta) sind in Sekunden.
         """
 
-        # --- Fehler: wie weit sind wir von o_i - o_j ≈ θ_ij entfernt? ---
-        error = (self._offset - peer_offset) - theta  # Sekunden
+        # Fehler (Sekunden)
+        error = (self._offset - peer_offset) - theta
 
-        # --- Gewichtung nach Link-Qualität (falls σ bekannt, in Sekunden) ---
+        # Gewichtung nach Link-Qualität (σ in Sekunden)
         sigma = self._peer_sigma.get(peer)
         if sigma is not None and sigma > 1e-6:
             weight = 1.0 / (sigma * sigma)
         else:
             weight = 1.0
 
-        # --- optionales Bootstrap-Clamping für große Thetas ---
-        if self._bootstrap_theta_max_s > 0.0:
-            theta_clamped = max(-self._bootstrap_theta_max_s,
-                                min(theta, self._bootstrap_theta_max_s))
-            error = (self._offset - peer_offset) - theta_clamped
+        # Theoretischer Schritt (Sekunden)
+        raw_delta = -self._eta * weight * error
 
-        # --- "theoretischer" Gradient-Schritt (ohne Slew-Limit) ---
-        raw_delta = -self._eta * weight * error  # Sekunden
-
-        # --- dt pro *Peer* ---
+        # dt pro Peer
         now = time.monotonic()
         last = self._last_update_ts.get(peer, now)
         dt = now - last
         if dt <= 0.0:
-            dt = 1e-3  # 1 ms Mindest-dt
+            dt = 1e-3
         self._last_update_ts[peer] = now
 
-        # --- Slew-Limit: max_slew_per_second_ms → Sekunden ---
+        # Slew-Limit: max_slew_per_second_ms -> Sekunden pro Sekunde
         if self._max_slew_per_second_ms > 0.0:
             max_step_s = (self._max_slew_per_second_ms / 1000.0) * dt
             if raw_delta > max_step_s:
@@ -322,16 +317,15 @@ class SyncModule:
         else:
             delta = raw_delta
 
-        # --- Offset aktualisieren ---
-        self._offset += delta  # Sekunden
+        # Offset aktualisieren
+        self._offset += delta
 
-        # --- Drift-Dämpfung (proportional zur Zeit) ---
+        # Drift-Dämpfung ~ exp(-λ dt) (hier linearisiert)
         if self._drift_damping > 0.0:
-            # Dämpfung ~ exp(-λ dt) linearisiert:
             factor = max(0.0, 1.0 - self._drift_damping * dt)
             self._offset *= factor
 
-        # --- Debug-Output in ms ---
+        # Debug
         print(
             "[{}] sym-update with {}: error={:.3f} ms, raw_delta={:.3f} ms, "
             "delta={:.3f} ms, offset={:.3f} ms".format(
@@ -344,9 +338,9 @@ class SyncModule:
             )
         )
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # Beacon-Versand
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
 
     async def send_beacons(self, client_ctx: aiocoap.Context) -> None:
         """
@@ -358,9 +352,7 @@ class SyncModule:
           - Antwort: {t2, t3, offset_j}
           - t4 = monotonic()
           - NTP-Formeln -> θ_ij, RTT
-          - Jitter-Update, symmetrisches Offset-Update
-
-        Unter Windows: Dev-Mode -> no-op.
+          - Jitter-Update, Bootstrap, symmetrisches Update
         """
         if IS_WINDOWS:
             return
@@ -370,7 +362,7 @@ class SyncModule:
             if not ip:
                 continue
 
-            uri = "coap://{}/sync/beacon".format(ip)
+            uri = f"coap://{ip}/sync/beacon"
 
             t1 = time.monotonic()
             payload = {
@@ -427,17 +419,17 @@ class SyncModule:
             self._update_rtt_sigma(peer, rtt)
             self._peer_offsets[peer] = theta
 
-            # ZUERST: Bootstrap versuchen (einmaliger harter Sprung in die richtige Region)
+            # Bootstrap zuerst (einmaliger harter Sprung)
             did_bootstrap = self._try_bootstrap(peer, peer_offset, theta)
 
-            # Danach: reguläres symmetrisches Update (feines Nachregeln)
+            # Danach feines Nachregeln
             if not did_bootstrap:
                 self._symmetrical_update(peer, peer_offset, theta)
 
-            # Debug-Kurzsummary
+            # Kurzsummary
             if peer in self._peer_sigma:
                 sigma_ms = self._peer_sigma[peer] * 1000.0
-                sigma_str = "{:.3f} ms".format(sigma_ms)
+                sigma_str = f"{sigma_ms:.3f} ms"
             else:
                 sigma_str = "n/a"
 

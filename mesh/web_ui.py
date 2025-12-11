@@ -116,11 +116,8 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
         """
         SELECT node_id, t_wall, t_mesh, offset, err_mesh_vs_wall, created_at
         FROM ntp_reference
-        WHERE created_at >= strftime('%s','now', ?)
         ORDER BY id ASC
-        LIMIT ?
-        """,
-        (f"-{int(window_seconds)} seconds", max_points),
+        """
     ).fetchall()
     conn.close()
 
@@ -130,6 +127,11 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
             "pairs": {},
             "jitter_pairs": {},
         }
+
+    # wir beschränken das Fenster in Python (letzte window_seconds)
+    newest_ts = max(float(r["created_at"]) for r in rows)
+    cutoff = newest_ts - float(window_seconds)
+    rows = [r for r in rows if float(r["created_at"]) >= cutoff]
 
     # nach Node gruppieren
     per_node = {}

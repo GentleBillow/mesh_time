@@ -19,7 +19,8 @@
     "button_pin": null
   },
   "B": {
-    "ip": "192.168.178.49",
+    "color": "red",
+    "ip": "172.16.32.164",
     "parent": "C",
     "neighbors": ["C"],
     "sensor_type": "potentiometer",
@@ -27,7 +28,8 @@
     "button_pin": null
   },
   "C": {
-    "ip": "192.168.178.48",
+    "color": "purple",
+    "ip": "172.16.32.136",
     "parent": null,
     "neighbors": ["B"],
     "sensor_type": "potentiometer",

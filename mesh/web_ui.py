@@ -1,7 +1,8 @@
 # web_ui.py
-# MeshTime Web-UI mit 5 Plots + Mesh-Topologie + Live-Updates
+# MeshTime Web-UI mit relativen Plots (paarweise ΔMesh-Time) + Topologie
 
 import json
+import math
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -10,8 +11,6 @@ from flask import Flask, render_template_string, jsonify
 
 DB_PATH = Path("mesh_data.sqlite")
 CFG_PATH = Path("config/nodes.json")
-
-LED_PERIOD_S = 0.5  # 500 ms
 
 app = Flask(__name__)
 
@@ -36,39 +35,83 @@ def load_config():
 def get_topology():
     """
     Liest config/nodes.json und baut eine einfache Mesh-Topologie:
-      - nodes: [{id, ip, color}]
+      - nodes: [{id, ip, color, is_root}]
       - links: [{source, target}]
+      - has_root: bool
     """
     cfg = load_config()
     nodes = []
     links = []
+    has_root = False
 
     for node_id, entry in cfg.items():
         if node_id == "sync":
             continue
+
         ip = entry.get("ip")
         color = entry.get("color") or "#3498db"
-        nodes.append({"id": node_id, "ip": ip, "color": color})
+        sync_cfg = entry.get("sync", {}) or {}
+        is_root = bool(sync_cfg.get("is_root", False))
+        if is_root:
+            has_root = True
+
+        nodes.append(
+            {
+                "id": node_id,
+                "ip": ip,
+                "color": color,
+                "is_root": is_root,
+            }
+        )
 
         for neigh in entry.get("neighbors", []):
             # doppelte Kanten vermeiden
             if node_id < neigh:
                 links.append({"source": node_id, "target": neigh})
 
-    return {"nodes": nodes, "links": links}
+    return {"nodes": nodes, "links": links, "has_root": has_root}
 
 
-def get_ntp_timeseries(window_seconds=600, max_points=1000, root_id="C"):
+def _quantiles(values):
     """
-    Holt die letzten NTP-Referenzen aus der DB und baut:
-      - pro Node eine Zeitreihe von:
-        t_wall, err_ms, offset_ms, phase_ms, delta_vs_root_ms
-      - jitter_ms pro Node (stddev der err_ms)
+    Einfache Quantils-Berechnung (Q1, Median, Q3) mit linearer Interpolation.
+    Liefert: (min, q1, median, q3, max)
+    """
+    xs = sorted(values)
+    n = len(xs)
+    if n == 0:
+        return None
+
+    def q(p: float) -> float:
+        if n == 1:
+            return xs[0]
+        pos = p * (n - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return xs[lo]
+        frac = pos - lo
+        return xs[lo] * (1.0 - frac) + xs[hi] * frac
+
+    return xs[0], q(0.25), q(0.5), q(0.75), xs[-1]
+
+
+def get_ntp_timeseries(window_seconds=600, max_points=2000):
+    """
+    Holt die letzten ntp_reference-Samples und baut:
+      - series_per_node: pro Node Zeitreihe mit
+            t_wall, offset_ms, delta_offset_ms
+      - pairs: paarweise ΔMesh-Time (Node i vs. j) als Zeitreihe
+            t_wall, delta_ms
+      - jitter_pairs: Boxplot-Stats der ΔMesh-Time pro Paar
+            {pair_id: {min,q1,median,q3,max}}
+    ΔMesh-Time wird aus den Fehlern err_mesh_vs_wall berechnet, d.h.
+    Δ_ij ≈ (mesh_i - wall) - (mesh_j - wall) = err_i - err_j.
+    Wallclock fällt also raus, wir nutzen es nur als gemeinsame Referenz.
     """
     conn = get_conn()
     cur = conn.cursor()
 
-    # Hole die letzten max_points aus dem gewünschten Zeitfenster
     rows = cur.execute(
         """
         SELECT node_id, t_wall, t_mesh, offset, err_mesh_vs_wall, created_at
@@ -81,82 +124,97 @@ def get_ntp_timeseries(window_seconds=600, max_points=1000, root_id="C"):
     ).fetchall()
     conn.close()
 
-    # in Python strukturieren
+    if not rows:
+        return {
+            "series": {},
+            "pairs": {},
+            "jitter_pairs": {},
+        }
+
+    # nach Node gruppieren
     per_node = {}
     for r in rows:
-        node = r["node_id"]
-        per_node.setdefault(node, []).append(r)
+        per_node.setdefault(r["node_id"], []).append(r)
 
-    # Letzte Root-Fehler (approx) pro Zeitpunkt: wir nehmen einfach
-    # den zuletzt gesehenen Fehler der Root, wenn kein Zeitabgleich möglich.
-    # Für eine Lab-Visualisierung reicht das aus.
-    def build_series():
-        series = {}
-        err_by_node = {}  # für Jitter
-        root_last_err = None
-
-        # wir gehen wieder durch alle Rows und bauen für jeden Node Punkte
-        for node, node_rows in per_node.items():
-            if node not in series:
-                series[node] = []
-                err_by_node[node] = []
-
-        # Wir iterieren lieber in globaler Zeitreihenfolge
-        all_rows_sorted = sorted(rows, key=lambda r: r["t_wall"])
-
-        for r in all_rows_sorted:
-            node = r["node_id"]
+    # Node-Zeitreihen mit Offset + Delta-Offset
+    series = {}
+    for node_id, node_rows in per_node.items():
+        node_rows_sorted = sorted(node_rows, key=lambda r: r["t_wall"])
+        node_series = []
+        prev_offset_ms = None
+        for r in node_rows_sorted:
             t_wall = float(r["t_wall"])
-            t_mesh = float(r["t_mesh"])
-            offset = float(r["offset"])
-            err = float(r["err_mesh_vs_wall"])
-
-            err_ms = err * 1000.0
-            offset_ms = offset * 1000.0
-
-            # LED-Phasenfehler relativ zu Flanke:
-            # Periodensignal P, Phase in [0, P),
-            # Symmetrische Distanz zur nächsten idealen Flanke (0 oder P/2)
-            phi = t_mesh % LED_PERIOD_S
-            phase_err_ms = min(phi, LED_PERIOD_S - phi) * 1000.0
-
-            # Root-Fehler tracken
-            if node == root_id:
-                root_last_err = err_ms
-
-            # ΔMesh-Time gegen Root als Differenz der Fehler
-            if root_last_err is not None:
-                delta_vs_root_ms = err_ms - root_last_err
+            offset_ms = float(r["offset"]) * 1000.0
+            if prev_offset_ms is None:
+                delta_offset_ms = 0.0
             else:
-                delta_vs_root_ms = None
+                delta_offset_ms = offset_ms - prev_offset_ms
+            prev_offset_ms = offset_ms
 
-            point = {
-                "t_wall": t_wall,
-                "err_ms": err_ms,
-                "offset_ms": offset_ms,
-                "phase_ms": phase_err_ms,
-                "delta_vs_root_ms": delta_vs_root_ms,
-            }
-            series[node].append(point)
-            err_by_node[node].append(err_ms)
+            node_series.append(
+                {
+                    "t_wall": t_wall,
+                    "offset_ms": offset_ms,
+                    "delta_offset_ms": delta_offset_ms,
+                }
+            )
+        series[node_id] = node_series
 
-        # Jitter (stddev) pro Node
-        jitter_ms = {}
-        for node, errs in err_by_node.items():
-            if len(errs) < 2:
-                jitter_ms[node] = None
-                continue
-            mean = sum(errs) / len(errs)
-            var = sum((e - mean) ** 2 for e in errs) / (len(errs) - 1)
-            jitter_ms[node] = var ** 0.5
+    # Paarweise ΔMesh-Time (err_i - err_j)
+    all_rows_sorted = sorted(rows, key=lambda r: r["t_wall"])
+    last_err_ms = {}  # node_id -> letzter Fehler in ms
+    pair_series = {}  # "A-B" -> [{"t_wall":..,"delta_ms":..}, ...]
 
-        return series, jitter_ms
+    def norm_pair(a, b):
+        return "-".join(sorted([a, b]))
 
-    series, jitter_ms = build_series()
+    for r in all_rows_sorted:
+        node = r["node_id"]
+        t_wall = float(r["t_wall"])
+        err_ms = float(r["err_mesh_vs_wall"]) * 1000.0
+        last_err_ms[node] = err_ms
+
+        # sobald wir mindestens zwei Nodes gesehen haben, können wir
+        # für alle bekannten Paare Δ berechnen
+        nodes_now = sorted(last_err_ms.keys())
+        if len(nodes_now) < 2:
+            continue
+
+        for i in range(len(nodes_now)):
+            for j in range(i + 1, len(nodes_now)):
+                a = nodes_now[i]
+                b = nodes_now[j]
+                pair_id = norm_pair(a, b)
+                delta_ms = last_err_ms[a] - last_err_ms[b]
+                pair_series.setdefault(pair_id, []).append(
+                    {
+                        "t_wall": t_wall,
+                        "delta_ms": delta_ms,
+                    }
+                )
+
+    # Jitter-Boxplots über ΔMesh-Time pro Paar
+    jitter_pairs = {}
+    for pair_id, pts in pair_series.items():
+        if len(pts) < 3:
+            continue
+        deltas = [p["delta_ms"] for p in pts]
+        stats = _quantiles(deltas)
+        if stats is None:
+            continue
+        min_v, q1, med, q3, max_v = stats
+        jitter_pairs[pair_id] = {
+            "min": min_v,
+            "q1": q1,
+            "median": med,
+            "q3": q3,
+            "max": max_v,
+        }
+
     return {
-        "root_id": root_id,
         "series": series,
-        "jitter_ms": jitter_ms,
+        "pairs": pair_series,
+        "jitter_pairs": jitter_pairs,
     }
 
 
@@ -199,7 +257,7 @@ def api_topology():
 
 @app.route("/api/ntp_timeseries")
 def api_ntp_timeseries():
-    data = get_ntp_timeseries(window_seconds=600, max_points=1000, root_id="C")
+    data = get_ntp_timeseries(window_seconds=600, max_points=2000)
     return jsonify(data)
 
 
@@ -315,14 +373,15 @@ TEMPLATE = r"""
       opacity: 0.6;
     }
   </style>
-  <!-- Chart.js + Date-Adapter -->
+  <!-- Chart.js + Date-Adapter + BoxPlot-Plugin -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-box-and-violin-plot@4.3.0/build/Chart.BoxPlot.js"></script>
 </head>
 <body>
   <h1>MeshTime Monitor</h1>
   <p class="small">
-    Datenquelle: <code>{{ db_path }}</code> (ntp_reference)
+    Datenquelle: <code>{{ db_path }}</code> (ntp_reference, relativ ausgewertet)
   </p>
 
   <div class="grid">
@@ -370,7 +429,11 @@ TEMPLATE = r"""
       <div class="card" style="margin-top:1rem;">
         <h2>Mesh-Topologie</h2>
         <canvas id="meshCanvas"></canvas>
-        <p class="small">Knoten und Links basierend auf <code>config/nodes.json</code>. Grün = Node hat NTP-Daten, grau = bisher keine.</p>
+        <p class="small">
+          Knoten und Links basierend auf <code>config/nodes.json</code>.
+          Grün = Node hat Daten, grau = bisher keine.
+          Dicker Rand = <strong>Root</strong> (falls vorhanden).
+        </p>
       </div>
     </div>
 
@@ -379,45 +442,37 @@ TEMPLATE = r"""
       <h2>Mesh-Time Plots (letzte 10 Minuten)</h2>
       <div class="plots-grid">
         <div>
-          <h3 style="font-size:0.95rem;">1) Mesh − Wallclock Fehler</h3>
-          <canvas id="errChart" height="160"></canvas>
+          <h3 style="font-size:0.95rem;">1) Paarweise ΔMesh-Time</h3>
+          <canvas id="pairChart" height="160"></canvas>
         </div>
         <div>
-          <h3 style="font-size:0.95rem;">2) Offset pro Node</h3>
-          <canvas id="offsetChart" height="160"></canvas>
+          <h3 style="font-size:0.95rem;">2) Offset-Änderung pro Node (Δoffset)</h3>
+          <canvas id="offsetDeltaChart" height="160"></canvas>
         </div>
         <div>
-          <h3 style="font-size:0.95rem;">3) ΔMesh-Time vs. Root</h3>
-          <canvas id="deltaChart" height="160"></canvas>
-        </div>
-        <div>
-          <h3 style="font-size:0.95rem;">4) LED-Phasenfehler</h3>
-          <canvas id="phaseChart" height="160"></canvas>
-        </div>
-        <div>
-          <h3 style="font-size:0.95rem;">5) Jitter (StdDev Fehler)</h3>
-          <canvas id="jitterChart" height="160"></canvas>
+          <h3 style="font-size:0.95rem;">3) Jitter der ΔMesh-Time (Boxplots pro Paar)</h3>
+          <canvas id="jitterBoxChart" height="160"></canvas>
         </div>
       </div>
     </div>
   </div>
 
   <div class="footer">
-    MeshTime Web-UI – Wenn alle Kurven flach &lt;5 ms sind und das Mesh grün leuchtet, hast du einen kleinen Zeit-Konsens-Computer gebaut.
+    MeshTime Web-UI – Wenn alle ΔMesh-Linien flach &lt;5 ms liegen, hast du einen kleinen Zeit-Konsens-Computer gebaut.
   </div>
 
   <script>
     const colors = [
-      'rgba(46, 204, 113, 1)',
-      'rgba(52, 152, 219, 1)',
-      'rgba(231, 76, 60, 1)',
-      'rgba(241, 196, 15, 1)',
-      'rgba(155, 89, 182, 1)'
+      'rgba(46, 204, 113, 0.9)',
+      'rgba(52, 152, 219, 0.9)',
+      'rgba(231, 76, 60, 0.9)',
+      'rgba(241, 196, 15, 0.9)',
+      'rgba(155, 89, 182, 0.9)'
     ];
 
-    let errChart, offsetChart, deltaChart, phaseChart, jitterChart;
+    let pairChart, offsetDeltaChart, jitterBoxChart;
 
-    function makeLineChart(ctx, labelSuffix, yLabel) {
+    function makeLineChart(ctx, yLabel) {
       return new Chart(ctx, {
         type: 'line',
         data: { datasets: [] },
@@ -445,22 +500,34 @@ TEMPLATE = r"""
             },
             tooltip: {
               callbacks: {
-                label: (ctx) => `${ctx.dataset.label}${labelSuffix}: ${ctx.parsed.y.toFixed(2)} ${yLabel}`
+                label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} ${yLabel}`
               }
+            }
+          },
+          elements: {
+            line: {
+              tension: 0.1
+            },
+            point: {
+              radius: 0
             }
           }
         }
       });
     }
 
-    function makeBarChart(ctx, yLabel) {
+    function makeBoxPlotChart(ctx, yLabel) {
       return new Chart(ctx, {
-        type: 'bar',
-        data: { labels: [], datasets: [{
-          label: 'Jitter',
-          data: [],
-          backgroundColor: 'rgba(52, 152, 219, 0.7)'
-        }] },
+        type: 'boxplot',
+        data: {
+          labels: [],
+          datasets: [{
+            label: 'ΔMesh-Time',
+            data: [],
+            backgroundColor: 'rgba(52, 152, 219, 0.6)',
+            borderColor: 'rgba(52, 152, 219, 1)',
+          }]
+        },
         options: {
           responsive: true,
           animation: false,
@@ -480,6 +547,20 @@ TEMPLATE = r"""
           plugins: {
             legend: {
               labels: { color: '#eee' }
+            },
+            tooltip: {
+              callbacks: {
+                label: (ctx) => {
+                  const v = ctx.raw;
+                  return [
+                    `min: ${v.min.toFixed(2)} ${yLabel}`,
+                    `Q1 : ${v.q1.toFixed(2)} ${yLabel}`,
+                    `med: ${v.median.toFixed(2)} ${yLabel}`,
+                    `Q3 : ${v.q3.toFixed(2)} ${yLabel}`,
+                    `max: ${v.max.toFixed(2)} ${yLabel}`,
+                  ];
+                }
+              }
             }
           }
         }
@@ -487,39 +568,62 @@ TEMPLATE = r"""
     }
 
     function initCharts() {
-      errChart    = makeLineChart(document.getElementById('errChart').getContext('2d'), '', 'ms');
-      offsetChart = makeLineChart(document.getElementById('offsetChart').getContext('2d'), '', 'ms');
-      deltaChart  = makeLineChart(document.getElementById('deltaChart').getContext('2d'), ' vs Root', 'ms');
-      phaseChart  = makeLineChart(document.getElementById('phaseChart').getContext('2d'), '', 'ms');
-      jitterChart = makeBarChart(document.getElementById('jitterChart').getContext('2d'), 'ms');
+      pairChart        = makeLineChart(document.getElementById('pairChart').getContext('2d'), 'ms');
+      offsetDeltaChart = makeLineChart(document.getElementById('offsetDeltaChart').getContext('2d'), 'ms');
+      jitterBoxChart   = makeBoxPlotChart(document.getElementById('jitterBoxChart').getContext('2d'), 'ms');
     }
 
-    function updateLineChart(chart, series, field, rootId, skipRootInDelta=false) {
+    function updatePairChart(chart, pairs) {
+      const pairIds = Object.keys(pairs).sort();
+      chart.data.datasets = [];
+      pairIds.forEach((pairId, idx) => {
+        const color = colors[idx % colors.length];
+        const points = pairs[pairId].map(p => ({
+          x: new Date(p.t_wall * 1000),
+          y: p.delta_ms
+        }));
+        chart.data.datasets.push({
+          label: pairId,
+          data: points,
+          borderColor: color,
+          backgroundColor: color,
+          fill: false,
+          pointRadius: 0,
+          borderWidth: 1.5,
+          // leichte Transparenz für Überlagerung
+          borderColor: color.replace('0.9', '0.5'),
+          backgroundColor: color.replace('0.9', '0.2'),
+        });
+      });
+      chart.update();
+    }
+
+    function updateOffsetDeltaChart(chart, series) {
       const nodeIds = Object.keys(series).sort();
       chart.data.datasets = [];
       nodeIds.forEach((nodeId, idx) => {
-        if (skipRootInDelta && nodeId === rootId) return;
         const color = colors[idx % colors.length];
-        const points = series[nodeId]
-          .filter(p => p[field] !== null && p[field] !== undefined)
-          .map(p => ({ x: new Date(p.t_wall * 1000), y: p[field] }));
+        const points = series[nodeId].map(p => ({
+          x: new Date(p.t_wall * 1000),
+          y: p.delta_offset_ms
+        }));
         chart.data.datasets.push({
           label: `Node ${nodeId}`,
           data: points,
           borderColor: color,
           backgroundColor: color,
           fill: false,
-          tension: 0.1,
-          pointRadius: 0
+          pointRadius: 0,
+          borderWidth: 1.5
         });
       });
       chart.update();
     }
 
-    function updateJitterChart(chart, jitter_ms) {
-      const nodeIds = Object.keys(jitter_ms).sort();
-      chart.data.labels = nodeIds;
-      chart.data.datasets[0].data = nodeIds.map(node => jitter_ms[node] || 0);
+    function updateJitterBoxChart(chart, jitter_pairs) {
+      const pairIds = Object.keys(jitter_pairs).sort();
+      chart.data.labels = pairIds;
+      chart.data.datasets[0].data = pairIds.map(pairId => jitter_pairs[pairId]);
       chart.update();
     }
 
@@ -577,15 +681,16 @@ TEMPLATE = r"""
         const pos = positions[node.id];
         if (!pos) return;
         const active = activeNodes.has(node.id);
-        const r = 16;
+        const isRoot = !!node.is_root;
+        const r = isRoot ? 20 : 16;
 
         ctx.beginPath();
         ctx.arc(pos.x, pos.y, r, 0, 2 * Math.PI);
         ctx.fillStyle = active ? 'rgba(39, 174, 96, 0.25)' : 'rgba(149, 165, 166, 0.2)';
         ctx.fill();
 
-        ctx.lineWidth = active ? 2.0 : 1.0;
-        ctx.strokeStyle = active ? '#2ecc71' : '#7f8c8d';
+        ctx.lineWidth = isRoot ? 3.0 : (active ? 2.0 : 1.0);
+        ctx.strokeStyle = isRoot ? '#f1c40f' : (active ? '#2ecc71' : '#7f8c8d');
         ctx.stroke();
 
         ctx.fillStyle = '#ecf0f1';
@@ -594,6 +699,17 @@ TEMPLATE = r"""
         ctx.textBaseline = 'middle';
         ctx.fillText(node.id, pos.x, pos.y);
       });
+
+      // Root-Info
+      const roots = topo.nodes.filter(n => n.is_root);
+      ctx.fillStyle = '#aaa';
+      ctx.font = '11px system-ui';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      const rootLabel = roots.length
+        ? 'Root: ' + roots.map(r => r.id).join(', ')
+        : 'Root: keiner (voll symmetrisch)';
+      ctx.fillText(rootLabel, 10, 10);
     }
 
     async function refresh() {
@@ -604,13 +720,12 @@ TEMPLATE = r"""
         ]);
 
         const series = ntpData.series || {};
-        const rootId = ntpData.root_id;
+        const pairs = ntpData.pairs || {};
+        const jitter_pairs = ntpData.jitter_pairs || {};
 
-        updateLineChart(errChart,    series, 'err_ms',          rootId);
-        updateLineChart(offsetChart, series, 'offset_ms',       rootId);
-        updateLineChart(deltaChart,  series, 'delta_vs_root_ms', rootId, true);
-        updateLineChart(phaseChart,  series, 'phase_ms',        rootId);
-        updateJitterChart(jitterChart, ntpData.jitter_ms || {});
+        updatePairChart(pairChart, pairs);
+        updateOffsetDeltaChart(offsetDeltaChart, series);
+        updateJitterBoxChart(jitterBoxChart, jitter_pairs);
 
         // aktive Nodes = alle, die Daten haben
         const activeNodes = new Set(Object.keys(series || {}));

@@ -227,25 +227,13 @@ class SyncModule:
     # --------------------------------------------------------------
 
     def _try_bootstrap(self, peer: str, peer_offset: float, theta: float) -> bool:
-        """
-        Führt einmalig einen harten Bootstrap-Schritt aus, wenn:
-          - noch nicht gebootstrapped
-          - |theta| <= bootstrap_theta_max_s
-
-        Setzt o_i so, dass (o_i - o_j) ≈ θ_ij:
-
-            o_i = o_j + θ_ij
-
-        Gibt True zurück, wenn Bootstrap gemacht wurde.
-        """
         if self._bootstrapped:
             return False
 
-        if self._bootstrap_theta_max_s <= 0.0:
-            return False
-
-        if abs(theta) > self._bootstrap_theta_max_s:
-            return False
+        # Wenn bootstrap_theta_max_s <= 0: kein Threshold, immer erste Messung nutzen
+        if self._bootstrap_theta_max_s > 0.0:
+            if abs(theta) > self._bootstrap_theta_max_s:
+                return False
 
         old_offset = self._offset
         new_offset = peer_offset + theta

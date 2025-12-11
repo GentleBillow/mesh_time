@@ -184,10 +184,18 @@ async def monitor_loop(selected_nodes=None):
                     status_by_node[nid] = st
 
                 # --- globale Δmesh_time berechnen ---
-                alive = [st for st in status_by_node.values() if st is not None]
-                if alive:
-                    mesh_times = [s["mesh_time"] for s in alive]
-                    delta_mesh = max(mesh_times) - min(mesh_times)
+                mesh_values = []
+                for st in status_by_node.values():
+                    if not st:
+                        continue
+                    if not st.get("_ok", False):
+                        continue
+                    mt = st.get("mesh_time", None)
+                    if isinstance(mt, (int, float)):
+                        mesh_values.append(mt)
+
+                if mesh_values:
+                    delta_mesh = max(mesh_values) - min(mesh_values)
                 else:
                     delta_mesh = None
 

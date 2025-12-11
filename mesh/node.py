@@ -2,6 +2,7 @@
 # mesh/node.py
 
 import asyncio
+import time
 import platform
 from typing import Dict, Any
 
@@ -18,7 +19,7 @@ from .sync import SyncModule
 from .sensor import DummySensor
 from .led import DummyLED, GrovePiLED  # falls du das schon so drin hast
 from .coap_endpoints import build_site
-from .storage import TimeSeriesDB     # <--- NEU
+from .storage import Storage     # <--- NEU
 
 
 
@@ -47,19 +48,15 @@ class MeshNode:
                     print(f"[{node_id}] GrovePiLED failed ({e}) → falling back to DummyLED")
                     self.led = DummyLED(pin=led_pin)
 
-        # ------------------------------------------------------------------
-        # Optional: lokale SQLite-DB (z.B. nur auf Node C)
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Optionale lokale DB (z.B. nur auf Node C)
+        # --------------------------------------------------------------
+        self.storage = None
         db_path = node_cfg.get("db_path")
         if db_path:
-            try:
-                self.db = TimeSeriesDB(db_path)
-                print(f"[{node_id}] TimeSeriesDB initialised at {db_path}")
-            except Exception as e:
-                print(f"[{node_id}] Failed to init TimeSeriesDB: {e}")
-                self.db = None
-        else:
-            self.db = None
+            print(f"[{self.id}] Initializing local DB at {db_path}")
+            self.storage = Storage(db_path)
+
 
 
 
@@ -204,18 +201,62 @@ class MeshNode:
             while True:
                 await asyncio.sleep(3600)
 
+    async def ntp_monitor_loop(self, interval: float = 5.0):
+        """
+        Periodisch NTP-Referenzwerte loggen:
+          - t_wall = time.time()
+          - t_mono = time.monotonic()
+          - t_mesh = self.sync.mesh_time()
+          - offset = self.sync.get_offset()
+          - err_mesh_vs_wall = t_mesh - t_wall
+        """
+        if self.storage is None:
+            # Kein lokales DB-Backend → Loop einfach schlafen lassen
+            while True:
+                await asyncio.sleep(3600.0)
+
+        print(f"[{self.id}] ntp_monitor_loop started (interval={interval}s)")
+        while True:
+            t_wall = time.time()
+            t_mono = time.monotonic()
+            t_mesh = self.sync.mesh_time()
+            offset = self.sync.get_offset()
+            err = t_mesh - t_wall
+
+            try:
+                self.storage.insert_ntp_reference(
+                    node_id=self.id,
+                    t_wall=t_wall,
+                    t_mono=t_mono,
+                    t_mesh=t_mesh,
+                    offset=offset,
+                    err_mesh_vs_wall=err,
+                )
+            except Exception as e:
+                print(f"[{self.id}] ntp_monitor_loop: DB insert failed: {e}")
+
+            await asyncio.sleep(interval)
+
+
     async def run_async(self):
         """
         Start all node tasks.
         """
         print("[{}] MeshNode starting with cfg: {}".format(self.id, self.cfg))
 
-        await asyncio.gather(
+        tasks = [
             self.coap_loop(),    # CoAP server
             self.sync_loop(),    # Sync beacons
             self.sensor_loop(),  # Sensor sampling
             self.led_loop(),     # LED blinking
-        )
+        ]
+
+        # Nur Knoten mit DB (z.B. C) loggen NTP-Referenz
+        if self.storage is not None:
+            tasks.append(self.ntp_monitor_loop())
+
+        await asyncio.gather(*tasks)
+
 
     def run(self):
         try:

@@ -139,15 +139,16 @@ class RelayIngestSensorResource(resource.Resource):
     """
     POST /relay/ingest/sensor
 
-    Payload (Beispiel):
+    Payload JSON (Beispiel):
       {
-        "src": "B",
-        "t_mesh": 12345.678,
-        "value": 0.42
+        "node_id": "B",
+        "t_mesh": 1234.567,
+        "monotonic": 1230.123,
+        "value": 42.0,
+        "extra": { ... }        # optional, wird als raw_json gespeichert
       }
 
-    - Auf Sinks (mit node.db != None) wird das in SQLite gespeichert.
-    - Auf anderen Nodes nur geloggt.
+    Auf dem Sammelknoten (z.B. C) wird das in SQLite geschrieben.
     """
 
     def __init__(self, node):
@@ -160,29 +161,36 @@ class RelayIngestSensorResource(resource.Resource):
         except Exception:
             data = {}
 
-        src = data.get("src", self.node.id)
-        t_mesh = float(data.get("t_mesh", 0.0))
-        value = data.get("value", None)
+        print("[{}] relay/ingest/sensor: {}".format(self.node.id, data))
 
-        print("[{}] relay/ingest/sensor from {}: t_mesh={:.3f}, value={}".format(
-            self.node.id, src, t_mesh, value
-        ))
+        # Versuchen, in DB zu schreiben, falls vorhanden
+        if getattr(self.node, "storage", None) is not None:
+            node_id = str(data.get("node_id", "unknown"))
+            t_mesh = float(data.get("t_mesh", 0.0))
+            monotonic = data.get("monotonic")
+            if monotonic is not None:
+                monotonic = float(monotonic)
 
-        # Wenn eine DB vorhanden ist → speichern
-        if getattr(self.node, "db", None) is not None:
+            value = data.get("value")
+            if value is not None:
+                value = float(value)
+
+            # Alles übrige als raw_json speichern
+            raw_json = json.dumps(data)
+
             try:
-                raw_json = json.dumps(data, ensure_ascii=False)
-                self.node.db.insert_reading(
-                    node_id=src,
+                self.node.storage.insert_reading(
+                    node_id=node_id,
                     t_mesh=t_mesh,
-                    value=float(value) if value is not None else None,
-                    monotonic=time.monotonic(),
+                    value=value if value is not None else 0.0,
+                    monotonic=monotonic,
                     raw_json=raw_json,
                 )
             except Exception as e:
-                print("[{}] DB insert failed: {}".format(self.node.id, e))
+                print("[{}] relay/ingest/sensor: DB insert failed: {}".format(self.node.id, e))
 
         return aiocoap.Message(code=aiocoap.CHANGED)
+
 
 
 

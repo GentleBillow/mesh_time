@@ -33,7 +33,7 @@
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "button_pin": null,
-    "db_path": "mesh_readings_c.sqlite"
+    "db_path": "mesh_data.sqlite"
   },
   "D": {
     "ip": "192.168.xx.xx",

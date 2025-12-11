@@ -37,7 +37,7 @@
     "button_pin": null,
     "db_path": "mesh_data.sqlite",
     "sync": {
-      "is_root": false
+      "is_root": true
     }
   },
   "D": {

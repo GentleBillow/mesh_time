@@ -3,47 +3,68 @@
 
 import sqlite3
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional
 import time
+import json
 
 
-class TimeSeriesDB:
+class Storage:
     """
-    Sehr einfache SQLite-DB für Sensordaten.
+    Zentrale SQLite-Datenbank für das Mesh.
 
-    Eine Tabelle:
-      sensor_readings(
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        node_id     TEXT,
-        t_mesh      REAL,
-        monotonic   REAL,
-        value       REAL,
-        raw_json    TEXT,
-        created_at  REAL
-      )
+    Tabellen:
+    ----------
+    1) sensor_readings
+        id INTEGER PRIMARY KEY
+        node_id TEXT
+        t_mesh REAL               -- Mesh-Zeitstempel der Messung
+        monotonic REAL            -- time.monotonic() beim Empfang
+        value REAL                -- Sensorwert
+        raw_json TEXT             -- Original-JSON (optional)
+        created_at REAL           -- time.time()
 
-    Idee:
-      - node_id: wer hat gemessen
-      - t_mesh: Mesh-Zeitstempel der Messung
-      - monotonic: (optional) lokale monotonic Zeit beim Empfang
-      - value: Sensorwert (float)
-      - raw_json: Original-Payload als JSON-String (Debug/Erweiterbarkeit)
-      - created_at: time.time() beim Insert
+    2) ntp_reference
+        id INTEGER PRIMARY KEY
+        node_id TEXT
+        t_wall REAL               -- time.time() (NTP-stabil)
+        t_mono REAL               -- time.monotonic()
+        t_mesh REAL               -- mesh_time()
+        offset REAL               -- aktueller Offset
+        err_mesh_vs_wall REAL     -- t_mesh - t_wall
+        created_at REAL           -- time.time()
     """
 
     def __init__(self, path: str):
         self.path = path
-        # SQLite ist nicht super threadsafe → einfacher Lock
         self._lock = threading.Lock()
         self._ensure_schema()
 
+    # ------------------------------------------------------------------
+    #  INTERNAL: Connection Helper
+    # ------------------------------------------------------------------
+
     def _get_conn(self) -> sqlite3.Connection:
-        # isolation_level=None → autocommit
-        return sqlite3.connect(self.path, isolation_level=None)
+        """
+        Jede Operation bekommt eine neue Connection (SQLite kann das gut),
+        aber wir schützen sie global mit einem Lock.
+        """
+        conn = sqlite3.connect(self.path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    # ------------------------------------------------------------------
+    #  SCHEMA
+    # ------------------------------------------------------------------
 
     def _ensure_schema(self) -> None:
+        """
+        Initialisiert alle Tabellen.
+        """
         with self._lock, self._get_conn() as conn:
             cur = conn.cursor()
+
+            # Sensor-Readings
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sensor_readings (
@@ -57,7 +78,28 @@ class TimeSeriesDB:
                 )
                 """
             )
+
+            # NTP/Wallclock-Referenz
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ntp_reference (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT NOT NULL,
+                    t_wall REAL NOT NULL,
+                    t_mono REAL NOT NULL,
+                    t_mesh REAL NOT NULL,
+                    offset REAL NOT NULL,
+                    err_mesh_vs_wall REAL NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+
             conn.commit()
+
+    # ------------------------------------------------------------------
+    #  SENSOR READING API
+    # ------------------------------------------------------------------
 
     def insert_reading(
         self,
@@ -68,16 +110,74 @@ class TimeSeriesDB:
         raw_json: Optional[str] = None,
     ) -> None:
         """
-        Ein Messpunkt einfügen.
+        Fügt einen Sensorwert ein.
         """
         ts = time.time()
+
+        if isinstance(raw_json, dict):
+            raw_json = json.dumps(raw_json)
+
         with self._lock, self._get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO sensor_readings (node_id, t_mesh, monotonic, value, raw_json, created_at)
+                INSERT INTO sensor_readings
+                    (node_id, t_mesh, monotonic, value, raw_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (node_id, t_mesh, monotonic, value, raw_json, ts),
             )
             conn.commit()
+
+    # ------------------------------------------------------------------
+    #  NTP REFERENCE LOGGING API
+    # ------------------------------------------------------------------
+
+    def insert_ntp_reference(
+        self,
+        node_id: str,
+        t_wall: float,
+        t_mono: float,
+        t_mesh: float,
+        offset: float,
+        err_mesh_vs_wall: float,
+    ) -> None:
+        """
+        Speichert Messpunkte für Mesh-Time-Qualität:
+        Wie stark weicht mesh_time vom echten time.time() ab?
+        """
+        ts = time.time()
+
+        with self._lock, self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO ntp_reference
+                    (node_id, t_wall, t_mono, t_mesh, offset, err_mesh_vs_wall, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (node_id, t_wall, t_mono, t_mesh, offset, err_mesh_vs_wall, ts),
+            )
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    #  OPTIONAL: Query Helpers (für Debugging)
+    # ------------------------------------------------------------------
+
+    def fetch_latest_ntp_error(self, node_id: str) -> Optional[float]:
+        """
+        Gibt den letzten mesh_time - wallclock Fehler zurück.
+        """
+        with self._lock, self._get_conn() as conn:
+            cur = conn.cursor()
+            res = cur.execute(
+                """
+                SELECT err_mesh_vs_wall
+                FROM ntp_reference
+                WHERE node_id=?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (node_id,),
+            ).fetchone()
+            return res[0] if res else None

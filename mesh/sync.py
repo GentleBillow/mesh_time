@@ -47,6 +47,13 @@ class SyncModule:
         neighbor_ips: Dict[str, str],
         sync_cfg: Optional[Dict[str, float]] = None,
     ):
+        # --------------------------------------------------------------
+        # Konfiguration
+        # --------------------------------------------------------------
+        if sync_cfg is None:
+            sync_cfg = {}
+
+
         self.node_id = node_id
         self.neighbors = neighbors
         self.neighbor_ips = neighbor_ips
@@ -57,13 +64,6 @@ class SyncModule:
         # Optionaler Bootstrap-Threshold, um völlig kaputte Messungen zu ignorieren
         self._bootstrap_theta_max = float(sync_cfg.get("bootstrap_theta_max_s", 1.0))
         # 1.0 s = wir erlauben einen harten Sprung, solange |theta| < 1s
-
-
-        # --------------------------------------------------------------
-        # Konfiguration
-        # --------------------------------------------------------------
-        if sync_cfg is None:
-            sync_cfg = {}
 
         # Zufälliger Start-Offset in ± initial_offset_ms
         initial_offset_ms = float(sync_cfg.get("initial_offset_ms", 200.0))

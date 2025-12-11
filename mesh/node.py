@@ -14,6 +14,13 @@ from .coap_endpoints import build_site
 
 from .led import DummyLED, GrovePiLED
 
+from .sync import SyncModule
+from .sensor import DummySensor
+from .led import DummyLED, GrovePiLED  # falls du das schon so drin hast
+from .coap_endpoints import build_site
+from .storage import TimeSeriesDB     # <--- NEU
+
+
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -23,6 +30,37 @@ class MeshNode:
         self.id = node_id
         self.cfg = node_cfg
         self.global_cfg = global_cfg
+
+        # Hardware abstractions (currently dummy; later Grove)
+        self.sensor = DummySensor(sensor_type=node_cfg.get("sensor_type", "dummy"))
+
+        led_pin = node_cfg.get("led_pin", None)
+        if led_pin is None:
+            self.led = None
+        else:
+            if IS_WINDOWS:
+                self.led = DummyLED(pin=led_pin)
+            else:
+                try:
+                    self.led = GrovePiLED(pin=led_pin)
+                except Exception as e:
+                    print(f"[{node_id}] GrovePiLED failed ({e}) → falling back to DummyLED")
+                    self.led = DummyLED(pin=led_pin)
+
+        # ------------------------------------------------------------------
+        # Optional: lokale SQLite-DB (z.B. nur auf Node C)
+        # ------------------------------------------------------------------
+        db_path = node_cfg.get("db_path")
+        if db_path:
+            try:
+                self.db = TimeSeriesDB(db_path)
+                print(f"[{node_id}] TimeSeriesDB initialised at {db_path}")
+            except Exception as e:
+                print(f"[{node_id}] Failed to init TimeSeriesDB: {e}")
+                self.db = None
+        else:
+            self.db = None
+
 
 
         # ------------------------------------------------------------------

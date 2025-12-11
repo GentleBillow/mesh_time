@@ -139,7 +139,15 @@ class RelayIngestSensorResource(resource.Resource):
     """
     POST /relay/ingest/sensor
 
-    MVP: einfach Payload loggen. Später auf C -> SQLite.
+    Payload (Beispiel):
+      {
+        "src": "B",
+        "t_mesh": 12345.678,
+        "value": 0.42
+      }
+
+    - Auf Sinks (mit node.db != None) wird das in SQLite gespeichert.
+    - Auf anderen Nodes nur geloggt.
     """
 
     def __init__(self, node):
@@ -152,9 +160,30 @@ class RelayIngestSensorResource(resource.Resource):
         except Exception:
             data = {}
 
-        print("[{}] relay/ingest/sensor: {}".format(self.node.id, data))
+        src = data.get("src", self.node.id)
+        t_mesh = float(data.get("t_mesh", 0.0))
+        value = data.get("value", None)
+
+        print("[{}] relay/ingest/sensor from {}: t_mesh={:.3f}, value={}".format(
+            self.node.id, src, t_mesh, value
+        ))
+
+        # Wenn eine DB vorhanden ist → speichern
+        if getattr(self.node, "db", None) is not None:
+            try:
+                raw_json = json.dumps(data, ensure_ascii=False)
+                self.node.db.insert_reading(
+                    node_id=src,
+                    t_mesh=t_mesh,
+                    value=float(value) if value is not None else None,
+                    monotonic=time.monotonic(),
+                    raw_json=raw_json,
+                )
+            except Exception as e:
+                print("[{}] DB insert failed: {}".format(self.node.id, e))
 
         return aiocoap.Message(code=aiocoap.CHANGED)
+
 
 
 def build_site(node):

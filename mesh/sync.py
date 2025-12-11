@@ -270,7 +270,7 @@ class SyncModule:
                 return False
 
         old_offset = self._offset
-        new_offset = peer_offset - theta
+        new_offset = peer_offset + theta # Richtige Beziehung: o_self ≈ o_peer + theta  mit  theta ≈ t_peer - t_self
         self._offset = new_offset
         self._bootstrapped = True
 
@@ -312,7 +312,7 @@ class SyncModule:
             return  # Root macht kein symmetrisches Update
 
         # Fehler (Sekunden)
-        target = peer_offset - theta
+        target = peer_offset + theta
         error = self._offset - target
 
         # Gewichtung nach Link-Qualität (σ in Sekunden)

@@ -12,6 +12,9 @@ from .sensor import DummySensor
 from .led import DummyLED
 from .coap_endpoints import build_site
 
+from .led import DummyLED, GrovePiLED
+
+
 IS_WINDOWS = platform.system() == "Windows"
 
 
@@ -20,6 +23,7 @@ class MeshNode:
         self.id = node_id
         self.cfg = node_cfg
         self.global_cfg = global_cfg
+
 
         # ------------------------------------------------------------------
         # Neighbors & their IPs (from global config)
@@ -43,7 +47,21 @@ class MeshNode:
         # Hardware abstractions (currently dummy; later Grove)
         # ------------------------------------------------------------------
         self.sensor = DummySensor(sensor_type=node_cfg.get("sensor_type", "dummy"))
-        self.led = DummyLED(pin=node_cfg.get("led_pin", 18))
+        led_pin = node_cfg.get("led_pin", None)
+
+        if led_pin is None:
+            print(f"[{node_id}] no led_pin configured → LED disabled")
+            self.led = None
+        else:
+            if IS_WINDOWS:
+                # Dev-Mode
+                self.led = DummyLED(pin=led_pin)
+            else:
+                try:
+                    self.led = GrovePiLED(pin=led_pin)
+                except Exception as e:
+                    print(f"[{node_id}] GrovePiLED failed ({e}) → falling back to DummyLED")
+                    self.led = DummyLED(pin=led_pin)
 
         # Routing parent for multi-hop data (used later)
         self.parent = node_cfg.get("parent")

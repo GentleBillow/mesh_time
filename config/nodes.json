@@ -15,7 +15,7 @@
     "parent": "B",
     "neighbors": ["B", "D"],
     "sensor_type": "potentiometer",
-    "led_pin": 18,
+    "led_pin": 5,
     "button_pin": null
   },
   "B": {
@@ -23,7 +23,7 @@
     "parent": "C",
     "neighbors": ["C"],
     "sensor_type": "potentiometer",
-    "led_pin": 18,
+    "led_pin": 5,
     "button_pin": null
   },
   "C": {
@@ -31,7 +31,7 @@
     "parent": null,
     "neighbors": ["B"],
     "sensor_type": "potentiometer",
-    "led_pin": 18,
+    "led_pin": 5,
     "button_pin": null
   },
   "D": {
@@ -39,7 +39,7 @@
     "parent": "C",
     "neighbors": ["A", "C"],
     "sensor_type": "potentiometer",
-    "led_pin": 18,
+    "led_pin": 5,
     "button_pin": 23
   }
 }

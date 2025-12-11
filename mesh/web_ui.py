@@ -579,7 +579,7 @@ TEMPLATE = r"""
       const pairIds = Object.keys(pairs).sort();
       chart.data.datasets = [];
       pairIds.forEach((pairId, idx) => {
-        const color = colors[idx % colors.length];
+        const baseColor = colors[idx % colors.length]; // z.B. rgba(...,0.9)
         const points = pairs[pairId].map(p => ({
           x: new Date(p.t_wall * 1000),
           y: p.delta_ms
@@ -587,19 +587,16 @@ TEMPLATE = r"""
         chart.data.datasets.push({
           label: pairId,
           data: points,
-          borderColor: color,
-          backgroundColor: color,
+          borderColor: baseColor,
+          backgroundColor: baseColor,
           fill: false,
           pointRadius: 0,
-          borderWidth: 1.5,
-          // leichte Transparenz für Überlagerung
-          borderColor: color.replace('0.9', '0.5'),
-          backgroundColor: color.replace('0.9', '0.2'),
+          borderWidth: 1.5
         });
       });
       chart.update();
     }
-
+    
     function updateOffsetDeltaChart(chart, series) {
       const nodeIds = Object.keys(series).sort();
       chart.data.datasets = [];
@@ -720,6 +717,8 @@ TEMPLATE = r"""
           fetchNtpData(),
           fetchTopology()
         ]);
+        
+        console.log("NTP DATA", ntpData);  // <--- Debug
 
         const series = ntpData.series || {};
         const pairs = ntpData.pairs || {};

@@ -178,33 +178,81 @@ class MeshNode:
 
     async def ntp_monitor_loop(self, interval: float = 5.0):
         """
-        Periodisch NTP-Referenzwerte loggen.
-        """
-        if self.storage is None:
-            while True:
-                await asyncio.sleep(3600.0)
+        Periodisch Mesh-Zeit-Telemetrie loggen.
 
+        - Jeder Node misst lokal:
+            t_wall  = time.time()          (nur für Achse / Diagnose)
+            t_mono  = time.monotonic()
+            t_mesh  = sync.mesh_time()
+            offset  = sync.get_offset()
+            err     = t_mesh - t_wall
+
+        - Wenn self.storage vorhanden (z.B. Node C):
+            -> direkt in lokale DB schreiben.
+
+        - Zusätzlich: per CoAP an Sammelknoten (typisch: parent = C)
+            POST /relay/ingest/ntp
+        """
         print(f"[{self.id}] ntp_monitor_loop started (interval={interval}s)")
-        while True:
+
+        # Ziel-Knoten für Telemetrie bestimmen: parent oder explizit 'C'
+        sink_id = self.cfg.get("telemetry_sink") or self.parent or "C"
+        sink_ip = None
+        if sink_id in self.global_cfg and "ip" in self.global_cfg[sink_id]:
+            sink_ip = self.global_cfg[sink_id]["ip"]
+
+        while not self._stop.is_set():
             t_wall = time.time()
             t_mono = time.monotonic()
             t_mesh = self.sync.mesh_time()
             offset = self.sync.get_offset()
             err = t_mesh - t_wall
 
-            try:
-                self.storage.insert_ntp_reference(
-                    node_id=self.id,
-                    t_wall=t_wall,
-                    t_mono=t_mono,
-                    t_mesh=t_mesh,
-                    offset=offset,
-                    err_mesh_vs_wall=err,
-                )
-            except Exception as e:
-                print(f"[{self.id}] ntp_monitor_loop: DB insert failed: {e}")
+            # 1) Lokal in DB loggen (nur auf Node mit Storage, z.B. C)
+            if self.storage is not None:
+                try:
+                    self.storage.insert_ntp_reference(
+                        node_id=self.id,
+                        t_wall=t_wall,
+                        t_mono=t_mono,
+                        t_mesh=t_mesh,
+                        offset=offset,
+                        err_mesh_vs_wall=err,
+                    )
+                except Exception as e:
+                    print(f"[{self.id}] ntp_monitor_loop: local DB insert failed: {e}")
+
+            # 2) An Sammelknoten schicken (typisch C)
+            if sink_ip is not None:
+                uri = f"coap://{sink_ip}/relay/ingest/ntp"
+                payload = {
+                    "node_id": self.id,
+                    "t_wall": t_wall,
+                    "t_mono": t_mono,
+                    "t_mesh": t_mesh,
+                    "offset": offset,
+                    "err_mesh_vs_wall": err,
+                }
+                try:
+                    req = aiocoap.Message(
+                        code=aiocoap.POST,
+                        uri=uri,
+                        payload=json.dumps(payload).encode("utf-8"),
+                    )
+                    ctx = await aiocoap.Context.create_client_context()
+                    # Fire-and-forget; Timeout klein halten
+                    await asyncio.wait_for(ctx.request(req).response, timeout=0.5)
+                    await ctx.shutdown()
+                except asyncio.TimeoutError:
+                    print(f"[{self.id}] ntp_monitor_loop: CoAP to {sink_id} timed out")
+                except Exception as e:
+                    print(f"[{self.id}] ntp_monitor_loop: CoAP to {sink_id} failed: {e}")
+            else:
+                # kein Sink bekannt → rein lokal
+                pass
 
             await asyncio.sleep(interval)
+
 
     async def run_async(self):
         """
@@ -217,11 +265,8 @@ class MeshNode:
             self.sync_loop(),    # Sync beacons
             self.sensor_loop(),  # Sensor sampling
             self.led_loop(),     # LED blinking
+            self.ntp_monitor_loop(),  # Telemetrie für alle Nodes
         ]
-
-        # Nur Knoten mit DB (z.B. C) loggen NTP-Referenz
-        if self.storage is not None:
-            tasks.append(self.ntp_monitor_loop())
 
         await asyncio.gather(*tasks)
 

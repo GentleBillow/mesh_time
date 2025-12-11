@@ -191,7 +191,62 @@ class RelayIngestSensorResource(resource.Resource):
 
         return aiocoap.Message(code=aiocoap.CHANGED)
 
+class RelayIngestNtpResource(resource.Resource):
+    """
+    POST /relay/ingest/ntp
 
+    Payload JSON:
+      {
+        "node_id": "B",
+        "t_wall":  1733940000.123,   # optional, lokale wallclock des senders
+        "t_mono":  12345.678,        # monotonic() beim Sender
+        "t_mesh":  12350.123,        # mesh_time() beim Sender
+        "offset":  -0.004,           # Offset des Senders
+        "err_mesh_vs_wall": 0.012    # optional, t_mesh - t_wall beim Sender
+      }
+
+    Auf dem Sammelknoten (z.B. C) wird das in SQLite geschrieben.
+    t_wall ist hier reine Diagnose/X-Achse und fließt nicht in den Sync-Algorithmus ein.
+    """
+
+    def __init__(self, node):
+        super(RelayIngestNtpResource, self).__init__()
+        self.node = node
+
+    async def render_post(self, request):
+        try:
+            data = json.loads(request.payload.decode("utf-8"))
+        except Exception:
+            data = {}
+
+        print("[{}] relay/ingest/ntp: {}".format(self.node.id, data))
+
+        if getattr(self.node, "storage", None) is not None:
+            try:
+                node_id = str(data.get("node_id", "unknown"))
+                t_wall = float(data.get("t_wall", time.time()))
+                t_mono = float(data.get("t_mono", 0.0))
+                t_mesh = float(data.get("t_mesh", 0.0))
+                offset = float(data.get("offset", 0.0))
+
+                # Wenn der Sender err_mesh_vs_wall nicht liefert, berechnen wir grob:
+                err_mesh_vs_wall = data.get("err_mesh_vs_wall", None)
+                if err_mesh_vs_wall is None:
+                    err_mesh_vs_wall = t_mesh - t_wall
+                err_mesh_vs_wall = float(err_mesh_vs_wall)
+
+                self.node.storage.insert_ntp_reference(
+                    node_id=node_id,
+                    t_wall=t_wall,
+                    t_mono=t_mono,
+                    t_mesh=t_mesh,
+                    offset=offset,
+                    err_mesh_vs_wall=err_mesh_vs_wall,
+                )
+            except Exception as e:
+                print("[{}] relay/ingest/ntp: DB insert failed: {}".format(self.node.id, e))
+
+        return aiocoap.Message(code=aiocoap.CHANGED)
 
 
 def build_site(node):
@@ -209,5 +264,9 @@ def build_site(node):
 
     # Sensor relay
     root.add_resource(('relay', 'ingest', 'sensor'), RelayIngestSensorResource(node))
+
+    # NTP/Time relay
+    root.add_resource(('relay', 'ingest', 'ntp'), RelayIngestNtpResource(node))
+
 
     return root

@@ -38,12 +38,10 @@ def get_topology():
     Liest config/nodes.json und baut eine einfache Mesh-Topologie:
       - nodes: [{id, ip, color, is_root}]
       - links: [{source, target}]
-      - has_root: bool
     """
     cfg = load_config()
     nodes = []
     links = []
-    has_root = False
 
     for node_id, entry in cfg.items():
         if node_id == "sync":
@@ -53,8 +51,6 @@ def get_topology():
         color = entry.get("color") or "#3498db"
         sync_cfg = entry.get("sync", {}) or {}
         is_root = bool(sync_cfg.get("is_root", False))
-        if is_root:
-            has_root = True
 
         nodes.append(
             {
@@ -66,35 +62,10 @@ def get_topology():
         )
 
         for neigh in entry.get("neighbors", []):
-            # doppelte Kanten vermeiden
             if node_id < neigh:
                 links.append({"source": node_id, "target": neigh})
 
-    return {"nodes": nodes, "links": links, "has_root": has_root}
-
-
-def _quantiles(values):
-    """
-    Einfache Quantils-Berechnung (Q1, Median, Q3) mit linearer Interpolation.
-    Liefert: (min, q1, median, q3, max)
-    """
-    xs = sorted(values)
-    n = len(xs)
-    if n == 0:
-        return None
-
-    def q(p: float) -> float:
-        if n == 1:
-            return xs[0]
-        pos = p * (n - 1)
-        lo = int(math.floor(pos))
-        hi = int(math.ceil(pos))
-        if lo == hi:
-            return xs[lo]
-        frac = pos - lo
-        return xs[lo] * (1.0 - frac) + xs[hi] * frac
-
-    return xs[0], q(0.25), q(0.5), q(0.75), xs[-1]
+    return {"nodes": nodes, "links": links}
 
 
 def get_ntp_timeseries(window_seconds=600, max_points=2000):
@@ -104,12 +75,7 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
             t_wall, offset_ms, delta_offset_ms
       - pairs: paarweise ΔMesh-Time (Node i vs. j) als Zeitreihe
             t_wall, delta_ms
-      - jitter_pairs: Boxplot-Stats der ΔMesh-Time pro Paar
-            {pair_id: {min,q1,median,q3,max}}
-
-    ΔMesh-Time wird aus den Fehlern err_mesh_vs_wall berechnet:
-      Δ_ij ≈ (mesh_i - wall) - (mesh_j - wall) = err_i - err_j.
-    Wallclock fällt raus, dient nur als gemeinsame Referenz.
+      - jitter_std_pairs: StdDev(ΔMesh-Time) pro Paar (für Jitter-Barplot)
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -118,7 +84,7 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
 
     rows = cur.execute(
         """
-        SELECT node_id, t_wall, t_mesh, offset, err_mesh_vs_wall, created_at
+        SELECT node_id, t_wall, offset, err_mesh_vs_wall, created_at
         FROM ntp_reference
         WHERE created_at >= ?
         ORDER BY created_at ASC
@@ -132,7 +98,7 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
         return {
             "series": {},
             "pairs": {},
-            "jitter_pairs": {},
+            "jitter_std_pairs": {},
         }
 
     # nach Node gruppieren
@@ -166,8 +132,8 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
 
     # Paarweise ΔMesh-Time (err_i - err_j)
     all_rows_sorted = sorted(rows, key=lambda r: r["t_wall"])
-    last_err_ms = {}  # node_id -> letzter Fehler in ms
-    pair_series = {}  # "A-B" -> [{"t_wall":..,"delta_ms":..}, ...]
+    last_err_ms = {}    # node_id -> letzter Fehler in ms
+    pair_series = {}    # "A-B" -> [{"t_wall":..,"delta_ms":..}, ...]
 
     def norm_pair(a, b):
         return "-".join(sorted([a, b]))
@@ -195,28 +161,20 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
                     }
                 )
 
-    # Jitter-Boxplots über ΔMesh-Time pro Paar
-    jitter_pairs = {}
+    # Jitter als StdDev der ΔMesh-Time pro Paar
+    jitter_std_pairs = {}
     for pair_id, pts in pair_series.items():
-        if len(pts) < 3:
+        if len(pts) < 2:
             continue
         deltas = [p["delta_ms"] for p in pts]
-        stats = _quantiles(deltas)
-        if stats is None:
-            continue
-        min_v, q1, med, q3, max_v = stats
-        jitter_pairs[pair_id] = {
-            "min": min_v,
-            "q1": q1,
-            "median": med,
-            "q3": q3,
-            "max": max_v,
-        }
+        mean = sum(deltas) / len(deltas)
+        var = sum((d - mean) ** 2 for d in deltas) / (len(deltas) - 1)
+        jitter_std_pairs[pair_id] = math.sqrt(var)
 
     return {
         "series": series,
         "pairs": pair_series,
-        "jitter_pairs": jitter_pairs,
+        "jitter_std_pairs": jitter_std_pairs,
     }
 
 
@@ -226,7 +184,6 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
 
 @app.route("/")
 def index():
-    # für die Kopf-Tabelle: letzter Eintrag pro Node
     conn = get_conn()
     cur = conn.cursor()
     last_by_node = cur.execute(
@@ -263,7 +220,6 @@ def api_ntp_timeseries():
     return jsonify(data)
 
 
-# Jinja Filter
 @app.template_filter("datetime_utc")
 def datetime_utc(ts):
     try:
@@ -291,9 +247,7 @@ TEMPLATE = r"""
       background: #111;
       color: #eee;
     }
-    h1, h2, h3 {
-      margin-top: 0;
-    }
+    h1, h2, h3 { margin-top: 0; }
     .grid {
       display: grid;
       grid-template-columns: minmax(0, 1.2fr) minmax(0, 2fr);
@@ -301,9 +255,7 @@ TEMPLATE = r"""
       align-items: flex-start;
     }
     @media (max-width: 1100px) {
-      .grid {
-        grid-template-columns: minmax(0, 1fr);
-      }
+      .grid { grid-template-columns: minmax(0, 1fr); }
     }
     .card {
       background: #1b1b1b;
@@ -324,9 +276,7 @@ TEMPLATE = r"""
       border-bottom: 1px solid rgba(255,255,255,0.15);
       font-weight: 600;
     }
-    tr:nth-child(even) td {
-      background: rgba(255,255,255,0.02);
-    }
+    tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
     .pill {
       display: inline-block;
       padding: 0.1rem 0.5rem;
@@ -334,25 +284,11 @@ TEMPLATE = r"""
       font-size: 0.75rem;
       font-weight: 500;
     }
-    .pill-ok {
-      background: rgba(46, 204, 113, 0.12);
-      color: #2ecc71;
-    }
-    .pill-warn {
-      background: rgba(241, 196, 15, 0.12);
-      color: #f1c40f;
-    }
-    .pill-bad {
-      background: rgba(231, 76, 60, 0.12);
-      color: #e74c3c;
-    }
-    .small {
-      font-size: 0.8rem;
-      opacity: 0.7;
-    }
-    canvas {
-      max-width: 100%;
-    }
+    .pill-ok   { background: rgba(46,204,113,0.12); color:#2ecc71; }
+    .pill-warn { background: rgba(241,196,15,0.12); color:#f1c40f; }
+    .pill-bad  { background: rgba(231,76,60,0.12);  color:#e74c3c; }
+    .small { font-size: 0.8rem; opacity: 0.7; }
+    canvas { max-width: 100%; }
     #meshCanvas {
       width: 100%;
       height: 260px;
@@ -365,9 +301,7 @@ TEMPLATE = r"""
       gap: 1rem;
     }
     @media (max-width: 1200px) {
-      .plots-grid {
-        grid-template-columns: minmax(0, 1fr);
-      }
+      .plots-grid { grid-template-columns: minmax(0, 1fr); }
     }
     .footer {
       margin-top: 1rem;
@@ -375,10 +309,9 @@ TEMPLATE = r"""
       opacity: 0.6;
     }
   </style>
-  <!-- Chart.js + Date-Adapter + BoxPlot-Plugin -->
+  <!-- Chart.js + Date-Adapter -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-box-and-violin-plot@4.3.0/build/Chart.BoxPlot.js"></script>
 </head>
 <body>
   <h1>MeshTime Monitor</h1>
@@ -387,7 +320,7 @@ TEMPLATE = r"""
   </p>
 
   <div class="grid">
-    <!-- linke Seite: Tabelle + Mesh-Topologie -->
+    <!-- linke Seite -->
     <div>
       <div class="card">
         <h2>Aktueller Status pro Node</h2>
@@ -416,9 +349,7 @@ TEMPLATE = r"""
               <td>{{ row["node_id"] }}</td>
               <td><span class="pill {{ cls }}">{{ "%.2f" % offset_ms }} ms</span></td>
               <td>{{ "%.2f" % err_ms }} ms</td>
-              <td class="small">
-                {{ row["t_wall"] | float | int | datetime_utc }}
-              </td>
+              <td class="small">{{ row["t_wall"] | float | int | datetime_utc }}</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -439,7 +370,7 @@ TEMPLATE = r"""
       </div>
     </div>
 
-    <!-- rechte Seite: Plots -->
+    <!-- rechte Seite -->
     <div class="card">
       <h2>Mesh-Time Plots (letzte 10 Minuten)</h2>
       <div class="plots-grid">
@@ -452,8 +383,8 @@ TEMPLATE = r"""
           <canvas id="offsetDeltaChart" height="160"></canvas>
         </div>
         <div>
-          <h3 style="font-size:0.95rem;">3) Jitter der ΔMesh-Time (Boxplots pro Paar)</h3>
-          <canvas id="jitterBoxChart" height="160"></canvas>
+          <h3 style="font-size:0.95rem;">3) Jitter der ΔMesh-Time (StdDev pro Paar)</h3>
+          <canvas id="jitterBarChart" height="160"></canvas>
         </div>
       </div>
     </div>
@@ -472,7 +403,7 @@ TEMPLATE = r"""
       'rgba(155, 89, 182, 0.5)'
     ];
 
-    let pairChart, offsetDeltaChart, jitterBoxChart;
+    let pairChart, offsetDeltaChart, jitterBarChart;
 
     function makeLineChart(ctx, yLabel) {
       return new Chart(ctx, {
@@ -497,9 +428,7 @@ TEMPLATE = r"""
             }
           },
           plugins: {
-            legend: {
-              labels: { color: '#eee' }
-            },
+            legend: { labels: { color: '#eee' } },
             tooltip: {
               callbacks: {
                 label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} ${yLabel}`
@@ -507,27 +436,22 @@ TEMPLATE = r"""
             }
           },
           elements: {
-            line: {
-              tension: 0.1
-            },
-            point: {
-              radius: 0
-            }
+            line: { tension: 0.1 },
+            point: { radius: 0 }
           }
         }
       });
     }
 
-    function makeBoxPlotChart(ctx, yLabel) {
+    function makeBarChart(ctx, yLabel) {
       return new Chart(ctx, {
-        type: 'boxplot',
+        type: 'bar',
         data: {
           labels: [],
           datasets: [{
-            label: 'ΔMesh-Time',
+            label: 'Jitter (StdDev ΔMesh)',
             data: [],
-            backgroundColor: 'rgba(52, 152, 219, 0.6)',
-            borderColor: 'rgba(52, 152, 219, 1)'
+            backgroundColor: 'rgba(52,152,219,0.7)'
           }]
         },
         options: {
@@ -547,23 +471,7 @@ TEMPLATE = r"""
             }
           },
           plugins: {
-            legend: {
-              labels: { color: '#eee' }
-            },
-            tooltip: {
-              callbacks: {
-                label: (ctx) => {
-                  const v = ctx.raw;
-                  return [
-                    `min: ${v.min.toFixed(2)} ${yLabel}`,
-                    `Q1 : ${v.q1.toFixed(2)} ${yLabel}`,
-                    `med: ${v.median.toFixed(2)} ${yLabel}`,
-                    `Q3 : ${v.q3.toFixed(2)} ${yLabel}`,
-                    `max: ${v.max.toFixed(2)} ${yLabel}`,
-                  ];
-                }
-              }
-            }
+            legend: { labels: { color: '#eee' } }
           }
         }
       });
@@ -572,14 +480,14 @@ TEMPLATE = r"""
     function initCharts() {
       pairChart        = makeLineChart(document.getElementById('pairChart').getContext('2d'), 'ms');
       offsetDeltaChart = makeLineChart(document.getElementById('offsetDeltaChart').getContext('2d'), 'ms');
-      jitterBoxChart   = makeBoxPlotChart(document.getElementById('jitterBoxChart').getContext('2d'), 'ms');
+      jitterBarChart   = makeBarChart(document.getElementById('jitterBarChart').getContext('2d'), 'ms');
     }
 
     function updatePairChart(chart, pairs) {
       const pairIds = Object.keys(pairs).sort();
       chart.data.datasets = [];
       pairIds.forEach((pairId, idx) => {
-        const baseColor = colors[idx % colors.length];
+        const baseColor   = colors[idx % colors.length];
         const strokeColor = baseColor.replace('0.5', '0.9');
         const points = pairs[pairId].map(p => ({
           x: new Date(p.t_wall * 1000),
@@ -602,7 +510,7 @@ TEMPLATE = r"""
       const nodeIds = Object.keys(series).sort();
       chart.data.datasets = [];
       nodeIds.forEach((nodeId, idx) => {
-        const baseColor = colors[idx % colors.length];
+        const baseColor   = colors[idx % colors.length];
         const strokeColor = baseColor.replace('0.5', '0.9');
         const points = series[nodeId].map(p => ({
           x: new Date(p.t_wall * 1000),
@@ -621,10 +529,10 @@ TEMPLATE = r"""
       chart.update();
     }
 
-    function updateJitterBoxChart(chart, jitter_pairs) {
-      const pairIds = Object.keys(jitter_pairs).sort();
+    function updateJitterBarChart(chart, jitter_std_pairs) {
+      const pairIds = Object.keys(jitter_std_pairs).sort();
       chart.data.labels = pairIds;
-      chart.data.datasets[0].data = pairIds.map(pairId => jitter_pairs[pairId]);
+      chart.data.datasets[0].data = pairIds.map(id => jitter_std_pairs[id]);
       chart.update();
     }
 
@@ -687,7 +595,7 @@ TEMPLATE = r"""
 
         ctx.beginPath();
         ctx.arc(pos.x, pos.y, r, 0, 2 * Math.PI);
-        ctx.fillStyle = active ? 'rgba(39, 174, 96, 0.25)' : 'rgba(149, 165, 166, 0.2)';
+        ctx.fillStyle = active ? 'rgba(39,174,96,0.25)' : 'rgba(149,165,166,0.2)';
         ctx.fill();
 
         ctx.lineWidth = isRoot ? 3.0 : (active ? 2.0 : 1.0);
@@ -701,7 +609,7 @@ TEMPLATE = r"""
         ctx.fillText(node.id, pos.x, pos.y);
       });
 
-      // Root-Info
+      // Root-Hinweis
       const roots = topo.nodes.filter(n => n.is_root);
       ctx.fillStyle = '#aaa';
       ctx.font = '11px system-ui';
@@ -709,29 +617,25 @@ TEMPLATE = r"""
       ctx.textBaseline = 'top';
       const rootLabel = roots.length
         ? 'Root: ' + roots.map(r => r.id).join(', ')
-        : 'Root: keiner (voll symmetrisch)';
+        : 'Root: keiner (symmetrisches Mesh)';
       ctx.fillText(rootLabel, 10, 10);
     }
 
     async function refresh() {
       try {
-        const [ntpData, topo] = await Promise.all([
-          fetchNtpData(),
-          fetchTopology()
-        ]);
-
-        const series = ntpData.series || {};
-        const pairs = ntpData.pairs || {};
-        const jitter_pairs = ntpData.jitter_pairs || {};
+        const [ntpData, topo] = await Promise.all([fetchNtpData(), fetchTopology()]);
+        const series          = ntpData.series || {};
+        const pairs           = ntpData.pairs || {};
+        const jitter_std_pairs= ntpData.jitter_std_pairs || {};
 
         updatePairChart(pairChart, pairs);
         updateOffsetDeltaChart(offsetDeltaChart, series);
-        updateJitterBoxChart(jitterBoxChart, jitter_pairs);
+        updateJitterBarChart(jitterBarChart, jitter_std_pairs);
 
-        const activeNodes = new Set(Object.keys(series || {}));
-        const meshCanvas = document.getElementById('meshCanvas');
-        meshCanvas.width  = meshCanvas.clientWidth;
-        meshCanvas.height = meshCanvas.clientHeight;
+        const activeNodes  = new Set(Object.keys(series || {}));
+        const meshCanvas   = document.getElementById('meshCanvas');
+        meshCanvas.width   = meshCanvas.clientWidth;
+        meshCanvas.height  = meshCanvas.clientHeight;
         drawMesh(meshCanvas, topo, activeNodes);
       } catch (e) {
         console.error('refresh failed', e);
@@ -741,7 +645,7 @@ TEMPLATE = r"""
     window.addEventListener('load', () => {
       initCharts();
       refresh();
-      setInterval(refresh, 2000); // alle 2s live updaten
+      setInterval(refresh, 2000);
     });
   </script>
 </body>

@@ -22,13 +22,23 @@ class SyncModule:
       - Lokale Zeit: mono(t) = time.monotonic()
       - Mesh-Zeit:   mesh_time(t) = mono(t) + offset
 
-    Die Offsets o_i werden über NTP-artige 4-Timestamp-Messungen θ_ij
-    iterativ angepasst:
+    Jedes Node i hat einen Offset o_i (in Sekunden).
+    Wir definieren für eine Kante (i, j):
 
-        E_ij = ((o_i - o_j) - θ_ij)^2
+        θ_ij ≈ o_i - o_j
 
     Zielbedingung:
         o_i - o_j ≈ θ_ij
+
+    Fehlerfunktion:
+
+        E_ij = ((o_i - o_j) - θ_ij)^2
+
+    Die NTP-4-Timestamp-Formel liefert zunächst
+        θ_NTP = o_j - o_i
+    also Peer minus Self. Wir verwenden im Code:
+
+        θ_ij = -(θ_NTP) = o_i - o_j
 
     Features:
       - Rolling RTT-Historie pro Peer
@@ -57,7 +67,7 @@ class SyncModule:
         # ----------------------------------------------------------
         # Konfiguration aus JSON
         # ----------------------------------------------------------
-        # Zufälliger Initial-Offset in ± initial_offset_ms
+        # Zufälliger Initial-Offset in ± initial_offset_ms (ms)
         initial_offset_ms = float(sync_cfg.get("initial_offset_ms", 200.0))
 
         # Rolling-Window-Größe für RTT / Jitter
@@ -71,7 +81,7 @@ class SyncModule:
         # Lernrate η (0 < eta <= 1, aber realistisch << 1)
         self._eta = float(sync_cfg.get("eta", 0.02))
 
-        # Slew-Limit in ms/s (Konfig-Einheit), intern merken wir uns den ms/s-Wert
+        # Slew-Limit in ms/s (Konfig-Einheit)
         self._max_slew_per_second_ms = float(
             sync_cfg.get("max_slew_per_second_ms", 10.0)
         )
@@ -96,7 +106,7 @@ class SyncModule:
         # Bootstrapping-Flag
         self._bootstrapped: bool = False
 
-        # letzte Offsets θ_ij (Sekunden) pro Peer
+        # letzte Offsets θ_ij (Sekunden) pro Peer (θ_ij ≈ o_i - o_j)
         self._peer_offsets: Dict[str, float] = {}
 
         # RTT-Samples (Sekunden)
@@ -141,7 +151,7 @@ class SyncModule:
           - mesh_time
           - offset_estimate (Sekunden + ms)
           - monotonic_now
-          - peer_offsets / peer_offsets_ms
+          - peer_offsets / peer_offsets_ms (θ_ij)
           - peer_sigma / peer_sigma_ms
           - neighbors
           - sync_config (wichtige Parameter)
@@ -223,28 +233,41 @@ class SyncModule:
             self._peer_sigma[peer] = max(sigma, 1e-6)
 
     # --------------------------------------------------------------
-    # Bootstrap
+    # Bootstrap (mit θ_ij = o_i - o_j)
     # --------------------------------------------------------------
 
-    def _try_bootstrap(self, peer: str, peer_offset: float, theta: float) -> bool:
+    def _try_bootstrap(self, peer: str, peer_offset: float, theta_ij: float) -> bool:
+        """
+        Einmaliger harter Bootstrap für Node i.
+
+        Wir haben per Definition:
+            θ_ij ≈ o_i - o_j
+
+        Bootstrap-Ziel:
+            o_i - o_j = θ_ij  =>  o_i = o_j + θ_ij
+
+        Daher setzen wir:
+
+            offset_i_new = peer_offset + theta_ij
+        """
         if self._bootstrapped:
             return False
 
         # Wenn bootstrap_theta_max_s <= 0: kein Threshold, immer erste Messung nutzen
         if self._bootstrap_theta_max_s > 0.0:
-            if abs(theta) > self._bootstrap_theta_max_s:
+            if abs(theta_ij) > self._bootstrap_theta_max_s:
                 return False
 
         old_offset = self._offset
-        new_offset = peer_offset + theta
+        new_offset = peer_offset + theta_ij
         self._offset = new_offset
         self._bootstrapped = True
 
         print(
-            "[{}] BOOTSTRAP with {}: theta={:.3f} ms, old_offset={:.3f} ms, new_offset={:.3f} ms".format(
+            "[{}] BOOTSTRAP with {}: theta_ij={:.3f} ms, old_offset={:.3f} ms, new_offset={:.3f} ms".format(
                 self.node_id,
                 peer,
-                theta * 1000.0,
+                theta_ij * 1000.0,
                 old_offset * 1000.0,
                 new_offset * 1000.0,
             )
@@ -255,7 +278,7 @@ class SyncModule:
     # Symmetrisches Update (Herzstück)
     # --------------------------------------------------------------
 
-    def _symmetrical_update(self, peer: str, peer_offset: float, theta: float) -> None:
+    def _symmetrical_update(self, peer: str, peer_offset: float, theta_ij: float) -> None:
         """
         Symmetrisches pairwise Update zur Minimierung
 
@@ -269,11 +292,11 @@ class SyncModule:
             error = (o_i - o_j) - θ_ij
             o_i   <- o_i - η * w * error
 
-        Alle Größen (offsets, theta, error, delta) sind in Sekunden.
+        Alle Größen (offsets, theta_ij, error, delta) sind in Sekunden.
         """
 
         # Fehler (Sekunden)
-        error = (self._offset - peer_offset) - theta
+        error = (self._offset - peer_offset) - theta_ij
 
         # Gewichtung nach Link-Qualität (σ in Sekunden)
         sigma = self._peer_sigma.get(peer)
@@ -335,12 +358,21 @@ class SyncModule:
         Periodische Beacons zu allen Nachbarn senden.
 
         Für jeden Nachbarn j:
-          - t1 = monotonic()
+          - t1 = monotonic()      (bei i)
           - POST /sync/beacon mit {src, dst, t1, offset_i}
           - Antwort: {t2, t3, offset_j}
-          - t4 = monotonic()
-          - NTP-Formeln -> θ_ij, RTT
-          - Jitter-Update, Bootstrap, symmetrisches Update
+          - t4 = monotonic()      (bei i)
+          - NTP-Formeln:
+
+                θ_NTP = ((t2 - t1) + (t3 - t4)) / 2
+                rtt   = (t4 - t1) - (t3 - t2)
+
+            wobei θ_NTP ≈ o_j - o_i ist.
+            Wir definieren dann:
+
+                θ_ij = o_i - o_j = -θ_NTP
+
+          - Jitter-Update, Bootstrap, symmetrisches Update.
         """
         if IS_WINDOWS:
             return
@@ -401,18 +433,19 @@ class SyncModule:
 
             # NTP-Formeln
             rtt = (t4 - t1) - (t3 - t2)
-            theta = ((t2 - t1) + (t3 - t4)) / 2.0
+            theta_ntp = ((t2 - t1) + (t3 - t4)) / 2.0  # ≈ o_j - o_i
+            theta_ij = -theta_ntp                      # ≈ o_i - o_j
 
             # Statistik-Update
             self._update_rtt_sigma(peer, rtt)
-            self._peer_offsets[peer] = theta
+            self._peer_offsets[peer] = theta_ij
 
             # Bootstrap zuerst (einmaliger harter Sprung)
-            did_bootstrap = self._try_bootstrap(peer, peer_offset, theta)
+            did_bootstrap = self._try_bootstrap(peer, peer_offset, theta_ij)
 
             # Danach feines Nachregeln
             if not did_bootstrap:
-                self._symmetrical_update(peer, peer_offset, theta)
+                self._symmetrical_update(peer, peer_offset, theta_ij)
 
             # Kurzsummary
             if peer in self._peer_sigma:
@@ -422,10 +455,10 @@ class SyncModule:
                 sigma_str = "n/a"
 
             print(
-                "[{}] sync with {}: theta={:.3f} ms, rtt={:.3f} ms, sigma={}".format(
+                "[{}] sync with {}: theta_ij={:.3f} ms, rtt={:.3f} ms, sigma={}".format(
                     self.node_id,
                     peer,
-                    theta * 1000.0,
+                    theta_ij * 1000.0,
                     rtt * 1000.0,
                     sigma_str,
                 )

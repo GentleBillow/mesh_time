@@ -148,6 +148,7 @@ TEMPLATE = r"""
   </style>
   <!-- Chart.js von CDN -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
 </head>
 <body>
   <h1>MeshTime Monitor</h1>

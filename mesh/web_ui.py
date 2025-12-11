@@ -1,14 +1,24 @@
 # web_ui.py
-# Minimaler Flask-Webserver, der die mesh_data.sqlite visualisiert.
+# MeshTime Web-UI mit 5 Plots + Mesh-Topologie + Live-Updates
 
-from flask import Flask, render_template_string
+import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
-DB_PATH = "mesh_data.sqlite"
+from flask import Flask, render_template_string, jsonify
+
+DB_PATH = Path("mesh_data.sqlite")
+CFG_PATH = Path("config/nodes.json")
+
+LED_PERIOD_S = 0.5  # 500 ms
 
 app = Flask(__name__)
 
+
+# ------------------------------------------------------------
+# Hilfsfunktionen Backend
+# ------------------------------------------------------------
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -16,12 +26,149 @@ def get_conn():
     return conn
 
 
-@app.route("/")
-def index():
+def load_config():
+    if not CFG_PATH.exists():
+        return {}
+    with CFG_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_topology():
+    """
+    Liest config/nodes.json und baut eine einfache Mesh-Topologie:
+      - nodes: [{id, ip, color}]
+      - links: [{source, target}]
+    """
+    cfg = load_config()
+    nodes = []
+    links = []
+
+    for node_id, entry in cfg.items():
+        if node_id == "sync":
+            continue
+        ip = entry.get("ip")
+        color = entry.get("color") or "#3498db"
+        nodes.append({"id": node_id, "ip": ip, "color": color})
+
+        for neigh in entry.get("neighbors", []):
+            # doppelte Kanten vermeiden
+            if node_id < neigh:
+                links.append({"source": node_id, "target": neigh})
+
+    return {"nodes": nodes, "links": links}
+
+
+def get_ntp_timeseries(window_seconds=600, max_points=1000, root_id="C"):
+    """
+    Holt die letzten NTP-Referenzen aus der DB und baut:
+      - pro Node eine Zeitreihe von:
+        t_wall, err_ms, offset_ms, phase_ms, delta_vs_root_ms
+      - jitter_ms pro Node (stddev der err_ms)
+    """
     conn = get_conn()
     cur = conn.cursor()
 
-    # Letzter NTP-Referenzpunkt pro Node
+    # Hole die letzten max_points aus dem gewünschten Zeitfenster
+    rows = cur.execute(
+        """
+        SELECT node_id, t_wall, t_mesh, offset, err_mesh_vs_wall, created_at
+        FROM ntp_reference
+        WHERE created_at >= strftime('%s','now', ?)
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (f"-{int(window_seconds)} seconds", max_points),
+    ).fetchall()
+    conn.close()
+
+    # in Python strukturieren
+    per_node = {}
+    for r in rows:
+        node = r["node_id"]
+        per_node.setdefault(node, []).append(r)
+
+    # Letzte Root-Fehler (approx) pro Zeitpunkt: wir nehmen einfach
+    # den zuletzt gesehenen Fehler der Root, wenn kein Zeitabgleich möglich.
+    # Für eine Lab-Visualisierung reicht das aus.
+    def build_series():
+        series = {}
+        err_by_node = {}  # für Jitter
+        root_last_err = None
+
+        # wir gehen wieder durch alle Rows und bauen für jeden Node Punkte
+        for node, node_rows in per_node.items():
+            if node not in series:
+                series[node] = []
+                err_by_node[node] = []
+
+        # Wir iterieren lieber in globaler Zeitreihenfolge
+        all_rows_sorted = sorted(rows, key=lambda r: r["t_wall"])
+
+        for r in all_rows_sorted:
+            node = r["node_id"]
+            t_wall = float(r["t_wall"])
+            t_mesh = float(r["t_mesh"])
+            offset = float(r["offset"])
+            err = float(r["err_mesh_vs_wall"])
+
+            err_ms = err * 1000.0
+            offset_ms = offset * 1000.0
+
+            # LED-Phasenfehler relativ zu Flanke:
+            # Periodensignal P, Phase in [0, P),
+            # Symmetrische Distanz zur nächsten idealen Flanke (0 oder P/2)
+            phi = t_mesh % LED_PERIOD_S
+            phase_err_ms = min(phi, LED_PERIOD_S - phi) * 1000.0
+
+            # Root-Fehler tracken
+            if node == root_id:
+                root_last_err = err_ms
+
+            # ΔMesh-Time gegen Root als Differenz der Fehler
+            if root_last_err is not None:
+                delta_vs_root_ms = err_ms - root_last_err
+            else:
+                delta_vs_root_ms = None
+
+            point = {
+                "t_wall": t_wall,
+                "err_ms": err_ms,
+                "offset_ms": offset_ms,
+                "phase_ms": phase_err_ms,
+                "delta_vs_root_ms": delta_vs_root_ms,
+            }
+            series[node].append(point)
+            err_by_node[node].append(err_ms)
+
+        # Jitter (stddev) pro Node
+        jitter_ms = {}
+        for node, errs in err_by_node.items():
+            if len(errs) < 2:
+                jitter_ms[node] = None
+                continue
+            mean = sum(errs) / len(errs)
+            var = sum((e - mean) ** 2 for e in errs) / (len(errs) - 1)
+            jitter_ms[node] = var ** 0.5
+
+        return series, jitter_ms
+
+    series, jitter_ms = build_series()
+    return {
+        "root_id": root_id,
+        "series": series,
+        "jitter_ms": jitter_ms,
+    }
+
+
+# ------------------------------------------------------------
+# Flask Routen
+# ------------------------------------------------------------
+
+@app.route("/")
+def index():
+    # für die Kopf-Tabelle: letzter Eintrag pro Node
+    conn = get_conn()
+    cur = conn.cursor()
     last_by_node = cur.execute(
         """
         SELECT r.*
@@ -34,33 +181,40 @@ def index():
         ORDER BY r.node_id
         """
     ).fetchall()
-
-    # Zeitreihe der letzten 200 Punkte (für Plot)
-    series = cur.execute(
-        """
-        SELECT node_id, t_wall, t_mesh, offset, err_mesh_vs_wall, created_at
-        FROM ntp_reference
-        ORDER BY id DESC
-        LIMIT 200
-        """
-    ).fetchall()
     conn.close()
 
-    # Für Chart.js vorbereiten
-    timeline = [
-        {
-            "node_id": row["node_id"],
-            "t_wall": row["t_wall"],
-            "t_mesh": row["t_mesh"],
-            "offset_ms": row["offset"] * 1000.0,
-            "err_ms": row["err_mesh_vs_wall"] * 1000.0,
-            "created_at": row["created_at"],
-        }
-        for row in series
-    ]
+    topo = get_topology()
+    return render_template_string(
+        TEMPLATE,
+        last_by_node=last_by_node,
+        topo=topo,
+        db_path=str(DB_PATH),
+    )
 
-    return render_template_string(TEMPLATE, last_by_node=last_by_node, timeline=timeline)
 
+@app.route("/api/topology")
+def api_topology():
+    return jsonify(get_topology())
+
+
+@app.route("/api/ntp_timeseries")
+def api_ntp_timeseries():
+    data = get_ntp_timeseries(window_seconds=600, max_points=1000, root_id="C")
+    return jsonify(data)
+
+
+# Jinja Filter
+@app.template_filter("datetime_utc")
+def datetime_utc(ts):
+    try:
+        return datetime.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "n/a"
+
+
+# ------------------------------------------------------------
+# HTML + JS Template
+# ------------------------------------------------------------
 
 TEMPLATE = r"""
 <!doctype html>
@@ -69,7 +223,6 @@ TEMPLATE = r"""
   <meta charset="utf-8">
   <title>MeshTime Monitor</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Ganz simples Styling -->
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -78,16 +231,16 @@ TEMPLATE = r"""
       background: #111;
       color: #eee;
     }
-    h1, h2 {
+    h1, h2, h3 {
       margin-top: 0;
     }
     .grid {
       display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.5fr);
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 2fr);
       gap: 1.5rem;
       align-items: flex-start;
     }
-    @media (max-width: 900px) {
+    @media (max-width: 1100px) {
       .grid {
         grid-template-columns: minmax(0, 1fr);
       }
@@ -140,174 +293,346 @@ TEMPLATE = r"""
     canvas {
       max-width: 100%;
     }
+    #meshCanvas {
+      width: 100%;
+      height: 260px;
+      background: #171717;
+      border-radius: 10px;
+    }
+    .plots-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1rem;
+    }
+    @media (max-width: 1200px) {
+      .plots-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
     .footer {
       margin-top: 1rem;
       font-size: 0.8rem;
       opacity: 0.6;
     }
   </style>
-  <!-- Chart.js von CDN -->
+  <!-- Chart.js + Date-Adapter -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
 </head>
 <body>
   <h1>MeshTime Monitor</h1>
   <p class="small">
-    Datenquelle: <code>{{ DB_PATH if DB_PATH is defined else "mesh_data.sqlite" }}</code> (ntp_reference)
+    Datenquelle: <code>{{ db_path }}</code> (ntp_reference)
   </p>
 
   <div class="grid">
-    <!-- Linke Karte: aktueller Status pro Node -->
-    <div class="card">
-      <h2>Aktueller Status pro Node</h2>
-      {% if last_by_node %}
-      <table>
-        <thead>
-          <tr>
-            <th>Node</th>
-            <th>Offset</th>
-            <th>Mesh − Wallclock</th>
-            <th>Wallclock (UTC)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in last_by_node %}
-          {% set err_ms = row["err_mesh_vs_wall"] * 1000.0 %}
-          {% set offset_ms = row["offset"] * 1000.0 %}
-          {% if err_ms|abs < 5 %}
-            {% set cls = "pill-ok" %}
-          {% elif err_ms|abs < 20 %}
-            {% set cls = "pill-warn" %}
-          {% else %}
-            {% set cls = "pill-bad" %}
-          {% endif %}
-          <tr>
-            <td>{{ row["node_id"] }}</td>
-            <td><span class="pill {{ cls }}">{{ "%.2f" % offset_ms }} ms</span></td>
-            <td>{{ "%.2f" % err_ms }} ms</td>
-            <td class="small">
-              {{ row["t_wall"] | float | int | datetime_utc }}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-        <p>Keine ntp_reference-Daten gefunden.</p>
-      {% endif %}
+    <!-- linke Seite: Tabelle + Mesh-Topologie -->
+    <div>
+      <div class="card">
+        <h2>Aktueller Status pro Node</h2>
+        {% if last_by_node %}
+        <table>
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>Offset</th>
+              <th>Mesh − Wallclock</th>
+              <th>Wallclock (UTC)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in last_by_node %}
+            {% set err_ms = row["err_mesh_vs_wall"] * 1000.0 %}
+            {% set offset_ms = row["offset"] * 1000.0 %}
+            {% if err_ms|abs < 5 %}
+              {% set cls = "pill-ok" %}
+            {% elif err_ms|abs < 20 %}
+              {% set cls = "pill-warn" %}
+            {% else %}
+              {% set cls = "pill-bad" %}
+            {% endif %}
+            <tr>
+              <td>{{ row["node_id"] }}</td>
+              <td><span class="pill {{ cls }}">{{ "%.2f" % offset_ms }} ms</span></td>
+              <td>{{ "%.2f" % err_ms }} ms</td>
+              <td class="small">
+                {{ row["t_wall"] | float | int | datetime_utc }}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <p>Keine ntp_reference-Daten gefunden.</p>
+        {% endif %}
+      </div>
+
+      <div class="card" style="margin-top:1rem;">
+        <h2>Mesh-Topologie</h2>
+        <canvas id="meshCanvas"></canvas>
+        <p class="small">Knoten und Links basierend auf <code>config/nodes.json</code>. Grün = Node hat NTP-Daten, grau = bisher keine.</p>
+      </div>
     </div>
 
-    <!-- Rechte Karte: Zeitreihe -->
+    <!-- rechte Seite: Plots -->
     <div class="card">
-      <h2>Mesh vs. Wallclock</h2>
-      <canvas id="errChart" height="200"></canvas>
-      <p class="small">
-        Gezeigt werden die letzten {{ timeline|length }} Punkte aus <code>ntp_reference</code>.
-      </p>
+      <h2>Mesh-Time Plots (letzte 10 Minuten)</h2>
+      <div class="plots-grid">
+        <div>
+          <h3 style="font-size:0.95rem;">1) Mesh − Wallclock Fehler</h3>
+          <canvas id="errChart" height="160"></canvas>
+        </div>
+        <div>
+          <h3 style="font-size:0.95rem;">2) Offset pro Node</h3>
+          <canvas id="offsetChart" height="160"></canvas>
+        </div>
+        <div>
+          <h3 style="font-size:0.95rem;">3) ΔMesh-Time vs. Root</h3>
+          <canvas id="deltaChart" height="160"></canvas>
+        </div>
+        <div>
+          <h3 style="font-size:0.95rem;">4) LED-Phasenfehler</h3>
+          <canvas id="phaseChart" height="160"></canvas>
+        </div>
+        <div>
+          <h3 style="font-size:0.95rem;">5) Jitter (StdDev Fehler)</h3>
+          <canvas id="jitterChart" height="160"></canvas>
+        </div>
+      </div>
     </div>
-  </div>
-
-  <div class="card" style="margin-top:1.5rem;">
-    <h2>Raw-Stats</h2>
-    <pre class="small" id="rawStats"></pre>
   </div>
 
   <div class="footer">
-    MeshTime Web-UI – nur für Laborzwecke. Wenn die Kurve flach bei &lt;5 ms ist, hast du gewonnen.
+    MeshTime Web-UI – Wenn alle Kurven flach &lt;5 ms sind und das Mesh grün leuchtet, hast du einen kleinen Zeit-Konsens-Computer gebaut.
   </div>
 
   <script>
-    // Daten aus Flask
-    const timeline = {{ timeline | tojson }};
-
-    // In JS-Struktur für Chart.js umformen (Gruppierung nach Node)
-    const byNode = {};
-    for (const row of timeline) {
-      const node = row.node_id;
-      if (!byNode[node]) byNode[node] = [];
-      // t_wall ist Unix-Zeit in Sekunden
-      const t = new Date(row.t_wall * 1000);
-      byNode[node].push({
-        x: t,
-        y: row.err_ms
-      });
-    }
-
     const colors = [
       'rgba(46, 204, 113, 1)',
       'rgba(52, 152, 219, 1)',
       'rgba(231, 76, 60, 1)',
-      'rgba(241, 196, 15, 1)'
+      'rgba(241, 196, 15, 1)',
+      'rgba(155, 89, 182, 1)'
     ];
 
-    const datasets = Object.keys(byNode).sort().map((node, idx) => ({
-      label: `Node ${node}`,
-      data: byNode[node],
-      borderColor: colors[idx % colors.length],
-      backgroundColor: colors[idx % colors.length],
-      fill: false,
-      tension: 0.1,
-      pointRadius: 0
-    }));
+    let errChart, offsetChart, deltaChart, phaseChart, jitterChart;
 
-    const ctx = document.getElementById('errChart').getContext('2d');
-    const errChart = new Chart(ctx, {
-      type: 'line',
-      data: { datasets },
-      options: {
-        responsive: true,
-        scales: {
-          x: {
-            type: 'time',
-            time: {
-              unit: 'second'
+    function makeLineChart(ctx, labelSuffix, yLabel) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: { datasets: [] },
+        options: {
+          responsive: true,
+          animation: false,
+          scales: {
+            x: {
+              type: 'time',
+              time: { unit: 'second' },
+              ticks: { color: '#aaa' },
+              grid: { color: 'rgba(255,255,255,0.05)' }
             },
-            ticks: { color: '#aaa' },
-            grid: { color: 'rgba(255,255,255,0.05)' }
+            y: {
+              ticks: {
+                color: '#aaa',
+                callback: (v) => v.toFixed ? v.toFixed(1) + ' ' + yLabel : v + ' ' + yLabel
+              },
+              grid: { color: 'rgba(255,255,255,0.05)' }
+            }
           },
-          y: {
-            ticks: {
-              color: '#aaa',
-              callback: (v) => v + ' ms'
+          plugins: {
+            legend: {
+              labels: { color: '#eee' }
             },
-            grid: { color: 'rgba(255,255,255,0.05)' }
-          }
-        },
-        plugins: {
-          legend: {
-            labels: { color: '#eee' }
-          },
-          tooltip: {
-            callbacks: {
-              label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} ms`
+            tooltip: {
+              callbacks: {
+                label: (ctx) => `${ctx.dataset.label}${labelSuffix}: ${ctx.parsed.y.toFixed(2)} ${yLabel}`
+              }
             }
           }
         }
-      }
-    });
-
-    // Raw-Stats anzeigen
-    const stats = {};
-    for (const row of timeline) {
-      const node = row.node_id;
-      if (!stats[node]) stats[node] = { count: 0, min: +Infinity, max: -Infinity };
-      stats[node].count += 1;
-      stats[node].min = Math.min(stats[node].min, row.err_ms);
-      stats[node].max = Math.max(stats[node].max, row.err_ms);
+      });
     }
-    document.getElementById('rawStats').textContent = JSON.stringify(stats, null, 2);
+
+    function makeBarChart(ctx, yLabel) {
+      return new Chart(ctx, {
+        type: 'bar',
+        data: { labels: [], datasets: [{
+          label: 'Jitter',
+          data: [],
+          backgroundColor: 'rgba(52, 152, 219, 0.7)'
+        }] },
+        options: {
+          responsive: true,
+          animation: false,
+          scales: {
+            x: {
+              ticks: { color: '#aaa' },
+              grid: { display: false }
+            },
+            y: {
+              ticks: {
+                color: '#aaa',
+                callback: (v) => v + ' ' + yLabel
+              },
+              grid: { color: 'rgba(255,255,255,0.05)' }
+            }
+          },
+          plugins: {
+            legend: {
+              labels: { color: '#eee' }
+            }
+          }
+        }
+      });
+    }
+
+    function initCharts() {
+      errChart    = makeLineChart(document.getElementById('errChart').getContext('2d'), '', 'ms');
+      offsetChart = makeLineChart(document.getElementById('offsetChart').getContext('2d'), '', 'ms');
+      deltaChart  = makeLineChart(document.getElementById('deltaChart').getContext('2d'), ' vs Root', 'ms');
+      phaseChart  = makeLineChart(document.getElementById('phaseChart').getContext('2d'), '', 'ms');
+      jitterChart = makeBarChart(document.getElementById('jitterChart').getContext('2d'), 'ms');
+    }
+
+    function updateLineChart(chart, series, field, rootId, skipRootInDelta=false) {
+      const nodeIds = Object.keys(series).sort();
+      chart.data.datasets = [];
+      nodeIds.forEach((nodeId, idx) => {
+        if (skipRootInDelta && nodeId === rootId) return;
+        const color = colors[idx % colors.length];
+        const points = series[nodeId]
+          .filter(p => p[field] !== null && p[field] !== undefined)
+          .map(p => ({ x: new Date(p.t_wall * 1000), y: p[field] }));
+        chart.data.datasets.push({
+          label: `Node ${nodeId}`,
+          data: points,
+          borderColor: color,
+          backgroundColor: color,
+          fill: false,
+          tension: 0.1,
+          pointRadius: 0
+        });
+      });
+      chart.update();
+    }
+
+    function updateJitterChart(chart, jitter_ms) {
+      const nodeIds = Object.keys(jitter_ms).sort();
+      chart.data.labels = nodeIds;
+      chart.data.datasets[0].data = nodeIds.map(node => jitter_ms[node] || 0);
+      chart.update();
+    }
+
+    async function fetchNtpData() {
+      const resp = await fetch('/api/ntp_timeseries');
+      return await resp.json();
+    }
+
+    async function fetchTopology() {
+      const resp = await fetch('/api/topology');
+      return await resp.json();
+    }
+
+    function drawMesh(canvas, topo, activeNodes) {
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      if (!topo.nodes || topo.nodes.length === 0) {
+        ctx.fillStyle = '#777';
+        ctx.font = '12px system-ui';
+        ctx.fillText('Keine Nodes in config/nodes.json gefunden.', 10, 20);
+        return;
+      }
+
+      const n = topo.nodes.length;
+      const radius = Math.min(w, h) * 0.35;
+      const cx = w / 2;
+      const cy = h / 2;
+
+      const positions = {};
+      topo.nodes.forEach((node, idx) => {
+        const angle = (2 * Math.PI * idx) / n - Math.PI / 2;
+        const x = cx + radius * Math.cos(angle);
+        const y = cy + radius * Math.sin(angle);
+        positions[node.id] = { x, y };
+      });
+
+      // Links
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 1.0;
+      topo.links.forEach(link => {
+        const a = positions[link.source];
+        const b = positions[link.target];
+        if (!a || !b) return;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      });
+
+      // Nodes
+      topo.nodes.forEach(node => {
+        const pos = positions[node.id];
+        if (!pos) return;
+        const active = activeNodes.has(node.id);
+        const r = 16;
+
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, r, 0, 2 * Math.PI);
+        ctx.fillStyle = active ? 'rgba(39, 174, 96, 0.25)' : 'rgba(149, 165, 166, 0.2)';
+        ctx.fill();
+
+        ctx.lineWidth = active ? 2.0 : 1.0;
+        ctx.strokeStyle = active ? '#2ecc71' : '#7f8c8d';
+        ctx.stroke();
+
+        ctx.fillStyle = '#ecf0f1';
+        ctx.font = '12px system-ui';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(node.id, pos.x, pos.y);
+      });
+    }
+
+    async function refresh() {
+      try {
+        const [ntpData, topo] = await Promise.all([
+          fetchNtpData(),
+          fetchTopology()
+        ]);
+
+        const series = ntpData.series || {};
+        const rootId = ntpData.root_id;
+
+        updateLineChart(errChart,    series, 'err_ms',          rootId);
+        updateLineChart(offsetChart, series, 'offset_ms',       rootId);
+        updateLineChart(deltaChart,  series, 'delta_vs_root_ms', rootId, true);
+        updateLineChart(phaseChart,  series, 'phase_ms',        rootId);
+        updateJitterChart(jitterChart, ntpData.jitter_ms || {});
+
+        // aktive Nodes = alle, die Daten haben
+        const activeNodes = new Set(Object.keys(series || {}));
+        const meshCanvas = document.getElementById('meshCanvas');
+        // Canvas-Size anpassen
+        meshCanvas.width  = meshCanvas.clientWidth;
+        meshCanvas.height = meshCanvas.clientHeight;
+        drawMesh(meshCanvas, topo, activeNodes);
+      } catch (e) {
+        console.error('refresh failed', e);
+      }
+    }
+
+    window.addEventListener('load', () => {
+      initCharts();
+      refresh();
+      setInterval(refresh, 2000); // alle 2s live updaten
+    });
   </script>
 </body>
 </html>
 """
-
-# kleiner Filter für UTC-Ausgabe im Template
-@app.template_filter("datetime_utc")
-def datetime_utc(ts):
-    try:
-        return datetime.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return "n/a"
 
 
 if __name__ == "__main__":

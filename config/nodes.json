@@ -1,14 +1,26 @@
 {
   "sync": {
-    "kp": 0.05,
-    "ki": 0.006,
-    "i_max_ms": 250.0,
-    "i_leak": 0.03,
+    "controller": "kalman",
 
-    "max_slew_per_second_ms": 10,
+    "pi": {
+      "kp": 0.05,
+      "ki": 0.001,
+      "i_max_ms": 500.0,
+      "i_leak": 0.1
+    },
+
+    "kalman": {
+      "q_offset": 1e-10,
+      "q_drift": 1e-13,
+      "q_bias": 1e-15,
+      "r_base": 5e-6
+    },
+
+    "max_slew_per_second_ms": 5.0,
 
     "jitter_window": 60,
     "min_samples_for_jitter": 25,
+    "max_weight": 30000.0,
 
     "min_beacons_for_warmup": 25,
     "min_samples_before_log": 25,
@@ -24,7 +36,9 @@
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8,
 
-    "max_weight": 3e4
+    "ui_window_s": 600,
+    "ui_bin_s": 0.5,
+    "ui_max_points": 6000
   },
 
   "A": {
@@ -51,7 +65,9 @@
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
-    "sync": { "is_root": false }
+    "sync": {
+      "is_root": false
+    }
   },
 
   "D": {

@@ -132,6 +132,26 @@ class KalmanController:
             x = x + K @ y
             P = (np.eye(dim) - K @ H) @ P
 
+        # ==========================================================
+        # Virtual gauge measurement (ONCE per cycle)
+        # z = 0 ≈ offset   with large R
+        # ==========================================================
+        H = np.zeros((1, dim))
+        H[0, 0] = 1.0           # only offset
+
+        z = np.array([[0.0]])   # mean offset = 0
+
+        R_virtual = np.array([
+            [self.cfg.get("r_virtual", 1e-2)]
+        ])
+
+        y = z - H @ x
+        S = H @ P @ H.T + R_virtual
+        K = P @ H.T @ np.linalg.inv(S)
+
+        x = x + K @ y
+        P = (np.eye(dim) - K @ H) @ P
+
         # ---------------- Output ----------------
         old_offset = offset_s
         new_offset = float(x[0, 0])
@@ -140,6 +160,7 @@ class KalmanController:
         self._P = P
 
         return new_offset - old_offset
+
 
     # ------------------------------------------------------------
 

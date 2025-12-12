@@ -10,11 +10,15 @@ from pathlib import Path
 
 from flask import Flask, render_template_string, jsonify
 
-DB_PATH = Path("mesh_data.sqlite")
-CFG_PATH = Path("config/nodes.json")
+BASE_DIR = Path("/mesh_time")
+DB_PATH  = BASE_DIR / "mesh_data.sqlite"
+CFG_PATH = BASE_DIR / "config" / "nodes.json"
+
+from mesh.storage import Storage
 
 app = Flask(__name__)
 
+Storage(str(DB_PATH))   # legt Schema an, falls DB neu/leer
 
 # ------------------------------------------------------------
 # Hilfsfunktionen Backend

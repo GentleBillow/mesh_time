@@ -407,7 +407,6 @@ class SyncModule:
         sigma = self._peer_sigma.get(peer)
 
         try:
-            # Storage.insert_ntp_reference muss diese Signatur unterstützen.
             self._storage.insert_ntp_reference(
                 node_id=self.node_id,
                 t_wall=t_wall,
@@ -416,12 +415,9 @@ class SyncModule:
                 offset=offset,
                 err_mesh_vs_wall=err_mesh_vs_wall,
                 peer_id=peer,
-                rtt=rtt,
-                theta=theta,
-                error=error,
-                delta=delta,
-                sigma=sigma,
-                is_bootstrap=1 if did_bootstrap else 0,
+                theta_ms=(theta * 1000.0) if theta is not None else None,
+                rtt_ms=(rtt * 1000.0) if rtt is not None else None,
+                sigma_ms=(sigma * 1000.0) if sigma is not None else None,
             )
         except Exception as e:
             print(f"[{self.node_id}] _log_sync_sample failed: {e}")

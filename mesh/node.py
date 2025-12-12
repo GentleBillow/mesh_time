@@ -136,8 +136,8 @@ class MeshNode:
                 continue
 
             # Slot-Wait: sende in deinem festen Zeitfenster innerhalb jeder Periode
-            now = time.time()
-            t0 = math.floor(now / period_s) * period_s
+            now = time.monotonic()
+            t0 = int(now / period_s) * period_s
             target = t0 + phase_s
             if target <= now:
                 target += period_s

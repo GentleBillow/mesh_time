@@ -10,7 +10,7 @@
     "drift_damping": 0.0,
     "beacon_period_s": 1.0,
     "beacon_slot_ms": 50.0,
-    "beacon_n_slots": 4
+    "beacon_n_slots": 8
   },
 
   "A": {

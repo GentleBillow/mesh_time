@@ -191,12 +191,16 @@ class MeshNode:
         try:
             self._coap_ctx = await aiocoap.Context.create_server_context(site)
             print(f"[{self.id}] CoAP server started (aiocoap default bind)")
-            await asyncio.Future()
+
+            # Run until cancelled
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                pass
 
         except Exception as e:
-            print("[{}] Failed to start CoAP server: {}".format(self.id, e))
-            while True:
-                await asyncio.sleep(3600)
+            print(f"[{self.id}] CoAP server failed to start: {e}")
+            raise
 
     async def ntp_monitor_loop(self, interval: float = 5.0):
         """

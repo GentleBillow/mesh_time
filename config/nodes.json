@@ -1,6 +1,7 @@
 {
   "sync": {
     "controller": "kalman",
+    "log_heartbeat": 1.0,
 
     "pi": {
       "kp": 0.05,

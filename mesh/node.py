@@ -242,26 +242,16 @@ class MeshNode:
             pass
 
     async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
-        """
-        Periodisch Mesh-Zeit-Telemetrie loggen und optional an Sink senden.
-
-        Hinweis: dieses Logging ist "node-lokal" (o_i, t_mesh, t_wall).
-        Link-spezifische Werte loggt SyncModule selbst (theta/rtt/sigma) — falls enabled.
-        """
         print(f"[{self.id}] ntp_monitor_loop started (interval={interval}s)")
 
         while not self._stop.is_set():
-            if not self.sync.is_warmed_up():
-                await asyncio.sleep(interval)
-                continue
-
             t_wall = time.time()
             t_mono = time.monotonic()
             t_mesh = self.sync.mesh_time()
             offset = self.sync.get_offset()
             err = t_mesh - t_wall
 
-            # 1) Local DB
+            # 1) Local DB: IMMER loggen
             if self.storage is not None:
                 try:
                     self.storage.insert_ntp_reference(
@@ -271,34 +261,36 @@ class MeshNode:
                         t_mesh=t_mesh,
                         offset=offset,
                         err_mesh_vs_wall=err,
+                        peer_id=None,
+                        theta_ms=None,
+                        rtt_ms=None,
+                        sigma_ms=None,
                     )
                 except Exception as e:
                     print(f"[{self.id}] ntp_monitor_loop: local DB insert failed: {e}")
 
-            # 2) Send to sink (if configured and sink has IP)
-            if self.telemetry_sink_ip is not None:
-                uri = f"coap://{self.telemetry_sink_ip}/relay/ingest/ntp"
-                payload = {
-                    "node_id": self.id,
-                    "t_wall": t_wall,
-                    "t_mono": t_mono,
-                    "t_mesh": t_mesh,
-                    "offset": offset,
-                    "err_mesh_vs_wall": err,
-                }
+            # 2) Sink: optional erst nach Warmup
+            if self.sync.is_warmed_up() and self.telemetry_sink_ip is not None:
                 try:
                     ctx = await self._ensure_client_ctx()
                     if ctx is not None:
+                        uri = f"coap://{self.telemetry_sink_ip}/relay/ingest/ntp"
+                        payload = {
+                            "node_id": self.id,
+                            "t_wall": t_wall,
+                            "t_mono": t_mono,
+                            "t_mesh": t_mesh,
+                            "offset": offset,
+                            "err_mesh_vs_wall": err,
+                        }
                         req = aiocoap.Message(
                             code=aiocoap.POST,
                             uri=uri,
                             payload=json.dumps(payload).encode("utf-8"),
                         )
                         await asyncio.wait_for(ctx.request(req).response, timeout=0.5)
-                except asyncio.TimeoutError:
-                    print(f"[{self.id}] ntp_monitor_loop: CoAP to {self.telemetry_sink_id} timed out")
                 except Exception as e:
-                    print(f"[{self.id}] ntp_monitor_loop: CoAP to {self.telemetry_sink_id} failed: {e}")
+                    print(f"[{self.id}] ntp_monitor_loop: CoAP failed: {e}")
 
             await asyncio.sleep(interval)
 

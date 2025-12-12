@@ -13,6 +13,7 @@
   "A": {
     "ip": "172.16.32.171",
     "parent": "B",
+    "telemetry_sink": "C",
     "neighbors": ["B", "D"],
     "sensor_type": "potentiometer",
     "led_pin": 5,

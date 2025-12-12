@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# mesh/sync.py
+# mesh/sync.py - FIXED VERSION mit Link-Metrics Logging
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import aiocoap
 
 IS_WINDOWS = platform.system() == "Windows"
 
+
 # ---------------------------------------------------------------------
 # Data containers
 # ---------------------------------------------------------------------
@@ -24,7 +25,7 @@ class PeerStats:
     """Per-peer rolling link statistics (seconds)."""
     rtt_samples: List[float] = field(default_factory=list)
     sigma: Optional[float] = None
-    theta_last: Optional[float] = None   # theta ≈ o_peer - o_self
+    theta_last: Optional[float] = None  # theta ≈ o_peer - o_self
     good_samples: int = 0
     last_theta_epoch: Optional[float] = None
 
@@ -46,11 +47,11 @@ class BaseController:
         pass
 
     def compute_delta(
-        self,
-        offset_s: float,
-        measurements: List[Measurement],
-        weight_fn: WeightFn,
-        dt_s: float,
+            self,
+            offset_s: float,
+            measurements: List[Measurement],
+            weight_fn: WeightFn,
+            dt_s: float,
     ) -> float:
         raise NotImplementedError
 
@@ -66,7 +67,7 @@ class PIController(BaseController):
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.kp = float(cfg.get("kp", 0.02))
         self.ki = float(cfg.get("ki", 0.001))
-        self.i_leak = float(cfg.get("i_leak", 0.0))   # 1/s
+        self.i_leak = float(cfg.get("i_leak", 0.0))  # 1/s
         self.i_max = float(cfg.get("i_max_ms", 200.0)) / 1000.0
         self.i_state = 0.0
 
@@ -74,11 +75,11 @@ class PIController(BaseController):
         self.i_state = 0.0
 
     def compute_delta(
-        self,
-        offset_s: float,
-        measurements: List[Measurement],
-        weight_fn: WeightFn,
-        dt_s: float,
+            self,
+            offset_s: float,
+            measurements: List[Measurement],
+            weight_fn: WeightFn,
+            dt_s: float,
     ) -> float:
         num = 0.0
         den = 0.0
@@ -124,22 +125,24 @@ class SyncModule:
     """
     Mesh time synchronization via CoAP beacons + NTP 4-timestamp estimate.
     Controller is pluggable (PI / Kalman).
+
+    FIX: Logs link metrics (theta, rtt, sigma) to storage after each beacon.
     """
 
     def __init__(
-        self,
-        node_id: str,
-        neighbors: List[str],
-        neighbor_ips: Dict[str, str],
-        sync_cfg: Optional[Dict[str, Any]] = None,
-        storage=None,
+            self,
+            node_id: str,
+            neighbors: List[str],
+            neighbor_ips: Dict[str, str],
+            sync_cfg: Optional[Dict[str, Any]] = None,
+            storage=None,
     ) -> None:
         sync_cfg = sync_cfg or {}
 
         self.node_id = node_id
         self.neighbors = list(neighbors)
         self.neighbor_ips = dict(neighbor_ips)
-        self._storage = storage
+        self._storage = storage  # FIX: Storage für Link-Logging
 
         # role
         self._is_root = bool(sync_cfg.get("is_root", False))
@@ -156,7 +159,7 @@ class SyncModule:
 
         # offset init
         init_ms = float(sync_cfg.get("initial_offset_ms", 200.0))
-        self._offset = 0.0 if self._is_root else random.uniform(-init_ms/1000, init_ms/1000)
+        self._offset = 0.0 if self._is_root else random.uniform(-init_ms / 1000, init_ms / 1000)
 
         # controller selection
         ctrl_name = (sync_cfg.get("controller", "pi") or "pi").lower()
@@ -255,7 +258,7 @@ class SyncModule:
         self._bootstrapped = True
         self._controller.on_bootstrap()
 
-        print(f"[{self.node_id}] BOOTSTRAP via {peer_id}: offset={self._offset*1000:.3f} ms")
+        print(f"[{self.node_id}] BOOTSTRAP via {peer_id}: offset={self._offset * 1000:.3f} ms")
         return True
 
     # -----------------------------------------------------------------
@@ -283,7 +286,53 @@ class SyncModule:
         if self._drift_damping > 0.0:
             self._offset *= max(0.0, 1.0 - self._drift_damping * dt)
 
-        print(f"[{self.node_id}] control: Δ={delta*1000:.3f} ms, offset={self._offset*1000:.3f} ms")
+        print(f"[{self.node_id}] control: Δ={delta * 1000:.3f} ms, offset={self._offset * 1000:.3f} ms")
+
+    # -----------------------------------------------------------------
+    # FIX: Link Metrics Logging Helper
+    # -----------------------------------------------------------------
+
+    def _log_link_metrics(self, peer_id: str, rtt_s: float, theta_s: float) -> None:
+        """
+        NEW: Nach jedem erfolgreichen Beacon schreiben wir die Link-Metriken
+        (theta, rtt, sigma) in die Datenbank, falls Storage vorhanden ist.
+        """
+        if self._storage is None:
+            return
+
+        st = self._peer.get(peer_id)
+        if st is None:
+            return
+
+        # Nur loggen wenn wir genug Samples haben
+        if st.good_samples < self._min_samples_before_log:
+            return
+
+        # Konvertiere zu ms
+        theta_ms = theta_s * 1000.0
+        rtt_ms = rtt_s * 1000.0
+        sigma_ms = st.sigma * 1000.0 if st.sigma is not None else None
+
+        # Aktuelle Zeiten
+        t_wall = time.time()
+        t_mono = time.monotonic()
+        t_mesh = self.mesh_time()
+
+        try:
+            self._storage.insert_ntp_reference(
+                node_id=self.node_id,
+                t_wall=t_wall,
+                t_mono=t_mono,
+                t_mesh=t_mesh,
+                offset=self._offset,
+                err_mesh_vs_wall=t_mesh - t_wall,
+                peer_id=peer_id,  # FIX: Peer-ID setzen!
+                theta_ms=theta_ms,  # FIX: Theta loggen!
+                rtt_ms=rtt_ms,  # FIX: RTT loggen!
+                sigma_ms=sigma_ms,  # FIX: Sigma loggen!
+            )
+        except Exception as e:
+            print(f"[{self.node_id}] Link metrics logging failed for peer {peer_id}: {e}")
 
     # -----------------------------------------------------------------
     # Beacon roundtrip
@@ -347,6 +396,9 @@ class SyncModule:
 
             if not did_bs:
                 meas.append((peer_id, rtt, theta, peer_offset))
+
+            # FIX: Logge Link-Metriken nach jedem erfolgreichen Beacon!
+            self._log_link_metrics(peer_id, rtt, theta)
 
         if meas:
             self._apply_global_control(meas)

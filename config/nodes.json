@@ -51,7 +51,7 @@
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
-    "sync": { "is_root": false }
+    "sync": { "is_root": true }
   },
 
   "D": {

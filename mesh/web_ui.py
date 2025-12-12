@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # mesh/web_ui.py
-# MeshTime Web-UI: status + pairwise ΔMesh-Time (bin-synchronisiert) + robust jitter (IQR/MAD) + heatmap + topology
+# MeshTime Web-UI: status + bin-synced pairwise ΔMesh-Time + robust jitter (IQR/MAD) + heatmap + topology
 
 import json
 import math
@@ -10,29 +10,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, make_response
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # /home/pi/mesh_time
 DB_PATH = BASE_DIR / "mesh_data.sqlite"
 CFG_PATH = BASE_DIR / "config" / "nodes.json"
 
-from mesh.storage import Storage  # noqa: E402
+from mesh.storage import Storage  # ensures schema
 
 app = Flask(__name__)
 
 # -----------------------------
-# Tuning: “physikalisch ehrlich”
+# Tuning
 # -----------------------------
 WINDOW_SECONDS_DEFAULT = 600        # 10 Minuten
 MAX_POINTS_DEFAULT = 4000           # raw rows limit (DB read)
-BIN_S_DEFAULT = 0.5                 # 500ms Bin -> gute Sync-Optik, wenig Artefakte
-HEATMAP_MAX_BINS = 40               # maximal so viele bins in der Heatmap (UI)
-JITTER_MIN_SAMPLES = 10             # min bins pro Paar für robuste Kennzahl
+BIN_S_DEFAULT = 0.5                 # 500ms Bin
+HEATMAP_MAX_BINS = 40               # max bins in heatmap (UI)
+JITTER_MIN_SAMPLES = 10             # min bins per pair for robust stats
 
 
 # ------------------------------------------------------------
-# DB / Config helpers
+# Helpers
 # ------------------------------------------------------------
+
+def _json_error(msg: str, status: int = 500):
+    return make_response(jsonify({"error": msg}), status)
+
 
 def get_conn():
     conn = sqlite3.connect(str(DB_PATH))
@@ -48,11 +52,6 @@ def load_config() -> Dict[str, Any]:
 
 
 def get_topology() -> Dict[str, Any]:
-    """
-    Liest config/nodes.json und baut eine einfache Mesh-Topologie:
-      - nodes: [{id, ip, color, is_root}]
-      - links: [{source, target}]
-    """
     cfg = load_config()
     nodes = []
     links = []
@@ -69,7 +68,6 @@ def get_topology() -> Dict[str, Any]:
         nodes.append({"id": node_id, "ip": ip, "color": color, "is_root": is_root})
 
         for neigh in entry.get("neighbors", []):
-            # einfache Duplikat-Filter-Regel
             if node_id < neigh:
                 links.append({"source": node_id, "target": neigh})
 
@@ -113,26 +111,10 @@ def robust_mad_ms(values_ms: List[float]) -> float:
 
 
 # ------------------------------------------------------------
-# Core data extraction (bin-synchronisiert)
+# Status snapshot
 # ------------------------------------------------------------
 
-def _bin_idx_abs(t_wall: float, bin_s: float) -> int:
-    # absolute binning -> stable grid independent of window start
-    return int(math.floor(t_wall / bin_s))
-
-
-def _bin_center_abs(idx: int, bin_s: float) -> float:
-    return (idx + 0.5) * bin_s
-
-
 def get_status_snapshot(reference_node: str = "C") -> Dict[str, Any]:
-    """
-    Status pro Node (letzter Eintrag):
-      - mesh_time UTC + epoch
-      - offset ms
-      - age seconds (wie alt ist das sample)
-      - delta_vs_ref_ms (t_mesh(node) - t_mesh(ref))
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -151,10 +133,10 @@ def get_status_snapshot(reference_node: str = "C") -> Dict[str, Any]:
     conn.close()
 
     now = time.time()
-    rows_out = []
+    rows_out: List[Dict[str, Any]] = []
 
-    # reference mesh time for delta display
-    ref_t_mesh = None
+    # reference t_mesh
+    ref_t_mesh: Optional[float] = None
     for r in last_by_node:
         if r["node_id"] == reference_node:
             try:
@@ -165,23 +147,28 @@ def get_status_snapshot(reference_node: str = "C") -> Dict[str, Any]:
     for r in last_by_node:
         node_id = r["node_id"]
 
+        t_wall = None
+        t_mesh = None
+        offset_ms = None
+        created_at = None
+
         try:
             t_wall = float(r["t_wall"])
         except Exception:
-            t_wall = None
+            pass
 
         try:
             t_mesh = float(r["t_mesh"])
         except Exception:
-            t_mesh = None
+            pass
 
         try:
             offset_ms = float(r["offset"]) * 1000.0
         except Exception:
-            offset_ms = None
+            pass
 
         try:
-            created_at = float(r["created_at"]) if r.get("created_at") is not None else t_wall
+            created_at = float(r["created_at"])
         except Exception:
             created_at = t_wall
 
@@ -191,44 +178,32 @@ def get_status_snapshot(reference_node: str = "C") -> Dict[str, Any]:
         if (t_mesh is not None) and (ref_t_mesh is not None):
             delta_vs_ref_ms = (t_mesh - ref_t_mesh) * 1000.0
 
-        rows_out.append(
-            {
-                "node_id": node_id,
-                "t_mesh": t_mesh,
-                "t_mesh_utc": datetime.utcfromtimestamp(t_mesh).strftime("%Y-%m-%d %H:%M:%S") if t_mesh is not None else "n/a",
-                "offset_ms": offset_ms,
-                "t_wall": t_wall,
-                "t_wall_utc": datetime.utcfromtimestamp(t_wall).strftime("%Y-%m-%d %H:%M:%S") if t_wall is not None else "n/a",
-                "age_s": age_s,
-                "delta_vs_ref_ms": delta_vs_ref_ms,
-            }
-        )
+        rows_out.append({
+            "node_id": node_id,
+            "t_mesh": t_mesh,
+            "t_mesh_utc": datetime.utcfromtimestamp(t_mesh).strftime("%Y-%m-%d %H:%M:%S") if t_mesh is not None else "n/a",
+            "offset_ms": offset_ms,
+            "t_wall": t_wall,
+            "t_wall_utc": datetime.utcfromtimestamp(t_wall).strftime("%Y-%m-%d %H:%M:%S") if t_wall is not None else "n/a",
+            "age_s": age_s,
+            "delta_vs_ref_ms": delta_vs_ref_ms,
+        })
 
     return {"rows": rows_out, "reference_node": reference_node}
 
 
-def get_ntp_timeseries(
-    window_seconds: int = WINDOW_SECONDS_DEFAULT,
-    max_points: int = MAX_POINTS_DEFAULT,
-    bin_s: float = BIN_S_DEFAULT
-) -> Dict[str, Any]:
-    """
-    Baut bin-synchronisierte Daten:
+# ------------------------------------------------------------
+# Bin-synced timeseries
+# ------------------------------------------------------------
 
-    - series[node]  : [{t_wall, offset_ms, delta_offset_ms}] (latest in bin)
-    - pairs[pair]   : [{t_wall, delta_ms}]  (same bin)
-    - jitter[pair]  : { sigma_ms, iqr_ms, mad_ms, n }   sigma_ms ~ 0.7413*IQR
-    - heatmap       : {data:[{pair,t_bin,value}], n_bins}
-                      value = avg(abs(delta_ms)) pro Display-Bin
-    """
-    bin_s = float(bin_s)
-    if bin_s <= 0:
-        bin_s = BIN_S_DEFAULT
-
-    cutoff = time.time() - float(window_seconds)
+def get_ntp_timeseries(window_seconds: int = WINDOW_SECONDS_DEFAULT,
+                       max_points: int = MAX_POINTS_DEFAULT,
+                       bin_s: float = BIN_S_DEFAULT) -> Dict[str, Any]:
 
     conn = get_conn()
     cur = conn.cursor()
+    cutoff = time.time() - float(window_seconds)
+
     rows = cur.execute(
         """
         SELECT node_id, t_wall, t_mesh, offset, created_at
@@ -250,35 +225,14 @@ def get_ntp_timeseries(
             "meta": {"bin_s": bin_s, "window_seconds": window_seconds},
         }
 
-    # bins: abs_idx -> node_id -> (created_at, offset_ms)
-    bins: Dict[int, Dict[str, Tuple[float, float]]] = {}
-
+    t_walls: List[float] = []
     for r in rows:
-        node = r["node_id"]
         try:
-            t_wall = float(r["t_wall"])
+            t_walls.append(float(r["t_wall"]))
         except Exception:
-            continue
+            pass
 
-        try:
-            created_at = float(r["created_at"]) if r.get("created_at") is not None else t_wall
-        except Exception:
-            created_at = t_wall
-
-        try:
-            offset_ms = float(r["offset"]) * 1000.0
-        except Exception:
-            continue
-
-        idx = _bin_idx_abs(t_wall, bin_s)
-        bucket = bins.setdefault(idx, {})
-        prev = bucket.get(node)
-
-        # keep latest in bin by created_at
-        if (prev is None) or (created_at >= prev[0]):
-            bucket[node] = (created_at, offset_ms)
-
-    if not bins:
+    if not t_walls:
         return {
             "series": {},
             "pairs": {},
@@ -287,14 +241,50 @@ def get_ntp_timeseries(
             "meta": {"bin_s": bin_s, "window_seconds": window_seconds},
         }
 
-    # Build per-node series
+    t_min = min(t_walls)
+    t_max = max(t_walls)
+    if t_max <= t_min:
+        t_max = t_min + bin_s
+
+    # bins: idx -> node_id -> (created_at, t_wall, offset_ms)
+    bins: Dict[int, Dict[str, Tuple[float, float, float]]] = {}
+
+    for r in rows:
+        node = r["node_id"]
+
+        try:
+            t_wall = float(r["t_wall"])
+        except Exception:
+            continue
+
+        try:
+            created_at = float(r["created_at"])
+        except Exception:
+            created_at = t_wall
+
+        try:
+            offset_ms = float(r["offset"]) * 1000.0
+        except Exception:
+            continue
+
+        idx = int((t_wall - t_min) / bin_s)
+        if idx < 0:
+            continue
+
+        bucket = bins.setdefault(idx, {})
+        prev = bucket.get(node)
+        if (prev is None) or (created_at >= prev[0]):
+            bucket[node] = (created_at, t_wall, offset_ms)
+
+    # per-node series
     series: Dict[str, List[Dict[str, float]]] = {}
     for idx in sorted(bins.keys()):
-        t_bin = _bin_center_abs(idx, bin_s)
-        for node, (_created, offset_ms) in bins[idx].items():
+        bucket = bins[idx]
+        t_bin = t_min + (idx + 0.5) * bin_s
+        for node, (_created, _t_wall, offset_ms) in bucket.items():
             series.setdefault(node, []).append({"t_wall": t_bin, "offset_ms": offset_ms})
 
-    # add delta_offset_ms per node
+    # delta_offset_ms
     for node, pts in series.items():
         pts.sort(key=lambda p: p["t_wall"])
         prev = None
@@ -305,7 +295,6 @@ def get_ntp_timeseries(
                 p["delta_offset_ms"] = p["offset_ms"] - prev
             prev = p["offset_ms"]
 
-    # Pair series
     def norm_pair(a: str, b: str) -> str:
         return "-".join(sorted([a, b]))
 
@@ -316,8 +305,8 @@ def get_ntp_timeseries(
         if len(nodes_now) < 2:
             continue
 
-        t_bin = _bin_center_abs(idx, bin_s)
-        off = {n: bucket[n][1] for n in nodes_now}  # offset_ms
+        t_bin = t_min + (idx + 0.5) * bin_s
+        off = {n: bucket[n][2] for n in nodes_now}
 
         for i in range(len(nodes_now)):
             for j in range(i + 1, len(nodes_now)):
@@ -325,9 +314,9 @@ def get_ntp_timeseries(
                 b = nodes_now[j]
                 pair_id = norm_pair(a, b)
                 delta_ms = off[a] - off[b]
-                pairs.setdefault(pair_id, []).append({"t_wall": t_bin, "delta_ms": float(delta_ms)})
+                pairs.setdefault(pair_id, []).append({"t_wall": t_bin, "delta_ms": delta_ms})
 
-    # Robust jitter per pair
+    # jitter
     jitter: Dict[str, Dict[str, float]] = {}
     for pair_id, pts in pairs.items():
         if len(pts) < JITTER_MIN_SAMPLES:
@@ -340,59 +329,54 @@ def get_ntp_timeseries(
             "sigma_ms": float(sigma),
             "iqr_ms": float(iqr),
             "mad_ms": float(mad),
-            "n": int(len(deltas)),
+            "n": float(len(deltas)),
         }
 
-    # Heatmap down-binning to HEATMAP_MAX_BINS
+    # heatmap (down-bin to HEATMAP_MAX_BINS)
     heatmap_data: List[Dict[str, Any]] = []
-    n_bins = 0
+    if pairs and bins:
+        idx_min = min(bins.keys())
+        idx_max = max(bins.keys())
+        total_bins = max(1, idx_max - idx_min + 1)
+        display_bins = min(HEATMAP_MAX_BINS, total_bins)
 
-    if pairs:
-        idxs = sorted(bins.keys())
-        idx_min = idxs[0]
-        idx_max = idxs[-1]
-        total_bins = (idx_max - idx_min + 1)
+        if display_bins == total_bins:
+            for pair_id, pts in pairs.items():
+                for p in pts:
+                    heatmap_data.append({"pair": pair_id, "t_bin": p["t_wall"], "value": abs(p["delta_ms"])})
+            n_bins = total_bins
+        else:
+            span = float(total_bins)
+            accum: Dict[Tuple[str, int], List[float]] = {}
 
-        display_bins = min(HEATMAP_MAX_BINS, max(1, total_bins))
-        n_bins = display_bins
+            # map original bin idx -> display bin
+            for idx in range(idx_min, idx_max + 1):
+                pass  # just to keep the mental model: idx is the true bin index
 
-        # map abs_idx -> display bin index
-        # stable mapping across window: depends only on absolute idx
-        span = max(1, total_bins)
-        def to_display_bin(abs_idx: int) -> int:
-            rel = (abs_idx - idx_min) / float(span)
-            d = int(rel * display_bins)
-            if d >= display_bins:
-                d = display_bins - 1
-            if d < 0:
-                d = 0
-            return d
+            for pair_id, pts in pairs.items():
+                for p in pts:
+                    t_wall = float(p["t_wall"])
+                    # invert t_bin -> idx approx
+                    idx = int(round((t_wall - (t_min + 0.5 * bin_s)) / bin_s))
+                    idx = max(idx_min, min(idx_max, idx))
 
-        accum: Dict[Tuple[str, int], List[float]] = {}
-        for abs_idx in idxs:
-            t_center = _bin_center_abs(abs_idx, bin_s)
-            bucket = bins.get(abs_idx, {})
-            nodes_now = sorted(bucket.keys())
-            if len(nodes_now) < 2:
-                continue
+                    rel = (idx - idx_min) / span
+                    d_idx = int(rel * display_bins)
+                    if d_idx >= display_bins:
+                        d_idx = display_bins - 1
 
-            off = {n: bucket[n][1] for n in nodes_now}
-            d_idx = to_display_bin(abs_idx)
+                    accum.setdefault((pair_id, d_idx), []).append(abs(float(p["delta_ms"])))
 
-            for i in range(len(nodes_now)):
-                for j in range(i + 1, len(nodes_now)):
-                    a = nodes_now[i]
-                    b = nodes_now[j]
-                    pair_id = norm_pair(a, b)
-                    val = abs(float(off[a] - off[b]))
-                    accum.setdefault((pair_id, d_idx), []).append(val)
+            for (pair_id, d_idx), vals in accum.items():
+                # center time for display bin
+                # map d_idx back into the idx-range
+                idx_center = idx_min + (d_idx + 0.5) * (total_bins / display_bins)
+                t_center = t_min + (idx_center + 0.5) * bin_s
+                heatmap_data.append({"pair": pair_id, "t_bin": t_center, "value": sum(vals) / max(1, len(vals))})
 
-        for (pair_id, d_idx), vals in accum.items():
-            # display time center: middle of that display bin in wallclock
-            # approximate using idx_min + center fraction
-            center_abs = idx_min + int((d_idx + 0.5) * (total_bins / display_bins))
-            t_disp = _bin_center_abs(center_abs, bin_s)
-            heatmap_data.append({"pair": pair_id, "t_bin": t_disp, "value": sum(vals) / max(1, len(vals))})
+            n_bins = display_bins
+    else:
+        n_bins = 0
 
     return {
         "series": series,
@@ -404,42 +388,47 @@ def get_ntp_timeseries(
 
 
 # ------------------------------------------------------------
-# Flask routes
+# Routes
 # ------------------------------------------------------------
 
 @app.route("/")
 def index():
     topo = get_topology()
-    return render_template_string(
-        TEMPLATE,
-        topo=topo,
-        db_path=str(DB_PATH),
-    )
+    return render_template_string(TEMPLATE, topo=topo, db_path=str(DB_PATH))
 
 
 @app.route("/api/topology")
 def api_topology():
-    return jsonify(get_topology())
+    try:
+        return jsonify(get_topology())
+    except Exception as e:
+        return _json_error(f"/api/topology failed: {e}", 500)
 
 
 @app.route("/api/status")
 def api_status():
-    cfg = load_config()
-    ref = "C" if "C" in cfg else ("A" if "A" in cfg else next(iter(cfg.keys()), "C"))
-    return jsonify(get_status_snapshot(reference_node=ref))
+    try:
+        cfg = load_config()
+        ref = "C" if "C" in cfg else "A"
+        return jsonify(get_status_snapshot(reference_node=ref))
+    except Exception as e:
+        return _json_error(f"/api/status failed: {e}", 500)
 
 
 @app.route("/api/ntp_timeseries")
 def api_ntp_timeseries():
-    cfg = load_config()
-    sync_cfg = (cfg.get("sync", {}) or {})
+    try:
+        cfg = load_config()
+        sync_cfg = (cfg.get("sync", {}) or {})
 
-    window_s = int(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
-    bin_s = float(sync_cfg.get("ui_bin_s", BIN_S_DEFAULT))
-    max_points = int(sync_cfg.get("ui_max_points", MAX_POINTS_DEFAULT))
+        window_s = int(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        bin_s = float(sync_cfg.get("ui_bin_s", BIN_S_DEFAULT))
+        max_points = int(sync_cfg.get("ui_max_points", MAX_POINTS_DEFAULT))
 
-    data = get_ntp_timeseries(window_seconds=window_s, max_points=max_points, bin_s=bin_s)
-    return jsonify(data)
+        return jsonify(get_ntp_timeseries(window_seconds=window_s, max_points=max_points, bin_s=bin_s))
+    except Exception as e:
+        # IMPORTANT: return JSON, not HTML, so the browser console is readable.
+        return _json_error(f"/api/ntp_timeseries failed: {e}", 500)
 
 
 @app.template_filter("datetime_utc")
@@ -451,7 +440,7 @@ def datetime_utc(ts):
 
 
 # ------------------------------------------------------------
-# HTML + JS Template (dein Layout)
+# Template (your adjusted UI)
 # ------------------------------------------------------------
 
 TEMPLATE = r"""
@@ -666,8 +655,7 @@ TEMPLATE = r"""
           animation: false,
           scales: {
             x: { ticks: { color: '#aaa' }, grid: { display: false } },
-            y: { ticks: { color: '#aaa', callback: (v) => v + ' ' + yLabel },
-                 grid: { color: 'rgba(255,255,255,0.05)' } }
+            y: { ticks: { color: '#aaa', callback: (v) => v + ' ' + yLabel }, grid: { color: 'rgba(255,255,255,0.05)' } }
           },
           plugins: {
             legend: { labels: { color: '#eee' } },
@@ -725,20 +713,18 @@ TEMPLATE = r"""
             const h = (area.bottom - area.top) / nCats;
             return (Number.isFinite(h) && h > 0) ? h : 10;
           }
-        }]},
+        } ]},
         options: {
           responsive: true,
           animation: false,
           scales: {
-            x: { type: 'time', time: { unit: 'second' }, ticks: { color: '#aaa' },
-                 grid: { color: 'rgba(255,255,255,0.05)' } },
+            x: { type: 'time', time: { unit: 'second' }, ticks: { color: '#aaa' }, grid: { color: 'rgba(255,255,255,0.05)' } },
             y: {
               type: 'linear',
               ticks: {
                 color: '#aaa',
                 callback: function (value) {
-                  const chart = this.chart;
-                  const cats = chart._categories || [];
+                  const cats = this.chart._categories || [];
                   const idx = Math.round(value);
                   return cats[idx] || '';
                 }
@@ -751,8 +737,7 @@ TEMPLATE = r"""
             tooltip: {
               callbacks: {
                 label: (ctx) => {
-                  const chart = ctx.chart;
-                  const cats = chart._categories || [];
+                  const cats = ctx.chart._categories || [];
                   const idx = Math.round(ctx.raw.y);
                   const pairId = cats[idx] || '?';
                   const v = (ctx.raw && typeof ctx.raw.v === 'number') ? ctx.raw.v : 0;
@@ -781,13 +766,9 @@ TEMPLATE = r"""
         const strokeColor = baseColor.replace('0.5', '0.9');
         const points = (pairs[pairId] || []).map(p => ({ x: new Date(p.t_wall * 1000), y: p.delta_ms }));
         chart.data.datasets.push({
-          label: pairId,
-          data: points,
-          borderColor: strokeColor,
-          backgroundColor: baseColor,
-          fill: false,
-          pointRadius: 0,
-          borderWidth: 1.5
+          label: pairId, data: points,
+          borderColor: strokeColor, backgroundColor: baseColor,
+          fill: false, pointRadius: 0, borderWidth: 1.5
         });
       });
       chart.update();
@@ -801,13 +782,9 @@ TEMPLATE = r"""
         const strokeColor = baseColor.replace('0.5', '0.9');
         const points = (series[nodeId] || []).map(p => ({ x: new Date(p.t_wall * 1000), y: p.delta_offset_ms }));
         chart.data.datasets.push({
-          label: `Node ${nodeId}`,
-          data: points,
-          borderColor: strokeColor,
-          backgroundColor: baseColor,
-          fill: false,
-          pointRadius: 0,
-          borderWidth: 1.5
+          label: `Node ${nodeId}`, data: points,
+          borderColor: strokeColor, backgroundColor: baseColor,
+          fill: false, pointRadius: 0, borderWidth: 1.5
         });
       });
       chart.update();
@@ -818,6 +795,7 @@ TEMPLATE = r"""
       const labels = [];
       const data = [];
       const meta = {};
+
       ids.forEach(id => {
         const obj = jitter[id] || {};
         const sigma = obj.sigma_ms;
@@ -827,6 +805,7 @@ TEMPLATE = r"""
           meta[id] = obj;
         }
       });
+
       chart.data.labels = labels;
       chart.data.datasets[0].data = data;
       chart._jitterMeta = meta;
@@ -863,18 +842,18 @@ TEMPLATE = r"""
       chart.update();
     }
 
-    async function fetchNtpData() {
-      const resp = await fetch('/api/ntp_timeseries');
-      return await resp.json();
+    async function fetchJson(url) {
+      const resp = await fetch(url);
+      const data = await resp.json(); // server guarantees JSON (even on errors)
+      if (!resp.ok) {
+        throw new Error(`${url}: ${data.error || 'unknown error'}`);
+      }
+      return data;
     }
-    async function fetchTopology() {
-      const resp = await fetch('/api/topology');
-      return await resp.json();
-    }
-    async function fetchStatus() {
-      const resp = await fetch('/api/status');
-      return await resp.json();
-    }
+
+    async function fetchNtpData() { return await fetchJson('/api/ntp_timeseries'); }
+    async function fetchTopology() { return await fetchJson('/api/topology'); }
+    async function fetchStatus() { return await fetchJson('/api/status'); }
 
     function classifyDelta(deltaAbsMs) {
       if (deltaAbsMs < 5) return 'pill-ok';
@@ -900,16 +879,16 @@ TEMPLATE = r"""
       rows.forEach(r => {
         const node = r.node_id;
         const tMeshUTC = r.t_mesh_utc || 'n/a';
-        const tMesh = (r.t_mesh !== null && r.t_mesh !== undefined) ? Number(r.t_mesh).toFixed(3) : 'n/a';
+        const tMesh = (r.t_mesh !== null && r.t_mesh !== undefined) ? r.t_mesh.toFixed(3) : 'n/a';
         const tWallUTC = r.t_wall_utc || 'n/a';
 
-        const offsetMs = (r.offset_ms !== null && r.offset_ms !== undefined) ? Number(r.offset_ms) : null;
-        const ageS = (r.age_s !== null && r.age_s !== undefined) ? Number(r.age_s) : null;
-        const dRef = (r.delta_vs_ref_ms !== null && r.delta_vs_ref_ms !== undefined) ? Number(r.delta_vs_ref_ms) : null;
+        const offsetMs = (r.offset_ms !== null && r.offset_ms !== undefined) ? r.offset_ms : null;
+        const ageS = (r.age_s !== null && r.age_s !== undefined) ? r.age_s : null;
+        const dRef = (r.delta_vs_ref_ms !== null && r.delta_vs_ref_ms !== undefined) ? r.delta_vs_ref_ms : null;
 
         const cls = (dRef === null) ? 'pill-warn' : classifyDelta(Math.abs(dRef));
-
         const tr = document.createElement('tr');
+
         tr.innerHTML = `
           <td>${node}</td>
           <td>${tMeshUTC}<br><span class="small mono">${tMesh}</span></td>
@@ -994,9 +973,9 @@ TEMPLATE = r"""
       try {
         const [ntpData, topo, status] = await Promise.all([fetchNtpData(), fetchTopology(), fetchStatus()]);
 
-        const series = ntpData.series || {};
-        const pairs = ntpData.pairs || {};
-        const jitter = ntpData.jitter || {};
+        const series  = ntpData.series || {};
+        const pairs   = ntpData.pairs || {};
+        const jitter  = ntpData.jitter || {};
         const heatmap = ntpData.heatmap || {data: [], n_bins: 0};
 
         renderStatusTable(status);
@@ -1007,12 +986,12 @@ TEMPLATE = r"""
         updateHeatmapChart(heatmapChart, heatmap);
 
         const activeNodes = new Set(Object.keys(series || {}));
-        const meshCanvas = document.getElementById('meshCanvas');
-        meshCanvas.width = meshCanvas.clientWidth;
+        const meshCanvas  = document.getElementById('meshCanvas');
+        meshCanvas.width  = meshCanvas.clientWidth;
         meshCanvas.height = meshCanvas.clientHeight;
         drawMesh(meshCanvas, topo, activeNodes);
       } catch (e) {
-        console.error('refresh failed', e);
+        console.error('refresh failed:', e);
       }
     }
 
@@ -1029,7 +1008,7 @@ TEMPLATE = r"""
 
 def ensure_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    Storage(str(DB_PATH))  # create schema if needed
+    Storage(str(DB_PATH))  # create schema if missing
 
 
 if __name__ == "__main__":

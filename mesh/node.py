@@ -6,6 +6,9 @@ import time
 import platform
 import json
 from typing import Dict, Any
+import zlib
+import math
+
 
 import aiocoap
 
@@ -104,7 +107,21 @@ class MeshNode:
         """
         Periodically send sync beacons.
         """
+
         print("[{}] sync_loop started".format(self.id))
+
+        # --- Beacon Slotting (deterministisch) ---
+        slot_ms = float(self.global_cfg.get("sync", {}).get("beacon_slot_ms", 50.0))  # z.B. 50ms
+        n_slots = int(self.global_cfg.get("sync", {}).get("beacon_n_slots", 8))  # z.B. 8 Slots
+        period_s = float(self.global_cfg.get("sync", {}).get("beacon_period_s", 1.0))  # z.B. 1s
+
+        # stabile "Hash"-Funktion (crc32), damit über Reboots konstant
+        h = zlib.crc32(self.id.encode("utf-8")) & 0xffffffff
+        slot_idx = h % n_slots
+        phase_s = (slot_idx * slot_ms) / 1000.0
+
+        print(f"[{self.id}] beacon slotting: slot_idx={slot_idx}/{n_slots}, phase={phase_s * 1000:.1f}ms")
+
         while not self._stop.is_set():
             if IS_WINDOWS:
                 # Dev mode: no network sync on Windows
@@ -117,6 +134,15 @@ class MeshNode:
                 print("[{}] sync_loop: failed to create client context: {}".format(self.id, e))
                 await asyncio.sleep(1.0)
                 continue
+
+            # Slot-Wait: sende in deinem festen Zeitfenster innerhalb jeder Periode
+            now = time.time()
+            t0 = math.floor(now / period_s) * period_s
+            target = t0 + phase_s
+            if target <= now:
+                target += period_s
+
+            await asyncio.sleep(max(0.0, target - now))
 
             try:
                 await self.sync.send_beacons(client_ctx)

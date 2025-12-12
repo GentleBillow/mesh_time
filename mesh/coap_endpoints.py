@@ -63,8 +63,8 @@ class SyncBeaconResource(resource.Resource):
             "dst": src or "unknown",
             "t2": t2,
             "t3": t3,
-            "offset": self.node.sync.get_offset(),  # <- wichtiger Teil für SyncModule
-
+            "boot_epoch": time.time() - time.monotonic(),  # <--- ADD THIS
+            "offset": self.node.sync.get_offset(),
             # Bonus-Infos für Debugging
             "receiver_id": self.node.id,
             "sender_id": src,

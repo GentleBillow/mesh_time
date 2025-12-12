@@ -1,5 +1,5 @@
 # web_ui.py
-# MeshTime Web-UI mit relativen Plots (paarweise ΔMesh-Time) + Topologie
+# MeshTime Web-UI mit relativen Plots (paarweise ΔMesh-Time) + Topologie + Heatmap
 
 import json
 import math
@@ -76,6 +76,8 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
       - pairs: paarweise ΔMesh-Time (Node i vs. j) als Zeitreihe
             t_wall, delta_ms
       - jitter_std_pairs: StdDev(ΔMesh-Time) pro Paar (für Jitter-Barplot)
+      - heatmap: binned ΔMesh-Time pro Paar/Zeitslot
+            { "data": [{pair, t_bin, value}], "n_bins": int }
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -99,6 +101,7 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
             "series": {},
             "pairs": {},
             "jitter_std_pairs": {},
+            "heatmap": {"data": [], "n_bins": 0},
         }
 
     # nach Node gruppieren
@@ -171,10 +174,59 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
         var = sum((d - mean) ** 2 for d in deltas) / (len(deltas) - 1)
         jitter_std_pairs[pair_id] = math.sqrt(var)
 
+    # Heatmap: ΔMesh-Time gebinnt nach Zeit und Paar
+    heatmap_data = []
+    n_bins = 0
+    if pair_series:
+        # alle Zeitstempel über alle Paare
+        all_t = [float(p["t_wall"]) for pts in pair_series.values() for p in pts]
+        t_min = min(all_t)
+        t_max = max(all_t)
+
+        if t_max == t_min:
+            n_bins = 1
+            bin_width = 1.0
+        else:
+            # grob: max 40 Bins, mind. 1
+            n_bins = max(1, min(40, int(len(all_t) / 5) or 1))
+            bin_width = (t_max - t_min) / n_bins
+
+        accum = {}  # (pair_id, bin_idx) -> [sum_delta, count]
+
+        for pair_id, pts in pair_series.items():
+            for p in pts:
+                t = float(p["t_wall"])
+                if n_bins == 1:
+                    idx = 0
+                else:
+                    rel = (t - t_min) / (t_max - t_min + 1e-9)
+                    idx = int(rel * n_bins)
+                    if idx >= n_bins:
+                        idx = n_bins - 1
+                key = (pair_id, idx)
+                v = float(p["delta_ms"])
+                if key not in accum:
+                    accum[key] = [v, 1]
+                else:
+                    accum[key][0] += v
+                    accum[key][1] += 1
+
+        for (pair_id, idx), (sum_v, cnt) in accum.items():
+            t_center = t_min + (idx + 0.5) * (bin_width if n_bins > 1 else 1.0)
+            avg = sum_v / cnt
+            heatmap_data.append(
+                {
+                    "pair": pair_id,
+                    "t_bin": t_center,
+                    "value": avg,
+                }
+            )
+
     return {
         "series": series,
         "pairs": pair_series,
         "jitter_std_pairs": jitter_std_pairs,
+        "heatmap": {"data": heatmap_data, "n_bins": n_bins},
     }
 
 
@@ -309,9 +361,10 @@ TEMPLATE = r"""
       opacity: 0.6;
     }
   </style>
-  <!-- Chart.js + Date-Adapter -->
+  <!-- Chart.js + Date-Adapter + Matrix-Plugin für Heatmap -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@1.3.0/dist/chartjs-chart-matrix.min.js"></script>
 </head>
 <body>
   <h1>MeshTime Monitor</h1>
@@ -386,12 +439,17 @@ TEMPLATE = r"""
           <h3 style="font-size:0.95rem;">3) Jitter der ΔMesh-Time (StdDev pro Paar)</h3>
           <canvas id="jitterBarChart" height="160"></canvas>
         </div>
+        <div>
+          <h3 style="font-size:0.95rem;">4) ΔMesh-Time Heatmap (|Δ| gebinnt)</h3>
+          <canvas id="heatmapChart" height="160"></canvas>
+        </div>
       </div>
     </div>
   </div>
 
   <div class="footer">
-    MeshTime Web-UI – Wenn alle ΔMesh-Linien flach &lt;5 ms liegen, hast du einen kleinen Zeit-Konsens-Computer gebaut.
+    MeshTime Web-UI – Wenn alle ΔMesh-Linien flach &lt;5 ms liegen und die Heatmap blassgrün bleibt,
+    hast du einen kleinen Zeit-Konsens-Computer gebaut.
   </div>
 
   <script>
@@ -403,7 +461,7 @@ TEMPLATE = r"""
       'rgba(155, 89, 182, 0.5)'
     ];
 
-    let pairChart, offsetDeltaChart, jitterBarChart;
+    let pairChart, offsetDeltaChart, jitterBarChart, heatmapChart;
 
     function makeLineChart(ctx, yLabel) {
       return new Chart(ctx, {
@@ -477,10 +535,90 @@ TEMPLATE = r"""
       });
     }
 
+    function makeHeatmapChart(ctx) {
+      return new Chart(ctx, {
+        type: 'matrix',
+        data: {
+          datasets: [{
+            label: 'ΔMesh-Time Heatmap',
+            data: [],
+            borderWidth: 0,
+            backgroundColor: (context) => {
+              const value = Math.abs(context.raw.v || 0);
+              const chart = context.chart;
+              const maxV = chart._maxV || 1;
+              const ratio = Math.min(1, value / maxV);
+              const r = Math.round(255 * ratio);
+              const g = Math.round(255 * (1 - ratio));
+              return `rgba(${r},${g},150,0.8)`;
+            },
+            width: (context) => {
+              const chart = context.chart;
+              const area = chart.chartArea || {};
+              const nBins = chart._nBins || 1;
+              const w = (area.right - area.left) / nBins;
+              return isFinite(w) && w > 0 ? w : 10;
+            },
+            height: (context) => {
+              const chart = context.chart;
+              const area = chart.chartArea || {};
+              const cats = chart._categories || ['pair'];
+              const nCats = cats.length || 1;
+              const h = (area.bottom - area.top) / nCats;
+              return isFinite(h) && h > 0 ? h : 10;
+            }
+          }]
+        },
+        options: {
+          responsive: true,
+          animation: false,
+          scales: {
+            x: {
+              type: 'time',
+              time: { unit: 'second' },
+              position: 'bottom',
+              ticks: { color: '#aaa' },
+              grid: { color: 'rgba(255,255,255,0.05)' }
+            },
+            y: {
+              type: 'linear',
+              ticks: {
+                color: '#aaa',
+                callback: (v) => {
+                  const chart = this.chart || context?.chart; // fallback
+                  const cats = chart?._categories || [];
+                  const idx = Math.round(v);
+                  return cats[idx] || '';
+                }
+              },
+              grid: { color: 'rgba(255,255,255,0.05)' }
+            }
+          },
+          plugins: {
+            legend: { labels: { color: '#eee' } },
+            tooltip: {
+              callbacks: {
+                label: (ctx) => {
+                  const chart = ctx.chart;
+                  const cats = chart._categories || [];
+                  const idx = Math.round(ctx.raw.y);
+                  const pairId = cats[idx] || '?';
+                  const v = ctx.raw.v || 0;
+                  const t = new Date(ctx.raw.x);
+                  return `${pairId} @ ${t.toLocaleTimeString()} : ${v.toFixed(2)} ms`;
+                }
+              }
+            }
+          }
+        }
+      });
+    }
+
     function initCharts() {
       pairChart        = makeLineChart(document.getElementById('pairChart').getContext('2d'), 'ms');
       offsetDeltaChart = makeLineChart(document.getElementById('offsetDeltaChart').getContext('2d'), 'ms');
       jitterBarChart   = makeBarChart(document.getElementById('jitterBarChart').getContext('2d'), 'ms');
+      heatmapChart     = makeHeatmapChart(document.getElementById('heatmapChart').getContext('2d'));
     }
 
     function updatePairChart(chart, pairs) {
@@ -533,6 +671,39 @@ TEMPLATE = r"""
       const pairIds = Object.keys(jitter_std_pairs).sort();
       chart.data.labels = pairIds;
       chart.data.datasets[0].data = pairIds.map(id => jitter_std_pairs[id]);
+      chart.update();
+    }
+
+    function updateHeatmapChart(chart, heatmap) {
+      const data = (heatmap && heatmap.data) || [];
+      if (!data.length) {
+        chart.data.datasets[0].data = [];
+        chart._categories = [];
+        chart._nBins = 1;
+        chart._maxV = 1;
+        chart.update();
+        return;
+      }
+
+      const categories = Array.from(new Set(data.map(d => d.pair))).sort();
+      const catIndex = new Map(categories.map((c, i) => [c, i]));
+
+      const nBins = heatmap.n_bins || 1;
+      let maxV = 0;
+      const matrixData = data.map(d => {
+        const v = Math.abs(d.value);
+        if (v > maxV) maxV = v;
+        return {
+          x: new Date(d.t_bin * 1000),
+          y: catIndex.get(d.pair) ?? 0,
+          v: v
+        };
+      });
+
+      chart.data.datasets[0].data = matrixData;
+      chart._categories = categories;
+      chart._nBins = nBins;
+      chart._maxV = maxV || 1;
       chart.update();
     }
 
@@ -624,13 +795,15 @@ TEMPLATE = r"""
     async function refresh() {
       try {
         const [ntpData, topo] = await Promise.all([fetchNtpData(), fetchTopology()]);
-        const series          = ntpData.series || {};
-        const pairs           = ntpData.pairs || {};
-        const jitter_std_pairs= ntpData.jitter_std_pairs || {};
+        const series           = ntpData.series || {};
+        const pairs            = ntpData.pairs || {};
+        const jitter_std_pairs = ntpData.jitter_std_pairs || {};
+        const heatmap          = ntpData.heatmap || {data: [], n_bins: 0};
 
         updatePairChart(pairChart, pairs);
         updateOffsetDeltaChart(offsetDeltaChart, series);
         updateJitterBarChart(jitterBarChart, jitter_std_pairs);
+        updateHeatmapChart(heatmapChart, heatmap);
 
         const activeNodes  = new Set(Object.keys(series || {}));
         const meshCanvas   = document.getElementById('meshCanvas');

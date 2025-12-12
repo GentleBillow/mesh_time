@@ -227,6 +227,14 @@ class MeshNode:
             sink_ip = self.global_cfg[sink_id]["ip"]
 
         while not self._stop.is_set():
+
+            # --- Warmup-Gating: erst loggen/senden wenn Sync stabil genug ist ---
+            if not self.sync.is_warmed_up():
+                # optional: nur selten loggen, sonst spammt es
+                # print(f"[{self.id}] ntp_monitor_loop: warmup, skipping telemetry")
+                await asyncio.sleep(interval)
+                continue
+
             t_wall = time.time()
             t_mono = time.monotonic()
             t_mesh = self.sync.mesh_time()

@@ -555,3 +555,24 @@ class SyncModule:
                 delta=delta,
                 did_bootstrap=did_bootstrap,
             )
+
+    def is_warmed_up(self, min_samples: Optional[int] = None) -> bool:
+        # Root ist per Definition stabil
+        if self._is_root:
+            return True
+
+        # Erst nach Bootstrap macht Telemetrie Sinn
+        if not self._bootstrapped:
+            return False
+
+        ms = int(min_samples or self._min_samples_for_jitter)
+
+        # Wenn keine Neighbors, dann kann man nicht “warm” werden
+        if not self.neighbors:
+            return False
+
+        # Warm, wenn wir pro Neighbor genug RTT-Samples haben
+        for p in self.neighbors:
+            if len(self._peer_rtt_samples.get(p, [])) < ms:
+                return False
+        return True

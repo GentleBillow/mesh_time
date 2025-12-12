@@ -18,7 +18,6 @@ from mesh.storage import Storage
 
 app = Flask(__name__)
 
-Storage(str(DB_PATH))   # legt Schema an, falls DB neu/leer
 
 # ------------------------------------------------------------
 # Hilfsfunktionen Backend
@@ -851,7 +850,10 @@ TEMPLATE = r"""
 </html>
 """
 
+def ensure_db():
+    Storage(str(DB_PATH))   # legt Schema an, falls DB neu/leer
 
 if __name__ == "__main__":
+    ensure_db()
     print("Starting MeshTime Web-UI on http://0.0.0.0:5000/")
     app.run(host="0.0.0.0", port=5000, debug=False)

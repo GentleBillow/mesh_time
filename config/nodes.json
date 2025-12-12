@@ -1,7 +1,7 @@
 {
   "sync": {
-      "eta": 0.005,
-    "max_slew_per_second_ms": 5,
+      "eta": 0.001,
+    "max_slew_per_second_ms": 1,
     "aggregate_updates": true,
 
 

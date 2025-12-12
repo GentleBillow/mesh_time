@@ -1,5 +1,6 @@
+# -*- coding: utf-8 -*-
 # web_ui.py
-# MeshTime Web-UI mit relativen Plots (paarweise ΔMesh-Time) + Topologie + Heatmap
+# MeshTime Web-UI: Pairwise ΔMesh-Time (via offsets), robust jitter (IQR/MAD), topology, heatmap
 
 import json
 import math
@@ -14,17 +15,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent   # /home/pi/mesh_time
 DB_PATH  = BASE_DIR / "mesh_data.sqlite"
 CFG_PATH = BASE_DIR / "config" / "nodes.json"
 
-from mesh.storage import Storage
+from mesh.storage import Storage  # ensures schema
 
 app = Flask(__name__)
 
 
 # ------------------------------------------------------------
-# Hilfsfunktionen Backend
+# DB / Config helpers
 # ------------------------------------------------------------
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -38,7 +39,7 @@ def load_config():
 
 def get_topology():
     """
-    Liest config/nodes.json und baut eine einfache Mesh-Topologie:
+    Reads config/nodes.json and returns a simple mesh topology:
       - nodes: [{id, ip, color, is_root}]
       - links: [{source, target}]
     """
@@ -55,14 +56,7 @@ def get_topology():
         sync_cfg = entry.get("sync", {}) or {}
         is_root = bool(sync_cfg.get("is_root", False))
 
-        nodes.append(
-            {
-                "id": node_id,
-                "ip": ip,
-                "color": color,
-                "is_root": is_root,
-            }
-        )
+        nodes.append({"id": node_id, "ip": ip, "color": color, "is_root": is_root})
 
         for neigh in entry.get("neighbors", []):
             if node_id < neigh:
@@ -71,16 +65,71 @@ def get_topology():
     return {"nodes": nodes, "links": links}
 
 
+# ------------------------------------------------------------
+# Robust stats
+# ------------------------------------------------------------
+
+def _quantile_sorted(xs, p):
+    n = len(xs)
+    if n == 0:
+        return None
+    pos = p * (n - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return xs[lo]
+    frac = pos - lo
+    return xs[lo] * (1.0 - frac) + xs[hi] * frac
+
+
+def robust_sigma_iqr(values):
+    """
+    Robust sigma estimate via IQR:
+        sigma ~= 0.7413 * IQR
+    Works well for jitter-like distributions (robust to outliers + drift).
+    """
+    if values is None:
+        return None
+    xs = sorted([float(v) for v in values if v is not None and math.isfinite(float(v))])
+    if len(xs) < 8:
+        return None
+    q25 = _quantile_sorted(xs, 0.25)
+    q75 = _quantile_sorted(xs, 0.75)
+    if q25 is None or q75 is None:
+        return None
+    iqr = q75 - q25
+    return 0.7413 * iqr
+
+
+def robust_sigma_mad(values):
+    """
+    Robust sigma estimate via MAD:
+        sigma ~= 1.4826 * MAD
+    """
+    if values is None:
+        return None
+    xs = sorted([float(v) for v in values if v is not None and math.isfinite(float(v))])
+    if len(xs) < 8:
+        return None
+    med = _quantile_sorted(xs, 0.50)
+    if med is None:
+        return None
+    abs_dev = sorted([abs(x - med) for x in xs])
+    mad = _quantile_sorted(abs_dev, 0.50)
+    return 1.4826 * mad if mad is not None else None
+
+
+# ------------------------------------------------------------
+# Data aggregation for charts
+# ------------------------------------------------------------
+
 def get_ntp_timeseries(window_seconds=600, max_points=2000):
     """
-    Holt die letzten ntp_reference-Samples und baut:
-      - series_per_node: pro Node Zeitreihe mit
-            t_wall, offset_ms, delta_offset_ms
-      - pairs: paarweise ΔMesh-Time (Node i vs. j) als Zeitreihe
-            t_wall, delta_ms
-      - jitter_std_pairs: StdDev(ΔMesh-Time) pro Paar (für Jitter-Barplot)
-      - heatmap: binned ΔMesh-Time pro Paar/Zeitslot
-            { "data": [{pair, t_bin, value}], "n_bins": int }
+    Pull ntp_reference rows and build:
+      - series: per node [{t_wall, offset_ms, delta_offset_ms}]
+      - pairs:  pairwise ΔMesh-Time (via offsets) [{t_wall, delta_ms}]
+      - jitter_sigma_pairs: robust jitter per pair (IQR-based sigma)
+      - heatmap: binned avg |Δ| per pair/timebin
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -89,13 +138,13 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
 
     rows = cur.execute(
         """
-        SELECT node_id, t_wall, offset, err_mesh_vs_wall, created_at
+        SELECT node_id, t_wall, offset, created_at
         FROM ntp_reference
         WHERE created_at >= ?
         ORDER BY created_at ASC
         LIMIT ?
         """,
-        (cutoff, max_points),
+        (cutoff, int(max_points)),
     ).fetchall()
     conn.close()
 
@@ -103,43 +152,35 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
         return {
             "series": {},
             "pairs": {},
-            "jitter_std_pairs": {},
+            "jitter_sigma_pairs": {},
+            "jitter_mad_pairs": {},
             "heatmap": {"data": [], "n_bins": 0},
         }
 
-    # nach Node gruppieren
+    # group by node
     per_node = {}
     for r in rows:
         per_node.setdefault(r["node_id"], []).append(r)
 
-    # Node-Zeitreihen mit Offset + Delta-Offset
+    # per-node series: offset + delta_offset
     series = {}
     for node_id, node_rows in per_node.items():
-        node_rows_sorted = sorted(node_rows, key=lambda r: r["t_wall"])
-        node_series = []
+        node_rows_sorted = sorted(node_rows, key=lambda r: float(r["t_wall"]))
+        out = []
         prev_offset_ms = None
         for r in node_rows_sorted:
             t_wall = float(r["t_wall"])
             offset_ms = float(r["offset"]) * 1000.0
-            if prev_offset_ms is None:
-                delta_offset_ms = 0.0
-            else:
-                delta_offset_ms = offset_ms - prev_offset_ms
+            delta_offset_ms = 0.0 if prev_offset_ms is None else (offset_ms - prev_offset_ms)
             prev_offset_ms = offset_ms
+            out.append({"t_wall": t_wall, "offset_ms": offset_ms, "delta_offset_ms": delta_offset_ms})
+        series[node_id] = out
 
-            node_series.append(
-                {
-                    "t_wall": t_wall,
-                    "offset_ms": offset_ms,
-                    "delta_offset_ms": delta_offset_ms,
-                }
-            )
-        series[node_id] = node_series
-
-    # Paarweise ΔMesh-Time (err_i - err_j)
-    all_rows_sorted = sorted(rows, key=lambda r: r["t_wall"])
-    last_err_ms = {}    # node_id -> letzter Fehler in ms
-    pair_series = {}    # "A-B" -> [{"t_wall":..,"delta_ms":..}, ...]
+    # pairwise ΔMesh-Time:
+    # Mesh time = t_wall + offset, so for same t_wall: ΔMesh = offset_a - offset_b
+    all_rows_sorted = sorted(rows, key=lambda r: float(r["t_wall"]))
+    last_offset_ms = {}  # node_id -> last offset_ms
+    pair_series = {}     # "A-B" -> [{t_wall, delta_ms}, ...]
 
     def norm_pair(a, b):
         return "-".join(sorted([a, b]))
@@ -147,10 +188,10 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
     for r in all_rows_sorted:
         node = r["node_id"]
         t_wall = float(r["t_wall"])
-        err_ms = float(r["err_mesh_vs_wall"]) * 1000.0
-        last_err_ms[node] = err_ms
+        off_ms = float(r["offset"]) * 1000.0
+        last_offset_ms[node] = off_ms
 
-        nodes_now = sorted(last_err_ms.keys())
+        nodes_now = sorted(last_offset_ms.keys())
         if len(nodes_now) < 2:
             continue
 
@@ -159,43 +200,37 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
                 a = nodes_now[i]
                 b = nodes_now[j]
                 pair_id = norm_pair(a, b)
-                delta_ms = last_err_ms[a] - last_err_ms[b]
-                pair_series.setdefault(pair_id, []).append(
-                    {
-                        "t_wall": t_wall,
-                        "delta_ms": delta_ms,
-                    }
-                )
+                delta_ms = last_offset_ms[a] - last_offset_ms[b]
+                pair_series.setdefault(pair_id, []).append({"t_wall": t_wall, "delta_ms": delta_ms})
 
-    # Jitter als StdDev der ΔMesh-Time pro Paar
-    jitter_std_pairs = {}
+    # robust jitter per pair (sigma via IQR and via MAD)
+    jitter_sigma_pairs = {}
+    jitter_mad_pairs = {}
     for pair_id, pts in pair_series.items():
-        if len(pts) < 2:
-            continue
         deltas = [p["delta_ms"] for p in pts]
-        mean = sum(deltas) / len(deltas)
-        var = sum((d - mean) ** 2 for d in deltas) / (len(deltas) - 1)
-        jitter_std_pairs[pair_id] = math.sqrt(var)
+        s_iqr = robust_sigma_iqr(deltas)
+        s_mad = robust_sigma_mad(deltas)
+        if s_iqr is not None:
+            jitter_sigma_pairs[pair_id] = s_iqr
+        if s_mad is not None:
+            jitter_mad_pairs[pair_id] = s_mad
 
-    # Heatmap: ΔMesh-Time gebinnt nach Zeit und Paar
+    # heatmap: bin by time and pair using avg |Δ|
     heatmap_data = []
     n_bins = 0
     if pair_series:
-        # alle Zeitstempel über alle Paare
         all_t = [float(p["t_wall"]) for pts in pair_series.values() for p in pts]
         t_min = min(all_t)
         t_max = max(all_t)
 
-        if t_max == t_min:
+        if t_max <= t_min:
             n_bins = 1
             bin_width = 1.0
         else:
-            # grob: max 40 Bins, mind. 1
             n_bins = max(1, min(40, int(len(all_t) / 5) or 1))
             bin_width = (t_max - t_min) / n_bins
 
-        accum = {}  # (pair_id, bin_idx) -> [sum_delta, count]
-
+        accum = {}  # (pair_id, bin_idx) -> [sum_abs_delta, count]
         for pair_id, pts in pair_series.items():
             for p in pts:
                 t = float(p["t_wall"])
@@ -207,7 +242,7 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
                     if idx >= n_bins:
                         idx = n_bins - 1
                 key = (pair_id, idx)
-                v = float(p["delta_ms"])
+                v = abs(float(p["delta_ms"]))
                 if key not in accum:
                     accum[key] = [v, 1]
                 else:
@@ -216,32 +251,26 @@ def get_ntp_timeseries(window_seconds=600, max_points=2000):
 
         for (pair_id, idx), (sum_v, cnt) in accum.items():
             t_center = t_min + (idx + 0.5) * (bin_width if n_bins > 1 else 1.0)
-            avg = sum_v / cnt
-            heatmap_data.append(
-                {
-                    "pair": pair_id,
-                    "t_bin": t_center,
-                    "value": avg,
-                }
-            )
+            avg = sum_v / max(1, cnt)
+            heatmap_data.append({"pair": pair_id, "t_bin": t_center, "value": avg})
 
     return {
         "series": series,
         "pairs": pair_series,
-        "jitter_std_pairs": jitter_std_pairs,
+        "jitter_sigma_pairs": jitter_sigma_pairs,  # robust (IQR)
+        "jitter_mad_pairs": jitter_mad_pairs,      # optional (MAD)
         "heatmap": {"data": heatmap_data, "n_bins": n_bins},
     }
 
 
-# ------------------------------------------------------------
-# Flask Routen
-# ------------------------------------------------------------
-
-@app.route("/")
-def index():
+def get_last_by_node():
+    """
+    Latest row per node for the status table.
+    We only need t_wall and offset to compute mesh_time.
+    """
     conn = get_conn()
     cur = conn.cursor()
-    last_by_node = cur.execute(
+    rows = cur.execute(
         """
         SELECT r.*
         FROM ntp_reference r
@@ -254,7 +283,16 @@ def index():
         """
     ).fetchall()
     conn.close()
+    return rows
 
+
+# ------------------------------------------------------------
+# Flask routes
+# ------------------------------------------------------------
+
+@app.route("/")
+def index():
+    last_by_node = get_last_by_node()
     topo = get_topology()
     return render_template_string(
         TEMPLATE,
@@ -271,8 +309,7 @@ def api_topology():
 
 @app.route("/api/ntp_timeseries")
 def api_ntp_timeseries():
-    data = get_ntp_timeseries(window_seconds=600, max_points=2000)
-    return jsonify(data)
+    return jsonify(get_ntp_timeseries(window_seconds=600, max_points=2000))
 
 
 @app.template_filter("datetime_utc")
@@ -284,7 +321,7 @@ def datetime_utc(ts):
 
 
 # ------------------------------------------------------------
-# HTML + JS Template
+# HTML + JS template
 # ------------------------------------------------------------
 
 TEMPLATE = r"""
@@ -326,6 +363,7 @@ TEMPLATE = r"""
     th, td {
       padding: 0.35rem 0.5rem;
       text-align: left;
+      vertical-align: top;
     }
     th {
       border-bottom: 1px solid rgba(255,255,255,0.15);
@@ -363,20 +401,20 @@ TEMPLATE = r"""
       font-size: 0.8rem;
       opacity: 0.6;
     }
+    code { color: rgba(255,255,255,0.85); }
   </style>
-  <!-- Chart.js + Date-Adapter + Matrix-Plugin für Heatmap -->
+
+  <!-- Chart.js + Date adapter + matrix plugin -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@1.3.0/dist/chartjs-chart-matrix.min.js"></script>
 </head>
+
 <body>
   <h1>MeshTime Monitor</h1>
-  <p class="small">
-    Datenquelle: <code>{{ db_path }}</code> (ntp_reference, relativ ausgewertet)
-  </p>
+  <p class="small">Datenquelle: <code>{{ db_path }}</code></p>
 
   <div class="grid">
-    <!-- linke Seite -->
     <div>
       <div class="card">
         <h2>Aktueller Status pro Node</h2>
@@ -385,28 +423,30 @@ TEMPLATE = r"""
           <thead>
             <tr>
               <th>Node</th>
+              <th>Mesh-Time (UTC)</th>
               <th>Offset</th>
-              <th>Mesh − Wallclock</th>
               <th>Wallclock (UTC)</th>
             </tr>
           </thead>
           <tbody>
             {% for row in last_by_node %}
-            {% set err_ms = row["err_mesh_vs_wall"] * 1000.0 %}
-            {% set offset_ms = row["offset"] * 1000.0 %}
-            {% if err_ms|abs < 5 %}
-              {% set cls = "pill-ok" %}
-            {% elif err_ms|abs < 20 %}
-              {% set cls = "pill-warn" %}
-            {% else %}
-              {% set cls = "pill-bad" %}
-            {% endif %}
-            <tr>
-              <td>{{ row["node_id"] }}</td>
-              <td><span class="pill {{ cls }}">{{ "%.2f" % offset_ms }} ms</span></td>
-              <td>{{ "%.2f" % err_ms }} ms</td>
-              <td class="small">{{ row["t_wall"] | float | int | datetime_utc }}</td>
-            </tr>
+              {% set t_wall = row["t_wall"] | float %}
+              {% set offset_s = row["offset"] | float %}
+              {% set mesh_ts = t_wall + offset_s %}
+              {% set offset_ms = offset_s * 1000.0 %}
+              {% if offset_ms|abs < 5 %}
+                {% set cls = "pill-ok" %}
+              {% elif offset_ms|abs < 20 %}
+                {% set cls = "pill-warn" %}
+              {% else %}
+                {% set cls = "pill-bad" %}
+              {% endif %}
+              <tr>
+                <td>{{ row["node_id"] }}</td>
+                <td>{{ mesh_ts | datetime_utc }}<div class="small">{{ "%.3f"|format(mesh_ts) }}</div></td>
+                <td><span class="pill {{ cls }}">{{ "%.2f"|format(offset_ms) }} ms</span></td>
+                <td class="small">{{ t_wall | int | datetime_utc }}</td>
+              </tr>
             {% endfor %}
           </tbody>
         </table>
@@ -419,19 +459,16 @@ TEMPLATE = r"""
         <h2>Mesh-Topologie</h2>
         <canvas id="meshCanvas"></canvas>
         <p class="small">
-          Knoten und Links basierend auf <code>config/nodes.json</code>.
-          Grün = Node hat Daten, grau = bisher keine.
-          Dicker Rand = <strong>Root</strong> (falls vorhanden).
+          Grün = Node hat Daten, grau = bisher keine. Dicker Rand = <strong>Root</strong> (falls vorhanden).
         </p>
       </div>
     </div>
 
-    <!-- rechte Seite -->
     <div class="card">
       <h2>Mesh-Time Plots (letzte 10 Minuten)</h2>
       <div class="plots-grid">
         <div>
-          <h3 style="font-size:0.95rem;">1) Paarweise ΔMesh-Time</h3>
+          <h3 style="font-size:0.95rem;">1) Paarweise ΔMesh-Time (aus Offsets)</h3>
           <canvas id="pairChart" height="160"></canvas>
         </div>
         <div>
@@ -439,7 +476,7 @@ TEMPLATE = r"""
           <canvas id="offsetDeltaChart" height="160"></canvas>
         </div>
         <div>
-          <h3 style="font-size:0.95rem;">3) Jitter der ΔMesh-Time (StdDev pro Paar)</h3>
+          <h3 style="font-size:0.95rem;">3) Jitter der ΔMesh-Time (robust: σ̂ ≈ 0.741·IQR)</h3>
           <canvas id="jitterBarChart" height="160"></canvas>
         </div>
         <div>
@@ -451,7 +488,7 @@ TEMPLATE = r"""
   </div>
 
   <div class="footer">
-    MeshTime Web-UI – Wenn alle ΔMesh-Linien flach &lt;5 ms liegen und die Heatmap blassgrün bleibt,
+    Faustregel: wenn alle ΔMesh-Linien flach bleiben und der Jitter klein ist,
     hast du einen kleinen Zeit-Konsens-Computer gebaut.
   </div>
 
@@ -510,7 +547,7 @@ TEMPLATE = r"""
         data: {
           labels: [],
           datasets: [{
-            label: 'Jitter (StdDev ΔMesh)',
+            label: 'Jitter (robust σ̂ ≈ 0.741·IQR)',
             data: [],
             backgroundColor: 'rgba(52,152,219,0.7)'
           }]
@@ -519,21 +556,13 @@ TEMPLATE = r"""
           responsive: true,
           animation: false,
           scales: {
-            x: {
-              ticks: { color: '#aaa' },
-              grid: { display: false }
-            },
+            x: { ticks: { color: '#aaa' }, grid: { display: false } },
             y: {
-              ticks: {
-                color: '#aaa',
-                callback: (v) => v + ' ' + yLabel
-              },
+              ticks: { color: '#aaa', callback: (v) => v + ' ' + yLabel },
               grid: { color: 'rgba(255,255,255,0.05)' }
             }
           },
-          plugins: {
-            legend: { labels: { color: '#eee' } }
-          }
+          plugins: { legend: { labels: { color: '#eee' } } }
         }
       });
     }
@@ -549,16 +578,10 @@ TEMPLATE = r"""
             backgroundColor: (context) => {
               const chart = context.chart;
               const raw = context.raw;
-    
-              // Safeguard: wenn kein raw oder kein v vorhanden → transparent zeichnen
-              if (!raw || typeof raw.v !== 'number') {
-                return 'rgba(0,0,0,0)';
-              }
-    
-              const value = Math.abs(raw.v);
+              if (!raw || typeof raw.v !== 'number') return 'rgba(0,0,0,0)';
+              const value = raw.v;
               const maxV = chart._maxV || 1;
               const ratio = Math.min(1, value / maxV);
-    
               const r = Math.round(255 * ratio);
               const g = Math.round(255 * (1 - ratio));
               return `rgba(${r},${g},150,0.8)`;
@@ -595,7 +618,6 @@ TEMPLATE = r"""
               type: 'linear',
               ticks: {
                 color: '#aaa',
-                // KEIN Arrow-Function: hier brauchen wir `this` als Scale
                 callback: function (value) {
                   const chart = this.chart;
                   const cats = chart._categories || [];
@@ -615,7 +637,7 @@ TEMPLATE = r"""
                   const cats = chart._categories || [];
                   const idx = Math.round(ctx.raw.y);
                   const pairId = cats[idx] || '?';
-                  const v = ctx.raw && typeof ctx.raw.v === 'number' ? ctx.raw.v : 0;
+                  const v = (ctx.raw && typeof ctx.raw.v === 'number') ? ctx.raw.v : 0;
                   const t = new Date(ctx.raw.x);
                   return `${pairId} @ ${t.toLocaleTimeString()} : ${v.toFixed(2)} ms`;
                 }
@@ -639,10 +661,7 @@ TEMPLATE = r"""
       pairIds.forEach((pairId, idx) => {
         const baseColor   = colors[idx % colors.length];
         const strokeColor = baseColor.replace('0.5', '0.9');
-        const points = pairs[pairId].map(p => ({
-          x: new Date(p.t_wall * 1000),
-          y: p.delta_ms
-        }));
+        const points = pairs[pairId].map(p => ({ x: new Date(p.t_wall * 1000), y: p.delta_ms }));
         chart.data.datasets.push({
           label: pairId,
           data: points,
@@ -662,10 +681,7 @@ TEMPLATE = r"""
       nodeIds.forEach((nodeId, idx) => {
         const baseColor   = colors[idx % colors.length];
         const strokeColor = baseColor.replace('0.5', '0.9');
-        const points = series[nodeId].map(p => ({
-          x: new Date(p.t_wall * 1000),
-          y: p.delta_offset_ms
-        }));
+        const points = series[nodeId].map(p => ({ x: new Date(p.t_wall * 1000), y: p.delta_offset_ms }));
         chart.data.datasets.push({
           label: `Node ${nodeId}`,
           data: points,
@@ -679,21 +695,17 @@ TEMPLATE = r"""
       chart.update();
     }
 
-    function updateJitterBarChart(chart, jitter_std_pairs) {
-      const allIds = Object.keys(jitter_std_pairs || {}).sort();
-      
+    function updateJitterBarChart(chart, jitterPairs) {
+      const ids = Object.keys(jitterPairs || {}).sort();
       const labels = [];
       const data = [];
-      
-    allIds.forEach(id => {
-      const v = jitter_std_pairs[id];
-      // nur saubere Zahlen übernehmen
-      if (v !== null && v !== undefined && Number.isFinite(v)) {
-        labels.push(id);
-        data.push(v);
-      }
-    });
-    
+      ids.forEach(id => {
+        const v = jitterPairs[id];
+        if (v !== null && v !== undefined && Number.isFinite(v)) {
+          labels.push(id);
+          data.push(v);
+        }
+      });
       chart.data.labels = labels;
       chart.data.datasets[0].data = data;
       chart.update();
@@ -715,14 +727,11 @@ TEMPLATE = r"""
 
       const nBins = heatmap.n_bins || 1;
       let maxV = 0;
+
       const matrixData = data.map(d => {
         const v = Math.abs(d.value);
         if (v > maxV) maxV = v;
-        return {
-          x: new Date(d.t_bin * 1000),
-          y: catIndex.get(d.pair) ?? 0,
-          v: v
-        };
+        return { x: new Date(d.t_bin * 1000), y: catIndex.get(d.pair) ?? 0, v: v };
       });
 
       chart.data.datasets[0].data = matrixData;
@@ -763,15 +772,12 @@ TEMPLATE = r"""
       const positions = {};
       topo.nodes.forEach((node, idx) => {
         const angle = (2 * Math.PI * idx) / n - Math.PI / 2;
-        const x = cx + radius * Math.cos(angle);
-        const y = cy + radius * Math.sin(angle);
-        positions[node.id] = { x, y };
+        positions[node.id] = { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) };
       });
 
-      // Links
       ctx.strokeStyle = 'rgba(255,255,255,0.25)';
       ctx.lineWidth = 1.0;
-      topo.links.forEach(link => {
+      (topo.links || []).forEach(link => {
         const a = positions[link.source];
         const b = positions[link.target];
         if (!a || !b) return;
@@ -781,8 +787,7 @@ TEMPLATE = r"""
         ctx.stroke();
       });
 
-      // Nodes
-      topo.nodes.forEach(node => {
+      (topo.nodes || []).forEach(node => {
         const pos = positions[node.id];
         if (!pos) return;
         const active = activeNodes.has(node.id);
@@ -805,35 +810,32 @@ TEMPLATE = r"""
         ctx.fillText(node.id, pos.x, pos.y);
       });
 
-      // Root-Hinweis
-      const roots = topo.nodes.filter(n => n.is_root);
+      const roots = (topo.nodes || []).filter(n => n.is_root);
       ctx.fillStyle = '#aaa';
       ctx.font = '11px system-ui';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'top';
-      const rootLabel = roots.length
-        ? 'Root: ' + roots.map(r => r.id).join(', ')
-        : 'Root: keiner (symmetrisches Mesh)';
+      const rootLabel = roots.length ? ('Root: ' + roots.map(r => r.id).join(', ')) : 'Root: keiner (symmetrisches Mesh)';
       ctx.fillText(rootLabel, 10, 10);
     }
 
     async function refresh() {
       try {
         const [ntpData, topo] = await Promise.all([fetchNtpData(), fetchTopology()]);
-        const series           = ntpData.series || {};
-        const pairs            = ntpData.pairs || {};
-        const jitter_std_pairs = ntpData.jitter_std_pairs || {};
-        const heatmap          = ntpData.heatmap || {data: [], n_bins: 0};
+        const series  = ntpData.series || {};
+        const pairs   = ntpData.pairs || {};
+        const jitter  = ntpData.jitter_sigma_pairs || {}; // robust IQR-sigma
+        const heatmap = ntpData.heatmap || {data: [], n_bins: 0};
 
         updatePairChart(pairChart, pairs);
         updateOffsetDeltaChart(offsetDeltaChart, series);
-        updateJitterBarChart(jitterBarChart, jitter_std_pairs);
+        updateJitterBarChart(jitterBarChart, jitter);
         updateHeatmapChart(heatmapChart, heatmap);
 
-        const activeNodes  = new Set(Object.keys(series || {}));
-        const meshCanvas   = document.getElementById('meshCanvas');
-        meshCanvas.width   = meshCanvas.clientWidth;
-        meshCanvas.height  = meshCanvas.clientHeight;
+        const activeNodes = new Set(Object.keys(series || {}));
+        const meshCanvas  = document.getElementById('meshCanvas');
+        meshCanvas.width  = meshCanvas.clientWidth;
+        meshCanvas.height = meshCanvas.clientHeight;
         drawMesh(meshCanvas, topo, activeNodes);
       } catch (e) {
         console.error('refresh failed', e);
@@ -850,9 +852,11 @@ TEMPLATE = r"""
 </html>
 """
 
+
 def ensure_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    Storage(str(DB_PATH))   # legt Schema an, falls DB neu/leer
+    Storage(str(DB_PATH))  # create schema if missing
+
 
 if __name__ == "__main__":
     ensure_db()

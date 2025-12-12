@@ -1,27 +1,26 @@
 {
   "sync": {
-    // Regelung
-    "eta": 0.01,                     // Lernrate (0.005–0.02 stabil)
-    "max_slew_per_second_ms": 15,    // WICHTIGSTER Stabilitäts-Parameter
-    "aggregate_updates": true,       // Mehrere Peers → 1 Update
+      "eta": 0.01,
+    "max_slew_per_second_ms": 15,
+    "aggregate_updates": true,
 
-    // Jitter / Gewichtung
-    "jitter_window": 30,             // RTT-Samples
+
+    "jitter_window": 30,
     "min_samples_for_jitter": 15,
 
-    // Warmup & Logging
-    "min_beacons_for_warmup": 15,    // is_warmed_up()
-    "min_samples_before_log": 15,    // DB/Web-UI gating
 
-    // Bootstrap
-    "initial_offset_ms": 200.0,      // Start-Spread
-    "bootstrap_theta_max_s": 0.0,    // 0 = kein Limit
-    "bootstrap_peers": [],           // z.B. ["C"]
+    "min_beacons_for_warmup": 15,
+    "min_samples_before_log": 15,
 
-    // Drift
-    "drift_damping": 0.0,            // ohne Kalman: 0 lassen
 
-    // Netzwerk
+    "initial_offset_ms": 200.0,
+    "bootstrap_theta_max_s": 0.0,
+    "bootstrap_peers": [],
+
+
+    "drift_damping": 0.0,
+
+
     "coap_timeout_s": 0.5,
     "beacon_period_s": 1.0,
     "beacon_slot_ms": 50.0,

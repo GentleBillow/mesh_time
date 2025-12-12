@@ -1,19 +1,19 @@
 {
   "sync": {
     "kp": 0.02,
-    "ki": 0.001,
+    "ki": 0.003,
     "i_max_ms": 200.0,
     "i_leak": 0.0,
 
     "max_slew_per_second_ms": 5,
 
-    "jitter_window": 30,
-    "min_samples_for_jitter": 15,
+    "jitter_window": 60,
+    "min_samples_for_jitter": 25,
 
-    "min_beacons_for_warmup": 15,
-    "min_samples_before_log": 15,
+    "min_beacons_for_warmup": 25,
+    "min_samples_before_log": 25,
 
-    "initial_offset_ms": 200.0,
+    "initial_offset_ms": 50.0,
     "bootstrap_theta_max_s": 0.0,
     "bootstrap_peers": [],
 
@@ -24,7 +24,7 @@
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8,
 
-    "max_weight": 1000000.0
+    "max_weight": 3e4
   },
 
   "A": {

@@ -1,11 +1,11 @@
 {
   "sync": {
     "kp": 0.05,
-    "ki": 0.001,
-    "i_max_ms": 500.0,
-    "i_leak": 0.1,
+    "ki": 0.006,
+    "i_max_ms": 250.0,
+    "i_leak": 0.03,
 
-    "max_slew_per_second_ms": 5,
+    "max_slew_per_second_ms": 10,
 
     "jitter_window": 60,
     "min_samples_for_jitter": 25,

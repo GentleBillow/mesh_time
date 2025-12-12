@@ -13,7 +13,8 @@
       "q_offset": 1e-10,
       "q_drift": 1e-13,
       "q_bias": 1e-15,
-      "r_base": 5e-6
+      "r_base": 5e-6,
+      "r_virtual": 1e-2
     },
 
     "max_slew_per_second_ms": 5.0,

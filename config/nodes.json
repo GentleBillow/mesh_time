@@ -1,13 +1,28 @@
 {
   "sync": {
-    "jitter_window": 30,
+    // Regelung
+    "eta": 0.01,                     // Lernrate (0.005–0.02 stabil)
+    "max_slew_per_second_ms": 15,    // WICHTIGSTER Stabilitäts-Parameter
+    "aggregate_updates": true,       // Mehrere Peers → 1 Update
+
+    // Jitter / Gewichtung
+    "jitter_window": 30,             // RTT-Samples
     "min_samples_for_jitter": 15,
-    "max_slew_per_second_ms": 15,
-    "initial_offset_ms": 0.0,
-    "eta": 0.001,
-    "bootstrap_theta_max_s": 0,
+
+    // Warmup & Logging
+    "min_beacons_for_warmup": 15,    // is_warmed_up()
+    "min_samples_before_log": 15,    // DB/Web-UI gating
+
+    // Bootstrap
+    "initial_offset_ms": 200.0,      // Start-Spread
+    "bootstrap_theta_max_s": 0.0,    // 0 = kein Limit
+    "bootstrap_peers": [],           // z.B. ["C"]
+
+    // Drift
+    "drift_damping": 0.0,            // ohne Kalman: 0 lassen
+
+    // Netzwerk
     "coap_timeout_s": 0.5,
-    "drift_damping": 0.0,
     "beacon_period_s": 1.0,
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8
@@ -19,31 +34,27 @@
     "telemetry_sink": "C",
     "neighbors": ["B", "D"],
     "sensor_type": "potentiometer",
-    "led_pin": 5,
-    "button_pin": null
+    "led_pin": 5
   },
+
   "B": {
-    "color": "red",
     "ip": "172.16.32.164",
     "parent": "C",
-    "neighbors": ["C","A"],
+    "neighbors": ["C", "A"],
     "sensor_type": "potentiometer",
-    "led_pin": 5,
-    "button_pin": null
+    "led_pin": 5
   },
+
   "C": {
-    "color": "purple",
     "ip": "172.16.32.136",
     "parent": null,
-    "neighbors": ["B","D"],
+    "neighbors": ["B", "D"],
     "sensor_type": "potentiometer",
     "led_pin": 5,
-    "button_pin": null,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
-    "sync": {
-      "is_root": false
-    }
+    "sync": { "is_root": false }
   },
+
   "D": {
     "ip": "172.16.32.172",
     "parent": "C",

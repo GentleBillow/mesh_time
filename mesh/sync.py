@@ -598,4 +598,8 @@ class SyncModule:
         Returns True once enough successful beacon exchanges
         have been observed to consider the sync state stable.
         """
+        if self._is_root:
+            return True
         return self._beacon_count >= self._min_beacons_for_warmup
+
+

@@ -48,7 +48,7 @@ class MeshNode:
                     self.led = DummyLED(pin=led_pin)
 
         # ------------------------------------------------------------------
-        # Optional lokale DB (z.B. nur auf Node C)
+        # Optional lokale DB (typisch nur auf Node C)
         # ------------------------------------------------------------------
         self.storage = None
         db_path = node_cfg.get("db_path")
@@ -81,9 +81,10 @@ class MeshNode:
             neighbors=neighbors,
             neighbor_ips=neighbor_ips,
             sync_cfg=sync_cfg,
+            storage=self.storage,  # <--- wichtig: Storage an SyncModule durchreichen
         )
 
-        # Routing parent für spätere Multi-Hop-Daten
+        # Routing parent für spätere Multi-Hop-Daten / Telemetrie
         self.parent = node_cfg.get("parent")
 
         # Optional disturbance button (z.B. auf Node D)
@@ -181,18 +182,19 @@ class MeshNode:
         """
         Periodisch Mesh-Zeit-Telemetrie loggen.
 
-        - Jeder Node misst lokal:
-            t_wall  = time.time()          (nur für Achse / Diagnose)
+        Wir benutzen time.time() hier nur als gemeinsame X-Achse
+        (kein echter NTP-Server nötig):
+
+            t_wall  = time.time()
             t_mono  = time.monotonic()
             t_mesh  = sync.mesh_time()
             offset  = sync.get_offset()
             err     = t_mesh - t_wall
 
-        - Wenn self.storage vorhanden (z.B. Node C):
-            -> direkt in lokale DB schreiben.
-
-        - Zusätzlich: per CoAP an Sammelknoten (typisch: parent = C)
-            POST /relay/ingest/ntp
+        - Wenn self.storage vorhanden (typisch Node C):
+              -> direkt in lokale DB schreiben.
+        - Zusätzlich: per CoAP an Sammelknoten (parent oder explizit 'C')
+              POST /relay/ingest/ntp
         """
         print(f"[{self.id}] ntp_monitor_loop started (interval={interval}s)")
 
@@ -201,7 +203,6 @@ class MeshNode:
         sink_ip = None
         if sink_id != self.id and sink_id in self.global_cfg and "ip" in self.global_cfg[sink_id]:
             sink_ip = self.global_cfg[sink_id]["ip"]
-
 
         while not self._stop.is_set():
             t_wall = time.time()
@@ -220,6 +221,8 @@ class MeshNode:
                         t_mesh=t_mesh,
                         offset=offset,
                         err_mesh_vs_wall=err,
+                        # alle Link-spezifischen Felder lässt Storage
+                        # einfach default-mäßig auf None
                     )
                 except Exception as e:
                     print(f"[{self.id}] ntp_monitor_loop: local DB insert failed: {e}")
@@ -249,12 +252,8 @@ class MeshNode:
                     print(f"[{self.id}] ntp_monitor_loop: CoAP to {sink_id} timed out")
                 except Exception as e:
                     print(f"[{self.id}] ntp_monitor_loop: CoAP to {sink_id} failed: {e}")
-            else:
-                # kein Sink bekannt → rein lokal
-                pass
 
             await asyncio.sleep(interval)
-
 
     async def run_async(self):
         """
@@ -263,11 +262,11 @@ class MeshNode:
         print("[{}] MeshNode starting with cfg: {}".format(self.id, self.cfg))
 
         tasks = [
-            self.coap_loop(),    # CoAP server
-            self.sync_loop(),    # Sync beacons
-            self.sensor_loop(),  # Sensor sampling
-            self.led_loop(),     # LED blinking
-            self.ntp_monitor_loop(),  # Telemetrie für alle Nodes
+            self.coap_loop(),        # CoAP server
+            self.sync_loop(),        # Sync beacons
+            self.sensor_loop(),      # Sensor sampling
+            self.led_loop(),         # LED blinking
+            self.ntp_monitor_loop(), # Telemetrie für Web-UI
         ]
 
         await asyncio.gather(*tasks)

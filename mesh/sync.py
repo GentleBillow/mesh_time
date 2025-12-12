@@ -25,15 +25,19 @@ class SyncModule:
     Jedes Node i hat einen Offset o_i (in Sekunden).
     Die NTP-4-Timestamp-Formel liefert eine Schätzung
 
-        θ ≈ o_peer - o_self
+        θ ≈ t_peer - t_self  ≈ o_peer - o_self
 
     Also: θ ist "peer minus self".
 
-    Unser Ziel:
-        o_self ≈ o_peer - θ
+    Wir halten o_self so, dass
+
+        o_self ≈ o_peer + θ
+
+    (d.h. self zieht sich zum Peer hin).
 
     Fehler (aus Sicht von self):
-        error = o_self - (o_peer - θ)
+
+        error = o_self - (o_peer + θ)
 
     Kosten:
         E = 0.5 * error^2
@@ -48,6 +52,7 @@ class SyncModule:
       - Slew-Limit (ms/s)
       - Optionaler Drift-Dämpfer
       - Bootstrap: einmaliger harter Sprung auf NTP-Schätzung
+      - Optionales Logging pro Sync in SQLite (über Storage)
     """
 
     def __init__(
@@ -56,11 +61,13 @@ class SyncModule:
         neighbors: List[str],
         neighbor_ips: Dict[str, str],
         sync_cfg: Optional[Dict[str, float]] = None,
+        storage=None,
     ) -> None:
 
         self.node_id = node_id
         self.neighbors = neighbors
         self.neighbor_ips = neighbor_ips
+        self._storage = storage
 
         if sync_cfg is None:
             sync_cfg = {}
@@ -240,22 +247,22 @@ class SyncModule:
             self._peer_sigma[peer] = max(sigma, 1e-6)
 
     # --------------------------------------------------------------
-    # Bootstrap (NTP-θ: o_peer - o_self)
+    # Bootstrap (NTP-θ)
     # --------------------------------------------------------------
 
     def _try_bootstrap(self, peer: str, peer_offset: float, theta: float) -> bool:
         """
         Einmaliger harter Bootstrap für dieses Node (self).
 
-        NTP-Schätzung:
-            θ ≈ o_peer - o_self
+        θ ≈ o_peer - o_self
 
-        Ziel:
-            o_self ≈ o_peer - θ
+        Wir wollen in den Konsens:
+
+            o_self ≈ o_peer + θ   (self zieht zu peer hin)
 
         Also setzen wir beim Bootstrap:
 
-            o_self <- o_peer - θ
+            o_self <- o_peer + θ
         """
         # Root lässt seinen Offset nie von Peers verändern
         if self._is_root:
@@ -270,7 +277,7 @@ class SyncModule:
                 return False
 
         old_offset = self._offset
-        new_offset = peer_offset + theta # Richtige Beziehung: o_self ≈ o_peer + theta  mit  theta ≈ t_peer - t_self
+        new_offset = peer_offset + theta
         self._offset = new_offset
         self._bootstrapped = True
 
@@ -289,27 +296,29 @@ class SyncModule:
     # Symmetrisches Update (Herzstück)
     # --------------------------------------------------------------
 
-    def _symmetrical_update(self, peer: str, peer_offset: float, theta: float) -> None:
+    def _symmetrical_update(self, peer: str, peer_offset: float, theta: float):
         """
         Symmetrisches pairwise Update aus Sicht dieses Nodes (self).
 
-        NTP liefert:
-            θ ≈ o_peer - o_self
+        θ ≈ o_peer - o_self
 
-        Wir wollen:
-            o_self ≈ o_peer - θ
+        Ziel:
+            o_self ≈ o_peer + θ
 
         Fehler:
-            error = o_self - (o_peer - θ)
+            error = o_self - (o_peer + θ)
 
         Gradient-Schritt:
             o_self <- o_self - η * w * error
 
         Alle Größen (Offsets, θ, error, delta) sind in Sekunden.
+
+        Gibt (error, raw_delta, delta) in Sekunden zurück.
         """
 
         if self._is_root:
-            return  # Root macht kein symmetrisches Update
+            # Root ändert seinen Offset nicht durch Peers
+            return 0.0, 0.0, 0.0
 
         # Fehler (Sekunden)
         target = peer_offset + theta
@@ -367,6 +376,56 @@ class SyncModule:
             )
         )
 
+        return error, raw_delta, delta
+
+    # --------------------------------------------------------------
+    # Logging-Helfer für Web-UI
+    # --------------------------------------------------------------
+
+    def _log_sync_sample(
+        self,
+        peer: str,
+        rtt: float,
+        theta: float,
+        error: Optional[float],
+        delta: Optional[float],
+        did_bootstrap: bool,
+    ) -> None:
+        """
+        Schreibt einen Sync-Sample in die ntp_reference-Tabelle, falls Storage vorhanden.
+
+        Alle Zeiten in Sekunden.
+        """
+        if self._storage is None:
+            return
+
+        t_wall = time.time()
+        t_mono = time.monotonic()
+        t_mesh = self.mesh_time()
+        offset = self._offset
+        err_mesh_vs_wall = t_mesh - t_wall
+        sigma = self._peer_sigma.get(peer)
+
+        try:
+            # Storage.insert_ntp_reference muss diese Signatur unterstützen.
+            self._storage.insert_ntp_reference(
+                node_id=self.node_id,
+                t_wall=t_wall,
+                t_mono=t_mono,
+                t_mesh=t_mesh,
+                offset=offset,
+                err_mesh_vs_wall=err_mesh_vs_wall,
+                peer_id=peer,
+                rtt=rtt,
+                theta=theta,
+                error=error,
+                delta=delta,
+                sigma=sigma,
+                is_bootstrap=1 if did_bootstrap else 0,
+            )
+        except Exception as e:
+            print(f"[{self.node_id}] _log_sync_sample failed: {e}")
+
     # --------------------------------------------------------------
     # Beacon-Versand
     # --------------------------------------------------------------
@@ -385,7 +444,7 @@ class SyncModule:
                 θ = ((t2 - t1) + (t3 - t4)) / 2  ≈ o_peer - o_self
                 rtt = (t4 - t1) - (t3 - t2)
 
-          - Jitter-Update, Bootstrap, symmetrisches Update.
+          - Jitter-Update, Bootstrap, symmetrisches Update, Logging.
         """
         if IS_WINDOWS:
             return
@@ -458,9 +517,16 @@ class SyncModule:
             # Bootstrap zuerst (einmaliger harter Sprung)
             did_bootstrap = self._try_bootstrap(peer, peer_offset, theta)
 
+            error = None
+            delta = None
+
             # Danach feines Nachregeln
             if not did_bootstrap:
-                self._symmetrical_update(peer, peer_offset, theta)
+                error, raw_delta, delta = self._symmetrical_update(
+                    peer, peer_offset, theta
+                )
+            else:
+                raw_delta = None
 
             # Kurzsummary
             if peer in self._peer_sigma:
@@ -477,4 +543,14 @@ class SyncModule:
                     rtt * 1000.0,
                     sigma_str,
                 )
+            )
+
+            # Sample in DB loggen (für Web-UI & Auswertung)
+            self._log_sync_sample(
+                peer=peer,
+                rtt=rtt,
+                theta=theta,
+                error=error,
+                delta=delta,
+                did_bootstrap=did_bootstrap,
             )

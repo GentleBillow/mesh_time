@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
+import asyncio
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
 import argparse
 import json
 from pathlib import Path
 
 from mesh.node import MeshNode
+
+
+
 
 
 def load_config(node_id):

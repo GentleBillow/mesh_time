@@ -96,6 +96,11 @@ class SyncModule:
         self.neighbor_ips = dict(neighbor_ips)
         self._storage = storage
 
+        self._beacon_count = 0
+        self._min_beacons_for_warmup = int(
+            sync_cfg.get("min_beacons_for_warmup", 15)
+        )
+
         sync_cfg = sync_cfg or {}
 
         # Root: server-only (no outbound beacons), keeps offset fixed at 0
@@ -499,6 +504,10 @@ class SyncModule:
             rtt = (t4 - t1) - (t3 - t2)
             theta = ((t2 - t1) + (t3 - t4)) / 2.0  # ≈ (peer_clock - self_clock)
 
+            self._beacon_count += 1
+            if self._beacon_count == self._min_beacons_for_warmup:
+                print(f"[{self.node_id}] sync warmup complete")
+
             # Update per-peer stats
             st = self._peer.setdefault(peer_id, PeerStats())
             st.good_samples += 1
@@ -583,3 +592,10 @@ class SyncModule:
             f"[{self.node_id}] aggregate-update: "
             f"delta={delta*1000.0:.3f} ms, offset={self._offset*1000.0:.3f} ms (dt={dt:.3f}s)"
         )
+
+    def is_warmed_up(self) -> bool:
+        """
+        Returns True once enough successful beacon exchanges
+        have been observed to consider the sync state stable.
+        """
+        return self._beacon_count >= self._min_beacons_for_warmup

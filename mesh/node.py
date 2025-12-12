@@ -293,18 +293,18 @@ class MeshNode:
         """
         print("[{}] MeshNode starting with cfg: {}".format(self.id, self.cfg))
 
-        # 1) CoAP-Server EXKLUSIV starten und stabilisieren lassen
-        await self.coap_loop()
-
-        # 2) Erst danach alle anderen Tasks parallel starten
         tasks = [
-            self.sync_loop(),
-            self.sensor_loop(),
-            self.led_loop(),
-            self.ntp_monitor_loop(),
+            asyncio.create_task(self.coap_loop()),
+            asyncio.create_task(self.sync_loop()),
+            asyncio.create_task(self.sensor_loop()),
+            asyncio.create_task(self.led_loop()),
+            asyncio.create_task(self.ntp_monitor_loop()),
         ]
 
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
 
     def run(self):
         try:

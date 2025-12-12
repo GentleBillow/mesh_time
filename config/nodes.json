@@ -1,7 +1,7 @@
 {
   "sync": {
-      "eta": 0.0001,
-    "max_slew_per_second_ms": 10,
+      "eta": 0.00001,
+    "max_slew_per_second_ms": 5,
     "aggregate_updates": true,
 
 
@@ -51,7 +51,7 @@
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
-    "sync": { "is_root": true }
+    "sync": { "is_root": false }
   },
 
   "D": {

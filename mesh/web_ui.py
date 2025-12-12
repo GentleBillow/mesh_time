@@ -851,6 +851,7 @@ TEMPLATE = r"""
 """
 
 def ensure_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     Storage(str(DB_PATH))   # legt Schema an, falls DB neu/leer
 
 if __name__ == "__main__":

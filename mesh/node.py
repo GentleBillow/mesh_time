@@ -189,12 +189,10 @@ class MeshNode:
         site = build_site(self)
 
         try:
-            self._coap_ctx = await aiocoap.Context.create_server_context(
-                site,
-                bind=("0.0.0.0", 5683),
-            )
-            print("[{}] CoAP server started on udp/5683".format(self.id))
-            await asyncio.Future()  # run forever
+            self._coap_ctx = await aiocoap.Context.create_server_context(site)
+            print(f"[{self.id}] CoAP server started (aiocoap default bind)")
+            await asyncio.Future()
+
         except Exception as e:
             print("[{}] Failed to start CoAP server: {}".format(self.id, e))
             while True:

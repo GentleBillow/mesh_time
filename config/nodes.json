@@ -11,7 +11,7 @@
   },
 
   "A": {
-    "ip": "192.168.xx.xx",
+    "ip": "172.16.32.171",
     "parent": "B",
     "neighbors": ["B", "D"],
     "sensor_type": "potentiometer",
@@ -20,7 +20,7 @@
   },
   "B": {
     "color": "red",
-    "ip": "192.168.178.48",
+    "ip": "172.16.32.164",
     "parent": "C",
     "neighbors": ["C"],
     "sensor_type": "potentiometer",
@@ -29,9 +29,9 @@
   },
   "C": {
     "color": "purple",
-    "ip": "192.168.178.49",
+    "ip": "172.16.32.136",
     "parent": null,
-    "neighbors": ["B"],
+    "neighbors": ["B","D"],
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "button_pin": null,
@@ -41,7 +41,7 @@
     }
   },
   "D": {
-    "ip": "192.168.xx.xx",
+    "ip": "172.16.32.172",
     "parent": "C",
     "neighbors": ["A", "C"],
     "sensor_type": "potentiometer",

@@ -433,26 +433,66 @@ class SyncModule:
 
     async def send_beacons(self, client_ctx: aiocoap.Context) -> None:
         """
-        Periodische Beacons zu allen Nachbarn senden.
+        Sende periodisch Time-Sync-Beacons an alle Nachbarn und führe
+        **genau EINEN aggregierten Offset-Update-Schritt pro Runde** aus.
 
+        Motivation
+        ----------
+        Bei mehreren Nachbarn (z.B. Knoten D) führt ein sofortiges Update
+        *pro Peer* zu hochfrequentem Hin- und Herziehen des Offsets
+        (Jitter), obwohl alle Peers lokal konsistent sind.
+
+        Diese Implementierung sammelt daher alle Peer-Messungen einer Runde
+        und führt anschließend **einen baryzentrischen Update-Schritt**
+        mit aggregiertem Slew-Limit aus.
+
+        Ablauf pro Sync-Runde
+        ---------------------
         Für jeden Nachbarn j:
-          - t1 = monotonic()      (bei self)
-          - POST /sync/beacon mit {src, dst, t1, offset_self}
-          - Antwort: {t2, t3, offset_peer}
-          - t4 = monotonic()      (bei self)
-          - NTP-Formeln:
 
-                θ = ((t2 - t1) + (t3 - t4)) / 2  ≈ o_peer - o_self
-                rtt = (t4 - t1) - (t3 - t2)
+          1) t1 = time.monotonic()                   (self)
+          2) POST /sync/beacon mit:
+                { src, dst, t1, offset_self }
+          3) Antwort vom Peer:
+                { t2, t3, offset_peer }
+          4) t4 = time.monotonic()                   (self)
 
-          - Jitter-Update, Bootstrap, symmetrisches Update, Logging.
+          NTP-Schätzungen:
+                θ_ij  = ((t2 - t1) + (t3 - t4)) / 2   ≈ o_peer - o_self
+                rtt_ij = (t4 - t1) - (t3 - t2)
+
+          Ziel-Offset aus Sicht von self:
+                target_ij = o_peer + θ_ij
+
+          Zusätzlich:
+            - RTT-Jitter-Schätzung σ_ij
+            - optionaler einmaliger Bootstrap
+
+        Nach allen Peers:
+          - gewichteter Mittelwert aller target_ij
+          - EIN Offset-Update:
+                o_self <- o_self + delta
+            mit:
+                delta = clip( -η * error , slew_limit )
+
+        Eigenschaften
+        -------------
+        ✔ stabil bei mehreren Nachbarn
+        ✔ Slew-Limit wirkt korrekt pro Runde
+        ✔ keine Änderung der Topologie nötig
+        ✔ kompatibel mit späterem Kalman-Upgrade
+
+        Alle Zeiten sind Sekunden.
         """
-        if IS_WINDOWS:
-            return
 
-        if self._is_root:
+        if IS_WINDOWS or self._is_root:
             return  # Root ist nur Server, kein Client für Sync
 
+        measurements = []  # [(peer, target, weight, rtt, theta, did_bootstrap)]
+
+        # ------------------------------------------------------------
+        # 1) Beacons senden & Messungen sammeln
+        # ------------------------------------------------------------
         for peer in self.neighbors:
             ip = self.neighbor_ips.get(peer)
             if not ip:
@@ -475,20 +515,11 @@ class SyncModule:
             )
 
             try:
-                req_ctx = client_ctx.request(req)
                 resp = await asyncio.wait_for(
-                    req_ctx.response,
+                    client_ctx.request(req).response,
                     timeout=self._coap_timeout,
                 )
-            except asyncio.TimeoutError:
-                print(
-                    "[{}] beacon to {} timed out after {:.3f}s".format(
-                        self.node_id, peer, self._coap_timeout
-                    )
-                )
-                continue
-            except Exception as e:
-                print("[{}] beacon to {} failed: {}".format(self.node_id, peer, e))
+            except Exception:
                 continue
 
             t4 = time.monotonic()
@@ -499,62 +530,89 @@ class SyncModule:
                 t2 = float(data["t2"])
                 t3 = float(data["t3"])
                 peer_offset = float(data["offset"])
-            except Exception as e:
-                print(
-                    "[{}] invalid beacon reply from {}: {}".format(
-                        self.node_id, peer, e
-                    )
-                )
+            except Exception:
                 continue
 
             # NTP-Formeln
             rtt = (t4 - t1) - (t3 - t2)
             theta = ((t2 - t1) + (t3 - t4)) / 2.0  # ≈ o_peer - o_self
 
-            # Statistik-Update
+            # Statistik
             self._update_rtt_sigma(peer, rtt)
             self._peer_theta[peer] = theta
 
-            # Bootstrap zuerst (einmaliger harter Sprung)
+            # Bootstrap (einmalig)
             did_bootstrap = self._try_bootstrap(peer, peer_offset, theta)
 
-            error = None
-            delta = None
+            # Ziel-Offset aus Sicht von self
+            target = peer_offset + theta
 
-            # Danach feines Nachregeln
-            if not did_bootstrap:
-                error, raw_delta, delta = self._symmetrical_update(
-                    peer, peer_offset, theta
-                )
+            # Gewicht aus Jitter
+            sigma = self._peer_sigma.get(peer)
+            if sigma is not None and sigma > 1e-6:
+                weight = 1.0 / (sigma * sigma)
             else:
-                raw_delta = None
+                weight = 1.0
 
-            # Kurzsummary
-            if peer in self._peer_sigma:
-                sigma_ms = self._peer_sigma[peer] * 1000.0
-                sigma_str = f"{sigma_ms:.3f} ms"
-            else:
-                sigma_str = "n/a"
+            measurements.append((peer, target, weight, rtt, theta, did_bootstrap))
 
-            print(
-                "[{}] sync with {}: theta={:.3f} ms, rtt={:.3f} ms, sigma={}".format(
-                    self.node_id,
-                    peer,
-                    theta * 1000.0,
-                    rtt * 1000.0,
-                    sigma_str,
-                )
-            )
-
-            # Sample in DB loggen (für Web-UI & Auswertung)
+            # Logging pro Peer (unabhängig vom Batch-Update)
             self._log_sync_sample(
                 peer=peer,
                 rtt=rtt,
                 theta=theta,
-                error=error,
-                delta=delta,
+                error=None,
+                delta=None,
                 did_bootstrap=did_bootstrap,
             )
+
+        if not measurements or self._is_root:
+            return
+
+        # ------------------------------------------------------------
+        # 2) Aggregierter Offset-Update-Schritt (einmal pro Runde)
+        # ------------------------------------------------------------
+        sum_w = sum(w for _, _, w, _, _, _ in measurements)
+        if sum_w <= 0.0:
+            return
+
+        target_avg = sum(target * w for _, target, w, _, _, _ in measurements) / sum_w
+
+        # Fehler aus Sicht von self
+        error = self._offset - target_avg
+
+        # Theoretischer Schritt
+        raw_delta = -self._eta * error
+
+        # Slew-Limit aggregiert pro Runde
+        now = time.monotonic()
+        last = getattr(self, "_last_global_update_ts", now)
+        dt = max(1e-3, now - last)
+        self._last_global_update_ts = now
+
+        if self._max_slew_per_second_ms > 0.0:
+            max_step = (self._max_slew_per_second_ms / 1000.0) * dt
+            delta = max(-max_step, min(max_step, raw_delta))
+        else:
+            delta = raw_delta
+
+        self._offset += delta
+
+        # Optionaler Drift-Dämpfer
+        if self._drift_damping > 0.0:
+            factor = max(0.0, 1.0 - self._drift_damping * dt)
+            self._offset *= factor
+
+        print(
+            "[{}] batch-sync: error={:.3f} ms, raw_delta={:.3f} ms, "
+            "delta={:.3f} ms, offset={:.3f} ms".format(
+                self.node_id,
+                error * 1000.0,
+                raw_delta * 1000.0,
+                delta * 1000.0,
+                self._offset * 1000.0,
+            )
+        )
 
     def is_warmed_up(self, min_samples: Optional[int] = None) -> bool:
         # Root ist per Definition stabil

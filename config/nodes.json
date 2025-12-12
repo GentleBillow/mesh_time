@@ -3,7 +3,7 @@
     "jitter_window": 30,
     "min_samples_for_jitter": 15,
     "max_slew_per_second_ms": 1,
-    "initial_offset_ms": 200.0,
+    "initial_offset_ms": 0.0,
     "eta": 0.01,
     "bootstrap_theta_max_s": 0,
     "coap_timeout_s": 0.5,
@@ -22,7 +22,7 @@
     "color": "red",
     "ip": "172.16.32.164",
     "parent": "C",
-    "neighbors": ["C"],
+    "neighbors": ["C","A"],
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "button_pin": null

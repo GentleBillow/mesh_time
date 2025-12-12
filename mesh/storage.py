@@ -141,22 +141,50 @@ class Storage:
         t_mesh: float,
         offset: float,
         err_mesh_vs_wall: float,
+        peer_id: Optional[str] = None,
+        theta_ms: Optional[float] = None,
+        rtt_ms: Optional[float] = None,
+        sigma_ms: Optional[float] = None,
     ) -> None:
-        """
-        Speichert Messpunkte für Mesh-Time-Qualität:
-        Wie stark weicht mesh_time vom echten time.time() ab?
-        """
         ts = time.time()
 
         with self._lock, self._get_conn() as conn:
             cur = conn.cursor()
+
+            # Welche Spalten existieren wirklich? (für alte DBs)
+            cols = {row[1] for row in cur.execute("PRAGMA table_info(ntp_reference)").fetchall()}
+
+            base_cols = ["node_id", "t_wall", "t_mono", "t_mesh", "offset", "err_mesh_vs_wall", "created_at"]
+            base_vals = [node_id, t_wall, t_mono, t_mesh, offset, err_mesh_vs_wall, ts]
+
+            extra = []
+            extra_vals = []
+
+            if "peer_id" in cols:
+                extra.append("peer_id")
+                extra_vals.append(peer_id)
+
+            if "theta_ms" in cols:
+                extra.append("theta_ms")
+                extra_vals.append(theta_ms)
+
+            if "rtt_ms" in cols:
+                extra.append("rtt_ms")
+                extra_vals.append(rtt_ms)
+
+            if "sigma_ms" in cols:
+                extra.append("sigma_ms")
+                extra_vals.append(sigma_ms)
+
+            all_cols = base_cols + extra
+            placeholders = ", ".join(["?"] * len(all_cols))
+
             cur.execute(
-                """
-                INSERT INTO ntp_reference
-                    (node_id, t_wall, t_mono, t_mesh, offset, err_mesh_vs_wall, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                f"""
+                INSERT INTO ntp_reference ({", ".join(all_cols)})
+                VALUES ({placeholders})
                 """,
-                (node_id, t_wall, t_mono, t_mesh, offset, err_mesh_vs_wall, ts),
+                tuple(base_vals + extra_vals),
             )
             conn.commit()
 

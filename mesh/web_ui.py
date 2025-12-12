@@ -544,10 +544,18 @@ TEMPLATE = r"""
             data: [],
             borderWidth: 0,
             backgroundColor: (context) => {
-              const value = Math.abs(context.raw.v || 0);
               const chart = context.chart;
+              const raw = context.raw;
+    
+              // Safeguard: wenn kein raw oder kein v vorhanden → transparent zeichnen
+              if (!raw || typeof raw.v !== 'number') {
+                return 'rgba(0,0,0,0)';
+              }
+    
+              const value = Math.abs(raw.v);
               const maxV = chart._maxV || 1;
               const ratio = Math.min(1, value / maxV);
+    
               const r = Math.round(255 * ratio);
               const g = Math.round(255 * (1 - ratio));
               return `rgba(${r},${g},150,0.8)`;
@@ -557,7 +565,7 @@ TEMPLATE = r"""
               const area = chart.chartArea || {};
               const nBins = chart._nBins || 1;
               const w = (area.right - area.left) / nBins;
-              return isFinite(w) && w > 0 ? w : 10;
+              return (Number.isFinite(w) && w > 0) ? w : 10;
             },
             height: (context) => {
               const chart = context.chart;
@@ -565,7 +573,7 @@ TEMPLATE = r"""
               const cats = chart._categories || ['pair'];
               const nCats = cats.length || 1;
               const h = (area.bottom - area.top) / nCats;
-              return isFinite(h) && h > 0 ? h : 10;
+              return (Number.isFinite(h) && h > 0) ? h : 10;
             }
           }]
         },
@@ -584,10 +592,11 @@ TEMPLATE = r"""
               type: 'linear',
               ticks: {
                 color: '#aaa',
-                callback: (v) => {
-                  const chart = this.chart || context?.chart; // fallback
-                  const cats = chart?._categories || [];
-                  const idx = Math.round(v);
+                // KEIN Arrow-Function: hier brauchen wir `this` als Scale
+                callback: function (value) {
+                  const chart = this.chart;
+                  const cats = chart._categories || [];
+                  const idx = Math.round(value);
                   return cats[idx] || '';
                 }
               },
@@ -603,7 +612,7 @@ TEMPLATE = r"""
                   const cats = chart._categories || [];
                   const idx = Math.round(ctx.raw.y);
                   const pairId = cats[idx] || '?';
-                  const v = ctx.raw.v || 0;
+                  const v = ctx.raw && typeof ctx.raw.v === 'number' ? ctx.raw.v : 0;
                   const t = new Date(ctx.raw.x);
                   return `${pairId} @ ${t.toLocaleTimeString()} : ${v.toFixed(2)} ms`;
                 }

@@ -1,7 +1,7 @@
 {
   "sync": {
-      "eta": 0.01,
-    "max_slew_per_second_ms": 15,
+      "eta": 0.005,
+    "max_slew_per_second_ms": 5,
     "aggregate_updates": true,
 
 
@@ -22,7 +22,7 @@
 
 
     "coap_timeout_s": 0.5,
-    "beacon_period_s": 1.0,
+    "beacon_period_s": 0.5,
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8
   },

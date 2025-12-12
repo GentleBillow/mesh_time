@@ -43,7 +43,7 @@
   },
 
   "A": {
-    "ip": "172.16.32.171",
+    "ip": "192.168.178.60",
     "parent": "B",
     "telemetry_sink": "C",
     "neighbors": ["B", "D"],
@@ -52,7 +52,7 @@
   },
 
   "B": {
-    "ip": "172.16.32.164",
+    "ip": "192.168.178.48",
     "parent": "C",
     "neighbors": ["C", "A"],
     "sensor_type": "potentiometer",
@@ -60,7 +60,7 @@
   },
 
   "C": {
-    "ip": "172.16.32.136",
+    "ip": "192.168.178.49",
     "parent": null,
     "neighbors": ["B", "D"],
     "sensor_type": "potentiometer",
@@ -72,7 +72,7 @@
   },
 
   "D": {
-    "ip": "172.16.32.172",
+    "ip": "192.168.178.59",
     "parent": "C",
     "neighbors": ["A", "C"],
     "sensor_type": "potentiometer",

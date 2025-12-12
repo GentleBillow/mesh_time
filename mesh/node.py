@@ -309,13 +309,19 @@ class MeshNode:
     async def run_async(self) -> None:
         print(f"[{self.id}] MeshNode starting with cfg: {self.cfg}")
 
-        tasks = [
-            asyncio.create_task(self.coap_loop(), name=f"{self.id}:coap"),
-            asyncio.create_task(self.sync_loop(), name=f"{self.id}:sync"),
-            asyncio.create_task(self.sensor_loop(), name=f"{self.id}:sensor"),
-            asyncio.create_task(self.led_loop(), name=f"{self.id}:led"),
-            asyncio.create_task(self.ntp_monitor_loop(), name=f"{self.id}:ntp"),
-        ]
+        tasks = []
+        for coro, name in [
+            (self.coap_loop(), f"{self.id}:coap"),
+            (self.sync_loop(), f"{self.id}:sync"),
+            (self.sensor_loop(), f"{self.id}:sensor"),
+            (self.led_loop(), f"{self.id}:led"),
+            (self.ntp_monitor_loop(), f"{self.id}:ntp"),
+        ]:
+            t = asyncio.create_task(coro)
+            # Python >=3.8 only — safe guard for 3.7
+            if hasattr(t, "set_name"):
+                t.set_name(name)
+            tasks.append(t)
 
         try:
             await asyncio.gather(*tasks)
@@ -323,8 +329,13 @@ class MeshNode:
             pass
         finally:
             self._stop.set()
+
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
             await self._shutdown_client_ctx()
-            # server ctx wird von aiocoap beim process-exit eh gekillt; sauberheitshalber:
             if self._coap_server_ctx is not None:
                 try:
                     await self._coap_server_ctx.shutdown()

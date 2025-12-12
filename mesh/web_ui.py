@@ -668,9 +668,22 @@ TEMPLATE = r"""
     }
 
     function updateJitterBarChart(chart, jitter_std_pairs) {
-      const pairIds = Object.keys(jitter_std_pairs).sort();
-      chart.data.labels = pairIds;
-      chart.data.datasets[0].data = pairIds.map(id => jitter_std_pairs[id]);
+      const allIds = Object.keys(jitter_std_pairs || {}).sort();
+      
+      const labels = [];
+      const data = [];
+      
+    allIds.forEach(id => {
+      const v = jitter_std_pairs[id];
+      // nur saubere Zahlen übernehmen
+      if (v !== null && v !== undefined && Number.isFinite(v)) {
+        labels.push(id);
+        data.push(v);
+      }
+    });
+    
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = data;
       chart.update();
     }
 

@@ -396,6 +396,11 @@ class SyncModule:
 
         Alle Zeiten in Sekunden.
         """
+        # DB-Gating: erst loggen, wenn genügend RTT-Samples für diesen Peer da sind
+        samples = self._peer_rtt_samples.get(peer, [])
+        if len(samples) < self._min_samples_for_jitter:
+            return
+
         if self._storage is None:
             return
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# mesh/sync.py - COMPLETE FIX mit Link-Metrics Telemetrie
+# mesh/sync.py - SIMPLIFIED VERSION mit direkter Telemetrie
 
 from __future__ import annotations
 
@@ -25,10 +25,9 @@ class PeerStats:
     """Per-peer rolling link statistics (seconds)."""
     rtt_samples: List[float] = field(default_factory=list)
     sigma: Optional[float] = None
-    theta_last: Optional[float] = None  # theta ≈ o_peer - o_self
+    theta_last: Optional[float] = None
     good_samples: int = 0
     last_theta_epoch: Optional[float] = None
-    # NEU: Letzte RTT für Telemetrie
     rtt_last: Optional[float] = None
 
 
@@ -37,8 +36,6 @@ class PeerStats:
 # ---------------------------------------------------------------------
 
 Measurement = Tuple[str, float, float, float]
-# (peer_id, rtt_s, theta_s, peer_offset_s)
-
 WeightFn = Callable[[str], float]
 
 
@@ -59,17 +56,12 @@ class BaseController:
 
 
 class PIController(BaseController):
-    """
-    Weighted global PI controller.
-
-    error_i = o_self - (o_peer - theta_i)
-    e = Σ(w_i * error_i) / Σ(w_i)
-    """
+    """Weighted global PI controller."""
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.kp = float(cfg.get("kp", 0.02))
         self.ki = float(cfg.get("ki", 0.001))
-        self.i_leak = float(cfg.get("i_leak", 0.0))  # 1/s
+        self.i_leak = float(cfg.get("i_leak", 0.0))
         self.i_max = float(cfg.get("i_max_ms", 200.0)) / 1000.0
         self.i_state = 0.0
 
@@ -98,7 +90,6 @@ class PIController(BaseController):
 
         e = num / den
 
-        # leaky integrator
         if self.i_leak > 0.0:
             self.i_state *= max(0.0, 1.0 - self.i_leak * dt_s)
 
@@ -126,9 +117,8 @@ class PIController(BaseController):
 class SyncModule:
     """
     Mesh time synchronization via CoAP beacons + NTP 4-timestamp estimate.
-    Controller is pluggable (PI / Kalman).
 
-    FIX: Logs link metrics (theta, rtt, sigma) either locally OR via telemetry callback.
+    SIMPLIFIED: Telemetrie direkt in send_beacons, kein Callback.
     """
 
     def __init__(
@@ -138,7 +128,7 @@ class SyncModule:
             neighbor_ips: Dict[str, str],
             sync_cfg: Optional[Dict[str, Any]] = None,
             storage=None,
-            telemetry_callback=None,  # NEU: Callback für Telemetrie
+            telemetry_sink_ip: Optional[str] = None,  # SIMPLIFIED: Direkte IP
     ) -> None:
         sync_cfg = sync_cfg or {}
 
@@ -146,7 +136,7 @@ class SyncModule:
         self.neighbors = list(neighbors)
         self.neighbor_ips = dict(neighbor_ips)
         self._storage = storage
-        self._telemetry_callback = telemetry_callback  # NEU
+        self._telemetry_sink_ip = telemetry_sink_ip  # SIMPLIFIED
 
         # role
         self._is_root = bool(sync_cfg.get("is_root", False))
@@ -203,24 +193,6 @@ class SyncModule:
     def is_warmed_up(self) -> bool:
         return self._is_root or self._beacon_count >= self._min_beacons_for_warmup
 
-    def get_peer_stats(self) -> Dict[str, Dict[str, Any]]:
-        """
-        NEU: Gibt aktuelle Peer-Statistiken zurück für Telemetrie.
-        Returns: {peer_id: {theta_ms, rtt_ms, sigma_ms, samples}}
-        """
-        result = {}
-        for peer_id, st in self._peer.items():
-            if st.good_samples < self._min_samples_before_log:
-                continue
-
-            result[peer_id] = {
-                "theta_ms": st.theta_last * 1000.0 if st.theta_last is not None else None,
-                "rtt_ms": st.rtt_last * 1000.0 if st.rtt_last is not None else None,
-                "sigma_ms": st.sigma * 1000.0 if st.sigma is not None else None,
-                "samples": st.good_samples,
-            }
-        return result
-
     # -----------------------------------------------------------------
     # Robust stats / weights
     # -----------------------------------------------------------------
@@ -246,7 +218,7 @@ class SyncModule:
     def _update_link_jitter(self, peer_id: str, rtt_s: float) -> None:
         st = self._peer.setdefault(peer_id, PeerStats())
         st.rtt_samples.append(rtt_s)
-        st.rtt_last = rtt_s  # NEU: Speichere letzte RTT
+        st.rtt_last = rtt_s
 
         if len(st.rtt_samples) > self._jitter_window:
             st.rtt_samples.pop(0)
@@ -302,38 +274,30 @@ class SyncModule:
         return max(-max_step, min(max_step, delta_s))
 
     def _apply_global_control(self, meas: List[Measurement]) -> None:
-        if not meas:
-            print(f"[{self.node_id}] WARNING: No measurements for control!")
-            return
-
         dt = self._compute_dt()
-
-        try:
-            delta = self._controller.compute_delta(self._offset, meas, self._weight_for_peer, dt)
-        except Exception as e:
-            print(f"[{self.node_id}] ERROR in controller: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-
+        delta = self._controller.compute_delta(self._offset, meas, self._weight_for_peer, dt)
         delta = self._global_slew_clip(delta, dt)
+        self._offset += delta
 
-        # DEBUG
-        print(
-            f"[{self.node_id}] control: n_meas={len(meas)}, Δ={delta * 1000:.3f} ms, offset={self._offset * 1000:.3f} ms")
+        if self._drift_damping > 0.0:
+            self._offset *= max(0.0, 1.0 - self._drift_damping * dt)
 
-        if abs(delta * 1000) > 50:  # Warnung bei großen Sprüngen
-            print(f"[{self.node_id}] WARNING: Large delta! {delta * 1000:.1f} ms")
+        print(f"[{self.node_id}] control: Δ={delta * 1000:.3f} ms, offset={self._offset * 1000:.3f} ms")
 
     # -----------------------------------------------------------------
-    # FIX: Link Metrics Logging/Telemetry
+    # SIMPLIFIED: Direkte Link-Metrics Logging/Telemetry
     # -----------------------------------------------------------------
 
-    def _log_link_metrics(self, peer_id: str, rtt_s: float, theta_s: float) -> None:
+    async def _log_link_metrics(
+            self,
+            peer_id: str,
+            rtt_s: float,
+            theta_s: float,
+            client_ctx: aiocoap.Context
+    ) -> None:
         """
-        Loggt Link-Metriken entweder:
-        1. Lokal in DB (wenn self._storage vorhanden)
-        2. Via Telemetrie-Callback (wenn kein Storage aber Callback vorhanden)
+        SIMPLIFIED: Loggt Link-Metriken entweder lokal ODER sendet via Telemetrie.
+        Wird direkt von send_beacons() aufgerufen (async context).
         """
         st = self._peer.get(peer_id)
         if st is None or st.good_samples < self._min_samples_before_log:
@@ -347,7 +311,7 @@ class SyncModule:
         t_mono = time.monotonic()
         t_mesh = self.mesh_time()
 
-        # Option 1: Lokales Logging (nur Node C)
+        # Option 1: Lokales Logging (Node C)
         if self._storage is not None:
             try:
                 self._storage.insert_ntp_reference(
@@ -362,23 +326,45 @@ class SyncModule:
                     rtt_ms=rtt_ms,
                     sigma_ms=sigma_ms,
                 )
-                # Optional: Verbose logging
-                # print(f"[{self.node_id}] Link to {peer_id}: θ={theta_ms:.2f}ms, RTT={rtt_ms:.2f}ms, σ={sigma_ms:.2f}ms")
             except Exception as e:
-                print(f"[{self.node_id}] Link metrics DB logging failed for peer {peer_id}: {e}")
+                print(f"[{self.node_id}] DB logging failed for {peer_id}: {e}")
 
         # Option 2: Telemetrie (Nodes A, B, D)
-        elif self._telemetry_callback is not None:
+        elif self._telemetry_sink_ip is not None:
             try:
-                self._telemetry_callback(peer_id, theta_ms, rtt_ms, sigma_ms)
+                uri = f"coap://{self._telemetry_sink_ip}/relay/ingest/link"
+
+                payload = {
+                    "node_id": self.node_id,
+                    "peer_id": peer_id,
+                    "theta_ms": theta_ms,
+                    "rtt_ms": rtt_ms,
+                    "sigma_ms": sigma_ms,
+                    "t_wall": t_wall,
+                    "t_mono": t_mono,
+                    "t_mesh": t_mesh,
+                    "offset": self._offset,
+                }
+
+                req = aiocoap.Message(
+                    code=aiocoap.POST,
+                    uri=uri,
+                    payload=json.dumps(payload).encode("utf-8"),
+                )
+
+                # Mit Timeout senden
+                await asyncio.wait_for(client_ctx.request(req).response, timeout=0.5)
+
             except Exception as e:
-                print(f"[{self.node_id}] Link metrics telemetry failed for peer {peer_id}: {e}")
+                # Verbose: zeige Fehler
+                print(f"[{self.node_id}] Telemetry failed for {peer_id}: {e}")
 
     # -----------------------------------------------------------------
     # Beacon roundtrip
     # -----------------------------------------------------------------
 
     async def send_beacons(self, client_ctx: aiocoap.Context) -> None:
+        # DEBUG
         print(f"[DEBUG] {self.node_id}: send_beacons called, is_root={self._is_root}, IS_WINDOWS={IS_WINDOWS}")
 
         if IS_WINDOWS or self._is_root:
@@ -386,16 +372,12 @@ class SyncModule:
 
         meas: List[Measurement] = []
 
-        print(f"[DEBUG] {self.node_id}: Starting beacon loop, neighbors={self.neighbors}")
-
         for peer_id in self.neighbors:
             ip = self.neighbor_ips.get(peer_id)
             if not ip:
-                print(f"[DEBUG] {self.node_id}: No IP for {peer_id}, skipping")
                 continue
 
             uri = f"coap://{ip}/sync/beacon"
-            print(f"[DEBUG] {self.node_id} → {peer_id}: Sending beacon to {uri}")
 
             t1_m = time.monotonic()
             payload = {
@@ -409,9 +391,7 @@ class SyncModule:
             req = aiocoap.Message(code=aiocoap.POST, uri=uri, payload=json.dumps(payload).encode())
             try:
                 resp = await client_ctx.request(req).response
-                print(f"[DEBUG] {self.node_id} → {peer_id}: Got response!")
-            except Exception as e:
-                print(f"[DEBUG] {self.node_id} → {peer_id}: Request FAILED: {type(e).__name__}: {e}")
+            except Exception:
                 continue
 
             t4_m = time.monotonic()
@@ -422,9 +402,7 @@ class SyncModule:
                 t3_m = float(data["t3"])
                 peer_offset = float(data["offset"])
                 peer_boot_epoch = float(data.get("boot_epoch"))
-                print(f"[DEBUG] {self.node_id} → {peer_id}: Parsed response OK")
-            except Exception as e:
-                print(f"[DEBUG] {self.node_id} → {peer_id}: Parse FAILED: {type(e).__name__}: {e}")
+            except Exception:
                 continue
 
             t1 = t1_m + self._boot_epoch
@@ -446,17 +424,13 @@ class SyncModule:
 
             if not did_bs:
                 meas.append((peer_id, rtt, theta, peer_offset))
-                print(f"[DEBUG] {self.node_id} → {peer_id}: Added to measurements")
-            else:
-                print(f"[DEBUG] {self.node_id} → {peer_id}: Bootstrapped, skipping measurement")
 
-            # Link metrics logging
+            # SIMPLIFIED: Direkt hier loggen/telemetrieren
             await self._log_link_metrics(peer_id, rtt, theta, client_ctx)
 
-        print(f"[DEBUG] {self.node_id}: Beacon loop done, collected {len(meas)} measurements")
-
         if meas:
-            print(f"[DEBUG] {self.node_id}: Calling _apply_global_control with {len(meas)} measurements")
             self._apply_global_control(meas)
-        else:
-            print(f"[DEBUG] {self.node_id}: NO measurements, skipping control")
+
+
+# asyncio import für await
+import asyncio

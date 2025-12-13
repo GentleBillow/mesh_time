@@ -227,7 +227,8 @@ class MeshNode:
 
         except asyncio.TimeoutError:
             log.error("[%s] CoAP server start TIMEOUT (bind=%s:%d)", self.id, bind_ip, bind_port)
-            task.cancel()   # IMPORTANT: cancel, but don't await forever
+            log.error("[%s] coap task done=%s cancelled=%s", self.id, task.done(), task.cancelled())
+            task.cancel()
             raise
 
         except asyncio.CancelledError:

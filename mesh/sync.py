@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# mesh/sync.py - FIXED VERSION mit Link-Metrics Logging
+# mesh/sync.py - COMPLETE FIX mit Link-Metrics Telemetrie
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ class PeerStats:
     theta_last: Optional[float] = None  # theta ≈ o_peer - o_self
     good_samples: int = 0
     last_theta_epoch: Optional[float] = None
+    # NEU: Letzte RTT für Telemetrie
+    rtt_last: Optional[float] = None
 
 
 # ---------------------------------------------------------------------
@@ -126,7 +128,7 @@ class SyncModule:
     Mesh time synchronization via CoAP beacons + NTP 4-timestamp estimate.
     Controller is pluggable (PI / Kalman).
 
-    FIX: Logs link metrics (theta, rtt, sigma) to storage after each beacon.
+    FIX: Logs link metrics (theta, rtt, sigma) either locally OR via telemetry callback.
     """
 
     def __init__(
@@ -136,13 +138,15 @@ class SyncModule:
             neighbor_ips: Dict[str, str],
             sync_cfg: Optional[Dict[str, Any]] = None,
             storage=None,
+            telemetry_callback=None,  # NEU: Callback für Telemetrie
     ) -> None:
         sync_cfg = sync_cfg or {}
 
         self.node_id = node_id
         self.neighbors = list(neighbors)
         self.neighbor_ips = dict(neighbor_ips)
-        self._storage = storage  # FIX: Storage für Link-Logging
+        self._storage = storage
+        self._telemetry_callback = telemetry_callback  # NEU
 
         # role
         self._is_root = bool(sync_cfg.get("is_root", False))
@@ -199,6 +203,24 @@ class SyncModule:
     def is_warmed_up(self) -> bool:
         return self._is_root or self._beacon_count >= self._min_beacons_for_warmup
 
+    def get_peer_stats(self) -> Dict[str, Dict[str, Any]]:
+        """
+        NEU: Gibt aktuelle Peer-Statistiken zurück für Telemetrie.
+        Returns: {peer_id: {theta_ms, rtt_ms, sigma_ms, samples}}
+        """
+        result = {}
+        for peer_id, st in self._peer.items():
+            if st.good_samples < self._min_samples_before_log:
+                continue
+
+            result[peer_id] = {
+                "theta_ms": st.theta_last * 1000.0 if st.theta_last is not None else None,
+                "rtt_ms": st.rtt_last * 1000.0 if st.rtt_last is not None else None,
+                "sigma_ms": st.sigma * 1000.0 if st.sigma is not None else None,
+                "samples": st.good_samples,
+            }
+        return result
+
     # -----------------------------------------------------------------
     # Robust stats / weights
     # -----------------------------------------------------------------
@@ -224,6 +246,8 @@ class SyncModule:
     def _update_link_jitter(self, peer_id: str, rtt_s: float) -> None:
         st = self._peer.setdefault(peer_id, PeerStats())
         st.rtt_samples.append(rtt_s)
+        st.rtt_last = rtt_s  # NEU: Speichere letzte RTT
+
         if len(st.rtt_samples) > self._jitter_window:
             st.rtt_samples.pop(0)
 
@@ -289,50 +313,53 @@ class SyncModule:
         print(f"[{self.node_id}] control: Δ={delta * 1000:.3f} ms, offset={self._offset * 1000:.3f} ms")
 
     # -----------------------------------------------------------------
-    # FIX: Link Metrics Logging Helper
+    # FIX: Link Metrics Logging/Telemetry
     # -----------------------------------------------------------------
 
     def _log_link_metrics(self, peer_id: str, rtt_s: float, theta_s: float) -> None:
         """
-        NEW: Nach jedem erfolgreichen Beacon schreiben wir die Link-Metriken
-        (theta, rtt, sigma) in die Datenbank, falls Storage vorhanden ist.
+        Loggt Link-Metriken entweder:
+        1. Lokal in DB (wenn self._storage vorhanden)
+        2. Via Telemetrie-Callback (wenn kein Storage aber Callback vorhanden)
         """
-        if self._storage is None:
-            return
-
         st = self._peer.get(peer_id)
-        if st is None:
+        if st is None or st.good_samples < self._min_samples_before_log:
             return
 
-        # Nur loggen wenn wir genug Samples haben
-        if st.good_samples < self._min_samples_before_log:
-            return
-
-        # Konvertiere zu ms
         theta_ms = theta_s * 1000.0
         rtt_ms = rtt_s * 1000.0
         sigma_ms = st.sigma * 1000.0 if st.sigma is not None else None
 
-        # Aktuelle Zeiten
         t_wall = time.time()
         t_mono = time.monotonic()
         t_mesh = self.mesh_time()
 
-        try:
-            self._storage.insert_ntp_reference(
-                node_id=self.node_id,
-                t_wall=t_wall,
-                t_mono=t_mono,
-                t_mesh=t_mesh,
-                offset=self._offset,
-                err_mesh_vs_wall=t_mesh - t_wall,
-                peer_id=peer_id,  # FIX: Peer-ID setzen!
-                theta_ms=theta_ms,  # FIX: Theta loggen!
-                rtt_ms=rtt_ms,  # FIX: RTT loggen!
-                sigma_ms=sigma_ms,  # FIX: Sigma loggen!
-            )
-        except Exception as e:
-            print(f"[{self.node_id}] Link metrics logging failed for peer {peer_id}: {e}")
+        # Option 1: Lokales Logging (nur Node C)
+        if self._storage is not None:
+            try:
+                self._storage.insert_ntp_reference(
+                    node_id=self.node_id,
+                    t_wall=t_wall,
+                    t_mono=t_mono,
+                    t_mesh=t_mesh,
+                    offset=self._offset,
+                    err_mesh_vs_wall=t_mesh - t_wall,
+                    peer_id=peer_id,
+                    theta_ms=theta_ms,
+                    rtt_ms=rtt_ms,
+                    sigma_ms=sigma_ms,
+                )
+                # Optional: Verbose logging
+                # print(f"[{self.node_id}] Link to {peer_id}: θ={theta_ms:.2f}ms, RTT={rtt_ms:.2f}ms, σ={sigma_ms:.2f}ms")
+            except Exception as e:
+                print(f"[{self.node_id}] Link metrics DB logging failed for peer {peer_id}: {e}")
+
+        # Option 2: Telemetrie (Nodes A, B, D)
+        elif self._telemetry_callback is not None:
+            try:
+                self._telemetry_callback(peer_id, theta_ms, rtt_ms, sigma_ms)
+            except Exception as e:
+                print(f"[{self.node_id}] Link metrics telemetry failed for peer {peer_id}: {e}")
 
     # -----------------------------------------------------------------
     # Beacon roundtrip

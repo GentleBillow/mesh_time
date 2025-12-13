@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-# mesh/coap_endpoints.py
+# mesh/coap_endpoints.py - FIXED VERSION mit Link-Metrics Endpoint
 """
-CoAP endpoints — drop-in, aufgeräumt
+CoAP endpoints — mit /relay/ingest/link für Link-Metriken
 
-Wichtigste Fixes:
-- /sync/beacon: validiert dst, antwortet immer sauber (auch bei kaputtem JSON)
-- boot_epoch IMMER mitliefern (für monotonic->epoch lifting)
-- Keine Debug-Felder im Default-Antwortpayload (nur optional via cfg), damit Payload klein bleibt
-- /relay/ingest/*: robust gegen fehlende Felder, keine Exceptions -> Server bleibt stabil
-- content_format korrekt gesetzt (application/json)
+FIX: Neuer Endpoint zum Empfangen von Link-Metriken via Telemetrie
 """
 
 from __future__ import annotations
@@ -19,7 +14,6 @@ from typing import Any, Dict, Optional
 
 import aiocoap
 import aiocoap.resource as resource
-
 
 JSON_CF = aiocoap.numbers.media_types_rev.get("application/json", 0)
 
@@ -258,6 +252,84 @@ class RelayIngestNtpResource(resource.Resource):
         return aiocoap.Message(code=aiocoap.CHANGED)
 
 
+class RelayIngestLinkResource(resource.Resource):
+    """
+    FIX: NEW ENDPOINT - POST /relay/ingest/link
+
+    Empfängt Link-Metriken via Telemetrie von Nodes ohne Storage.
+
+    JSON:
+      {
+        "node_id": "B",           # Sender Node
+        "peer_id": "C",           # Link zu diesem Peer
+        "theta_ms": 1.23,         # Zeitoffset in ms
+        "rtt_ms": 2.45,           # Round-Trip Time in ms
+        "sigma_ms": 0.12,         # Jitter-Schätzung in ms (optional)
+        "t_wall": <epoch>,
+        "t_mono": <monotonic>,
+        "t_mesh": <mesh_time>,
+        "offset": <node_offset>
+      }
+    """
+
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+
+    async def render_post(self, request):
+        data = _safe_json(request.payload)
+        # Optional: Verbose logging
+        # print(f"[{self.node.id}] relay/ingest/link: {data}")
+
+        st = getattr(self.node, "storage", None)
+        if st is not None:
+            try:
+                node_id = str(data.get("node_id", "unknown"))
+                peer_id = data.get("peer_id", None)
+
+                if peer_id is None:
+                    # Skip invalid link data
+                    return aiocoap.Message(code=aiocoap.CHANGED)
+
+                peer_id = str(peer_id)
+
+                # Extract link metrics
+                theta_ms = data.get("theta_ms", None)
+                rtt_ms = data.get("rtt_ms", None)
+                sigma_ms = data.get("sigma_ms", None)
+
+                # Convert to float (allow None)
+                theta_ms = float(theta_ms) if theta_ms is not None else None
+                rtt_ms = float(rtt_ms) if rtt_ms is not None else None
+                sigma_ms = float(sigma_ms) if sigma_ms is not None else None
+
+                # Time info
+                t_wall = float(data.get("t_wall", time.time()))
+                t_mono = float(data.get("t_mono", 0.0))
+                t_mesh = float(data.get("t_mesh", 0.0))
+                offset = float(data.get("offset", 0.0))
+                err = t_mesh - t_wall
+
+                # Insert into DB
+                st.insert_ntp_reference(
+                    node_id=node_id,
+                    t_wall=t_wall,
+                    t_mono=t_mono,
+                    t_mesh=t_mesh,
+                    offset=offset,
+                    err_mesh_vs_wall=err,
+                    peer_id=peer_id,  # FIX: Link-spezifisch
+                    theta_ms=theta_ms,  # FIX: Link-Metriken
+                    rtt_ms=rtt_ms,
+                    sigma_ms=sigma_ms,
+                )
+
+            except Exception as e:
+                print(f"[{self.node.id}] relay/ingest/link: DB insert failed: {e}")
+
+        return aiocoap.Message(code=aiocoap.CHANGED)
+
+
 def build_site(node) -> resource.Site:
     """
     Build the CoAP resource tree for a node.
@@ -274,5 +346,6 @@ def build_site(node) -> resource.Site:
     # Relay ingests
     root.add_resource(("relay", "ingest", "sensor"), RelayIngestSensorResource(node))
     root.add_resource(("relay", "ingest", "ntp"), RelayIngestNtpResource(node))
+    root.add_resource(("relay", "ingest", "link"), RelayIngestLinkResource(node))  # FIX: NEU!
 
     return root

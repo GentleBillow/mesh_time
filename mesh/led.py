@@ -19,43 +19,34 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 class _BlinkCore:
     """
-    Gemeinsame Logik: glättet t_mesh -> t_disp (Anzeigezeit),
-    damit kleine Sync-Korrekturen nicht als LED-Phasen-Zittern sichtbar werden.
+    Edge-triggered global blink.
+    No phase slewing. Uses t_mesh as absolute event clock.
     """
     def __init__(self):
-        self._t_disp = None          # geglättete Anzeigezeit (Sekunden)
-        self._last_mono = None       # letzter monotonic Zeitpunkt (Sekunden)
-        self._last_on = False
+        self._last_k = None
+        self._pulse_until = 0.0
 
     def compute_on(
         self,
         t_mesh: float,
         *,
         period: float = 1.0,
-        pulse_s: float = 0.05,              # 50ms Pulsfenster (optisch stabiler als 20ms)
-        max_slew_ms_per_s: float = 250.0,   # wie du’s schon nutzt: 250ms pro Sekunde
-        snap_if_far_s: float = 2.0,         # wenn wir zu weit weg sind -> sofort "snappen"
+        pulse_s: float = 0.05,
     ) -> bool:
-        now_mono = time.monotonic()
+        now = time.monotonic()
 
-        if self._t_disp is None:
-            self._t_disp = t_mesh
-            self._last_mono = now_mono
-        else:
-            dt = max(1e-3, now_mono - (self._last_mono or now_mono))
-            self._last_mono = now_mono
+        k = int(t_mesh // period)
 
-            err = t_mesh - self._t_disp
+        if self._last_k is None:
+            self._last_k = k
 
-            # wenn wir *sehr* weit weg sind (z.B. Bootstrap/Restart), sofort nachziehen
-            if abs(err) > snap_if_far_s:
-                self._t_disp = t_mesh
-            else:
-                max_step = (max_slew_ms_per_s / 1000.0) * dt
-                self._t_disp += _clamp(err, -max_step, +max_step)
+        if k != self._last_k:
+            # global event edge
+            self._last_k = k
+            self._pulse_until = now + pulse_s
 
-        phase = self._t_disp % period
-        return phase < pulse_s
+        return now < self._pulse_until
+
 
 
 class DummyLED:

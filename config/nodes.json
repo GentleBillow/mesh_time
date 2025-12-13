@@ -24,7 +24,7 @@
       "q_drift": 0.0,
       "q_bias": 1e-13,
       "r_base": 2e-7,
-      "r_virtual": 1e-2
+      "r_virtual": 5e-2
     },
 
     "ui_window_s": 600,

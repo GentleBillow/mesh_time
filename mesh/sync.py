@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-# mesh/sync.py - SIMPLIFIED VERSION mit direkter Telemetrie
+# mesh/sync.py - ROBUST VERSION nach Forum-Best-Practices
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import math
 import platform
 import random
@@ -14,6 +16,9 @@ from typing import Dict, List, Optional, Tuple, Any, Callable
 import aiocoap
 
 IS_WINDOWS = platform.system() == "Windows"
+
+# Setup logging
+log = logging.getLogger("meshtime.sync")
 
 
 # ---------------------------------------------------------------------
@@ -29,6 +34,7 @@ class PeerStats:
     good_samples: int = 0
     last_theta_epoch: Optional[float] = None
     rtt_last: Optional[float] = None
+    state: str = "DOWN"  # UP or DOWN
 
 
 # ---------------------------------------------------------------------
@@ -99,15 +105,28 @@ class PIController(BaseController):
 
         return -self.kp * e - self.ki * self.i_state
 
-    def snapshot(self) -> Dict[str, Any]:
-        return {
-            "type": "pi",
-            "kp": self.kp,
-            "ki": self.ki,
-            "i_state_ms": self.i_state * 1000.0,
-            "i_max_ms": self.i_max * 1000.0,
-            "i_leak": self.i_leak,
-        }
+
+# ---------------------------------------------------------------------
+# ROBUST: Task spawn helper (aus Forum)
+# ---------------------------------------------------------------------
+
+def spawn_task(coro, name: str) -> asyncio.Task:
+    """
+    Spawns a task with proper exception handling.
+    Crashes are logged, not silently swallowed.
+    """
+    task = asyncio.create_task(coro, name=name)
+
+    def _done_callback(t: asyncio.Task):
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            log.info("Task cancelled: %s", name)
+        except Exception:
+            log.exception("Task CRASHED: %s", name)  # NICHT SILENT!
+
+    task.add_done_callback(_done_callback)
+    return task
 
 
 # ---------------------------------------------------------------------
@@ -116,9 +135,14 @@ class PIController(BaseController):
 
 class SyncModule:
     """
-    Mesh time synchronization via CoAP beacons + NTP 4-timestamp estimate.
+    ROBUST mesh time synchronization.
 
-    SIMPLIFIED: Telemetrie direkt in send_beacons, kein Callback.
+    Key improvements:
+    - Separate worker per peer (non-blocking)
+    - Hard timeouts on all requests
+    - Exponential backoff for down peers
+    - Proper exception logging
+    - No silent failures
     """
 
     def __init__(
@@ -128,7 +152,7 @@ class SyncModule:
             neighbor_ips: Dict[str, str],
             sync_cfg: Optional[Dict[str, Any]] = None,
             storage=None,
-            telemetry_sink_ip: Optional[str] = None,  # SIMPLIFIED: Direkte IP
+            telemetry_sink_ip: Optional[str] = None,
     ) -> None:
         sync_cfg = sync_cfg or {}
 
@@ -136,7 +160,7 @@ class SyncModule:
         self.neighbors = list(neighbors)
         self.neighbor_ips = dict(neighbor_ips)
         self._storage = storage
-        self._telemetry_sink_ip = telemetry_sink_ip  # SIMPLIFIED
+        self._telemetry_sink_ip = telemetry_sink_ip
 
         # role
         self._is_root = bool(sync_cfg.get("is_root", False))
@@ -167,7 +191,11 @@ class SyncModule:
 
         # limits / timing
         self._max_slew_per_second_ms = float(sync_cfg.get("max_slew_per_second_ms", 10.0))
-        self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 0.5))
+
+        # ROBUST: Timeout config (aus Forum)
+        self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 1.0))
+        self._base_interval = float(sync_cfg.get("beacon_period_s", 0.5))
+        self._max_backoff = float(sync_cfg.get("max_backoff_s", 8.0))
 
         # jitter / weighting
         self._jitter_window = int(sync_cfg.get("jitter_window", 30))
@@ -179,6 +207,10 @@ class SyncModule:
 
         self._peer: Dict[str, PeerStats] = {}
         self._last_global_update_mono: Optional[float] = None
+
+        # ROBUST: Measurement queue (thread-safe)
+        self._measurement_queue: asyncio.Queue = asyncio.Queue()
+        self._worker_tasks: List[asyncio.Task] = []
 
     # -----------------------------------------------------------------
     # Public API
@@ -254,7 +286,7 @@ class SyncModule:
         self._bootstrapped = True
         self._controller.on_bootstrap()
 
-        print(f"[{self.node_id}] BOOTSTRAP via {peer_id}: offset={self._offset * 1000:.3f} ms")
+        log.info("[%s] BOOTSTRAP via %s: offset=%.3f ms", self.node_id, peer_id, self._offset * 1000)
         return True
 
     # -----------------------------------------------------------------
@@ -282,10 +314,11 @@ class SyncModule:
         if self._drift_damping > 0.0:
             self._offset *= max(0.0, 1.0 - self._drift_damping * dt)
 
-        print(f"[{self.node_id}] control: Δ={delta * 1000:.3f} ms, offset={self._offset * 1000:.3f} ms")
+        log.info("[%s] control: n_meas=%d, Δ=%.3f ms, offset=%.3f ms",
+                 self.node_id, len(meas), delta * 1000, self._offset * 1000)
 
     # -----------------------------------------------------------------
-    # SIMPLIFIED: Direkte Link-Metrics Logging/Telemetry
+    # ROBUST: Link Metrics Logging (mit Timeout)
     # -----------------------------------------------------------------
 
     async def _log_link_metrics(
@@ -295,10 +328,7 @@ class SyncModule:
             theta_s: float,
             client_ctx: aiocoap.Context
     ) -> None:
-        """
-        SIMPLIFIED: Loggt Link-Metriken entweder lokal ODER sendet via Telemetrie.
-        Wird direkt von send_beacons() aufgerufen (async context).
-        """
+        """Loggt Link-Metriken mit TIMEOUT."""
         st = self._peer.get(peer_id)
         if st is None or st.good_samples < self._min_samples_before_log:
             return
@@ -311,7 +341,7 @@ class SyncModule:
         t_mono = time.monotonic()
         t_mesh = self.mesh_time()
 
-        # Option 1: Lokales Logging (Node C)
+        # Option 1: Lokales Logging
         if self._storage is not None:
             try:
                 self._storage.insert_ntp_reference(
@@ -327,9 +357,9 @@ class SyncModule:
                     sigma_ms=sigma_ms,
                 )
             except Exception as e:
-                print(f"[{self.node_id}] DB logging failed for {peer_id}: {e}")
+                log.error("[%s] DB logging failed for %s: %s", self.node_id, peer_id, e)
 
-        # Option 2: Telemetrie (Nodes A, B, D)
+        # Option 2: Telemetrie (MIT TIMEOUT!)
         elif self._telemetry_sink_ip is not None:
             try:
                 uri = f"coap://{self._telemetry_sink_ip}/relay/ingest/link"
@@ -352,32 +382,39 @@ class SyncModule:
                     payload=json.dumps(payload).encode("utf-8"),
                 )
 
-                # Mit Timeout senden
-                await asyncio.wait_for(client_ctx.request(req).response, timeout=0.5)
+                # ROBUST: Hard timeout!
+                await asyncio.wait_for(
+                    client_ctx.request(req).response,
+                    timeout=self._coap_timeout
+                )
 
+            except asyncio.TimeoutError:
+                log.warning("[%s] Telemetry timeout for %s", self.node_id, peer_id)
             except Exception as e:
-                # Verbose: zeige Fehler
-                print(f"[{self.node_id}] Telemetry failed for {peer_id}: {e}")
+                log.warning("[%s] Telemetry failed for %s: %s", self.node_id, peer_id, type(e).__name__)
 
     # -----------------------------------------------------------------
-    # Beacon roundtrip
+    # ROBUST: Per-Peer Worker (aus Forum)
     # -----------------------------------------------------------------
 
-    async def send_beacons(self, client_ctx: aiocoap.Context) -> None:
-        # DEBUG
-        print(f"[DEBUG] {self.node_id}: send_beacons called, is_root={self._is_root}, IS_WINDOWS={IS_WINDOWS}")
+    async def _peer_worker(
+            self,
+            peer_id: str,
+            peer_ip: str,
+            client_ctx: aiocoap.Context
+    ) -> None:
+        """
+        ROBUST peer worker mit Backoff und Exception Handling.
+        Nach Forum-Best-Practices.
+        """
+        backoff = self._base_interval
+        st = self._peer.setdefault(peer_id, PeerStats())
+        st.state = "DOWN"
 
-        if IS_WINDOWS or self._is_root:
-            return
+        log.info("[%s] Starting peer worker for %s (%s)", self.node_id, peer_id, peer_ip)
 
-        meas: List[Measurement] = []
-
-        for peer_id in self.neighbors:
-            ip = self.neighbor_ips.get(peer_id)
-            if not ip:
-                continue
-
-            uri = f"coap://{ip}/sync/beacon"
+        while True:
+            uri = f"coap://{peer_ip}/sync/beacon"
 
             t1_m = time.monotonic()
             payload = {
@@ -388,49 +425,155 @@ class SyncModule:
                 "offset": self._offset,
             }
 
-            req = aiocoap.Message(code=aiocoap.POST, uri=uri, payload=json.dumps(payload).encode())
-            try:
-                resp = await client_ctx.request(req).response
-            except Exception:
-                continue
-
-            t4_m = time.monotonic()
+            req = aiocoap.Message(
+                code=aiocoap.POST,
+                uri=uri,
+                payload=json.dumps(payload).encode()
+            )
 
             try:
+                # ROBUST: Hard timeout!
+                resp = await asyncio.wait_for(
+                    client_ctx.request(req).response,
+                    timeout=self._coap_timeout
+                )
+
+                t4_m = time.monotonic()
+
                 data = json.loads(resp.payload.decode())
                 t2_m = float(data["t2"])
                 t3_m = float(data["t3"])
                 peer_offset = float(data["offset"])
                 peer_boot_epoch = float(data.get("boot_epoch"))
-            except Exception:
+
+                t1 = t1_m + self._boot_epoch
+                t4 = t4_m + self._boot_epoch
+                t2 = t2_m + peer_boot_epoch
+                t3 = t3_m + peer_boot_epoch
+
+                rtt = (t4 - t1) - (t3 - t2)
+                theta = ((t2 - t1) + (t3 - t4)) / 2.0
+
+                # SUCCESS!
+                if st.state != "UP":
+                    log.info("[%s] Peer %s is UP", self.node_id, peer_id)
+                    st.state = "UP"
+
+                self._beacon_count += 1
+                st.good_samples += 1
+                st.theta_last = theta
+                st.last_theta_epoch = time.time()
+                self._update_link_jitter(peer_id, rtt)
+
+                # Bootstrap
+                did_bs = self._try_bootstrap(peer_id, peer_offset, theta)
+
+                # Queue measurement for control
+                if not did_bs:
+                    await self._measurement_queue.put((peer_id, rtt, theta, peer_offset))
+
+                # Log metrics
+                await self._log_link_metrics(peer_id, rtt, theta, client_ctx)
+
+                # Reset backoff
+                backoff = self._base_interval
+                await asyncio.sleep(self._base_interval)
+
+            except asyncio.TimeoutError:
+                # EXPECTED wenn Peer down
+                if st.state != "DOWN":
+                    log.warning("[%s] Peer %s timeout", self.node_id, peer_id)
+                    st.state = "DOWN"
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self._max_backoff)
+
+            except Exception as e:
+                # Network error, parse error, etc.
+                if st.state != "DOWN":
+                    log.warning("[%s] Peer %s error: %s", self.node_id, peer_id, type(e).__name__)
+                    st.state = "DOWN"
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self._max_backoff)
+
+    # -----------------------------------------------------------------
+    # ROBUST: Control Loop (verarbeitet Measurements)
+    # -----------------------------------------------------------------
+
+    async def _control_loop(self) -> None:
+        """
+        Sammelt Measurements von allen Peers und wendet Control an.
+        """
+        log.info("[%s] Starting control loop", self.node_id)
+
+        measurement_buffer: List[Measurement] = []
+        last_control = time.monotonic()
+
+        while True:
+            try:
+                # Sammle Measurements für control_interval
+                timeout = max(0.1, self._base_interval - (time.monotonic() - last_control))
+
+                try:
+                    meas = await asyncio.wait_for(
+                        self._measurement_queue.get(),
+                        timeout=timeout
+                    )
+                    measurement_buffer.append(meas)
+                except asyncio.TimeoutError:
+                    pass
+
+                # Apply control wenn genug Zeit vergangen
+                now = time.monotonic()
+                if now - last_control >= self._base_interval:
+                    if measurement_buffer:
+                        self._apply_global_control(measurement_buffer)
+                        measurement_buffer.clear()
+                    last_control = now
+
+            except Exception as e:
+                log.exception("[%s] Control loop error: %s", self.node_id, e)
+                await asyncio.sleep(1.0)
+
+    # -----------------------------------------------------------------
+    # ROBUST: Start/Stop
+    # -----------------------------------------------------------------
+
+    async def start(self, client_ctx: aiocoap.Context) -> None:
+        """
+        Startet alle Peer-Worker und Control-Loop.
+        ROBUST: Separate Tasks, kein Blocking.
+        """
+        if IS_WINDOWS or self._is_root:
+            log.info("[%s] Skipping beacon workers (Windows or Root)", self.node_id)
+            return
+
+        # Start control loop
+        self._worker_tasks.append(
+            spawn_task(self._control_loop(), f"{self.node_id}:control")
+        )
+
+        # Start peer workers
+        for peer_id in self.neighbors:
+            peer_ip = self.neighbor_ips.get(peer_id)
+            if not peer_ip:
+                log.warning("[%s] No IP for peer %s", self.node_id, peer_id)
                 continue
 
-            t1 = t1_m + self._boot_epoch
-            t4 = t4_m + self._boot_epoch
-            t2 = t2_m + peer_boot_epoch
-            t3 = t3_m + peer_boot_epoch
+            self._worker_tasks.append(
+                spawn_task(
+                    self._peer_worker(peer_id, peer_ip, client_ctx),
+                    f"{self.node_id}:peer:{peer_id}"
+                )
+            )
 
-            rtt = (t4 - t1) - (t3 - t2)
-            theta = ((t2 - t1) + (t3 - t4)) / 2.0
+        log.info("[%s] Started %d workers", self.node_id, len(self._worker_tasks))
 
-            self._beacon_count += 1
-            st = self._peer.setdefault(peer_id, PeerStats())
-            st.good_samples += 1
-            st.theta_last = theta
-            st.last_theta_epoch = time.time()
-            self._update_link_jitter(peer_id, rtt)
+    async def stop(self) -> None:
+        """Stoppt alle Worker."""
+        log.info("[%s] Stopping %d workers", self.node_id, len(self._worker_tasks))
 
-            did_bs = self._try_bootstrap(peer_id, peer_offset, theta)
+        for task in self._worker_tasks:
+            task.cancel()
 
-            if not did_bs:
-                meas.append((peer_id, rtt, theta, peer_offset))
-
-            # SIMPLIFIED: Direkt hier loggen/telemetrieren
-            await self._log_link_metrics(peer_id, rtt, theta, client_ctx)
-
-        if meas:
-            self._apply_global_control(meas)
-
-
-# asyncio import für await
-import asyncio
+        await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+        self._worker_tasks.clear()

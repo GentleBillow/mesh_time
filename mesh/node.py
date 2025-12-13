@@ -1,20 +1,13 @@
 # -*- coding: utf-8 -*-
-# mesh/node.py - SIMPLIFIED VERSION ohne Callback-Komplexität
-"""
-MeshNode — SIMPLIFIED mit direkter Telemetrie
-
-FIX: Keine Callbacks mehr, direkte IP-Übergabe an SyncModule.
-"""
+# mesh/node.py - ROBUST VERSION für sync_robust.py
 
 from __future__ import annotations
 
 import asyncio
 import json
-import math
+import logging
 import platform
 import time
-import zlib
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import aiocoap
@@ -27,12 +20,20 @@ from .sync import SyncModule
 
 IS_WINDOWS = platform.system() == "Windows"
 
+log = logging.getLogger("meshtime.node")
+
 
 class MeshNode:
     def __init__(self, node_id: str, node_cfg: Dict[str, Any], global_cfg: Dict[str, Any]) -> None:
         self.id = node_id
         self.cfg = node_cfg or {}
         self.global_cfg = global_cfg or {}
+
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
 
         # --- Stop flag ---
         self._stop = asyncio.Event()
@@ -43,7 +44,7 @@ class MeshNode:
         # --- LED ---
         self.led = self._init_led()
 
-        # --- Optional Storage (typisch nur C) ---
+        # --- Optional Storage ---
         self.storage = self._init_storage()
 
         # --- Neighbors & IP map ---
@@ -58,9 +59,9 @@ class MeshNode:
         # --- Sync config merge ---
         sync_cfg = self._merged_sync_cfg()
 
-        # SIMPLIFIED: Direkte IP-Übergabe statt Callback
+        # ROBUST: Direkte IP-Übergabe
         telemetry_ip = None
-        if self.storage is None:  # Nur wenn kein lokales Storage
+        if self.storage is None:
             telemetry_ip = self.telemetry_sink_ip
 
         self.sync = SyncModule(
@@ -69,11 +70,8 @@ class MeshNode:
             neighbor_ips=self.neighbor_ips,
             sync_cfg=sync_cfg,
             storage=self.storage,
-            telemetry_sink_ip=telemetry_ip,  # SIMPLIFIED
+            telemetry_sink_ip=telemetry_ip,
         )
-
-        # --- Optional button ---
-        self.button_pin = self.cfg.get("button_pin")
 
         # --- CoAP contexts ---
         self._coap_server_ctx: Optional[aiocoap.Context] = None
@@ -86,7 +84,7 @@ class MeshNode:
     def _init_led(self):
         led_pin = self.cfg.get("led_pin", None)
         if led_pin is None:
-            print(f"[{self.id}] no led_pin configured → LED disabled")
+            log.info("[%s] No led_pin configured → LED disabled", self.id)
             return None
 
         if IS_WINDOWS:
@@ -95,7 +93,7 @@ class MeshNode:
         try:
             return GrovePiLED(pin=led_pin)
         except Exception as e:
-            print(f"[{self.id}] GrovePiLED failed ({e}) → falling back to DummyLED")
+            log.warning("[%s] GrovePiLED failed (%s) → falling back to DummyLED", self.id, e)
             return DummyLED(pin=led_pin)
 
     def _init_storage(self) -> Optional[Storage]:
@@ -103,10 +101,10 @@ class MeshNode:
         if not db_path:
             return None
         try:
-            print(f"[{self.id}] Initializing local DB at {db_path}")
+            log.info("[%s] Initializing local DB at %s", self.id, db_path)
             return Storage(db_path)
         except Exception as e:
-            print(f"[{self.id}] Storage init failed ({e}) → DB disabled")
+            log.error("[%s] Storage init failed (%s) → DB disabled", self.id, e)
             return None
 
     def _resolve_ip(self, node_id: Optional[str]) -> Optional[str]:
@@ -150,60 +148,53 @@ class MeshNode:
             self._coap_client_ctx = None
 
     # ------------------------------------------------------------------
-    # Loops
+    # ROBUST: Sync Loop (simplified)
     # ------------------------------------------------------------------
 
     async def sync_loop(self) -> None:
-        """Periodically send sync beacons."""
-        print(f"[{self.id}] sync_loop started")
+        """
+        ROBUST: Startet einfach nur die Sync-Worker.
+        Kein slotting mehr nötig - jeder Peer-Worker managed sein Timing.
+        """
+        log.info("[%s] sync_loop started", self.id)
 
-        sync_global = (self.global_cfg.get("sync", {}) or {})
-        slot_ms = float(sync_global.get("beacon_slot_ms", 50.0))
-        n_slots = int(sync_global.get("beacon_n_slots", 8))
-        period_s = float(sync_global.get("beacon_period_s", 1.0))
-
-        h = zlib.crc32(self.id.encode("utf-8")) & 0xFFFFFFFF
-        slot_idx = h % max(1, n_slots)
-        phase_s = (slot_idx * slot_ms) / 1000.0
-
-        print(
-            f"[{self.id}] beacon slotting: slot_idx={slot_idx}/{n_slots}, "
-            f"phase={phase_s * 1000:.1f}ms, period={period_s:.2f}s"
-        )
-
-        while not self._stop.is_set():
-            if IS_WINDOWS:
+        if IS_WINDOWS:
+            log.info("[%s] Windows dev mode: skipping sync workers", self.id)
+            while not self._stop.is_set():
                 await asyncio.sleep(1.0)
-                continue
+            return
 
-            now = time.monotonic()
-            t0 = math.floor(now / period_s) * period_s
-            target = t0 + phase_s
-            if target <= now:
-                target += period_s
+        # Get client context
+        ctx = await self._ensure_client_ctx()
+        if ctx is None:
+            return
 
-            await asyncio.sleep(max(0.0, target - now))
+        try:
+            # ROBUST: Start all peer workers
+            await self.sync.start(ctx)
 
-            try:
-                ctx = await self._ensure_client_ctx()
-                if ctx is None:
-                    continue
-                await self.sync.send_beacons(ctx)
-            except Exception as e:
-                print(f"[{self.id}] sync_loop: send_beacons failed: {e}")
+            # Wait until stop
+            await self._stop.wait()
 
-        await self._shutdown_client_ctx()
+        finally:
+            # ROBUST: Stop all workers
+            await self.sync.stop()
+            await self._shutdown_client_ctx()
+
+    # ------------------------------------------------------------------
+    # Other loops (unchanged)
+    # ------------------------------------------------------------------
 
     async def sensor_loop(self) -> None:
-        print(f"[{self.id}] sensor_loop started")
+        log.info("[%s] sensor_loop started", self.id)
         while not self._stop.is_set():
             value = self.sensor.read()
             t_mesh = self.sync.mesh_time()
-            print(f"[{self.id}] sensor reading: value={value:.3f}, t_mesh={t_mesh:.3f}")
+            log.debug("[%s] sensor reading: value=%.3f, t_mesh=%.3f", self.id, value, t_mesh)
             await asyncio.sleep(1.0)
 
     async def led_loop(self) -> None:
-        print(f"[{self.id}] led_loop started")
+        log.info("[%s] led_loop started", self.id)
         while not self._stop.is_set():
             if self.led is not None:
                 self.led.update(self.sync.mesh_time())
@@ -212,7 +203,7 @@ class MeshNode:
     async def coap_loop(self) -> None:
         """Start the CoAP server."""
         if IS_WINDOWS:
-            print(f"[{self.id}] Windows dev mode: skipping CoAP server startup")
+            log.info("[%s] Windows dev mode: skipping CoAP server", self.id)
             while not self._stop.is_set():
                 await asyncio.sleep(3600)
             return
@@ -220,9 +211,9 @@ class MeshNode:
         site = build_site(self)
         try:
             self._coap_server_ctx = await aiocoap.Context.create_server_context(site)
-            print(f"[{self.id}] CoAP server started (aiocoap default bind)")
+            log.info("[%s] CoAP server started", self.id)
         except Exception as e:
-            print(f"[{self.id}] CoAP server failed to start: {e}")
+            log.error("[%s] CoAP server failed to start: %s", self.id, e)
             raise
 
         try:
@@ -231,8 +222,8 @@ class MeshNode:
             pass
 
     async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
-        """Loggt globalen Node-Status (kein peer_id)."""
-        print(f"[{self.id}] ntp_monitor_loop started (interval={interval}s)")
+        """Loggt globalen Node-Status."""
+        log.info("[%s] ntp_monitor_loop started (interval=%.1fs)", self.id, interval)
 
         while not self._stop.is_set():
             t_wall = time.time()
@@ -241,7 +232,7 @@ class MeshNode:
             offset = self.sync.get_offset()
             err = t_mesh - t_wall
 
-            # 1) Local DB: Globaler Status
+            # 1) Local DB
             if self.storage is not None:
                 try:
                     self.storage.insert_ntp_reference(
@@ -251,16 +242,18 @@ class MeshNode:
                         t_mesh=t_mesh,
                         offset=offset,
                         err_mesh_vs_wall=err,
-                        peer_id=None,  # Globaler Status
+                        peer_id=None,
                         theta_ms=None,
                         rtt_ms=None,
                         sigma_ms=None,
                     )
                 except Exception as e:
-                    print(f"[{self.id}] ntp_monitor_loop: local DB insert failed: {e}")
+                    log.error("[%s] ntp_monitor_loop: DB insert failed: %s", self.id, e)
 
-            # 2) Sink: Globaler Status via Telemetrie
-            if self.sync.is_warmed_up() and self.telemetry_sink_ip is not None:
+
+            # 2) Telemetry: IMMER senden (auch vor warmup), damit UI alle Nodes sieht.
+            # Warmup ist ein Regler/Sigma-Thema, aber fürs "Node lebt" + offset Plot wollen wir Daten ab Start.
+            if self.telemetry_sink_ip is not None:
                 try:
                     ctx = await self._ensure_client_ctx()
                     if ctx is not None:
@@ -272,6 +265,7 @@ class MeshNode:
                             "t_mesh": t_mesh,
                             "offset": offset,
                             "err_mesh_vs_wall": err,
+                            "warmed_up": bool(self.sync.is_warmed_up()),  # optional, nice for debug
                         }
                         req = aiocoap.Message(
                             code=aiocoap.POST,
@@ -279,17 +273,17 @@ class MeshNode:
                             payload=json.dumps(payload).encode("utf-8"),
                         )
                         await asyncio.wait_for(ctx.request(req).response, timeout=0.5)
+                except asyncio.TimeoutError:
+                    log.warning("[%s] ntp_monitor_loop: telemetry timeout", self.id)
                 except Exception as e:
-                    print(f"[{self.id}] ntp_monitor_loop: CoAP failed: {e}")
-
-            await asyncio.sleep(interval)
+                    log.warning("[%s] ntp_monitor_loop: telemetry failed: %s", self.id, type(e).__name__)
 
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
     async def run_async(self) -> None:
-        print(f"[{self.id}] MeshNode starting with cfg: {self.cfg}")
+        log.info("[%s] MeshNode starting with cfg: %s", self.id, self.cfg)
 
         tasks = []
         for coro, name in [
@@ -328,4 +322,4 @@ class MeshNode:
         try:
             asyncio.run(self.run_async())
         except KeyboardInterrupt:
-            print(f"[{self.id}] shutting down (KeyboardInterrupt)")
+            log.info("[%s] shutting down (KeyboardInterrupt)", self.id)

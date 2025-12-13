@@ -1,42 +1,30 @@
 {
   "sync": {
     "controller": "kalman",
-    "log_heartbeat": 1.0,
-
-    "pi": {
-      "kp": 0.05,
-      "ki": 0.001,
-      "i_max_ms": 500.0,
-      "i_leak": 0.1
-    },
-
-    "kalman": {
-      "q_offset": 1e-10,
-      "q_drift": 1e-13,
-      "q_bias": 1e-15,
-      "r_base": 5e-6,
-      "r_virtual": 1e-2
-    },
 
     "max_slew_per_second_ms": 5.0,
+
+    "coap_timeout_s": 0.6,
+    "beacon_period_s": 0.5,
+    "beacon_slot_ms": 50.0,
+    "beacon_n_slots": 8,
+
+    "min_beacons_for_warmup": 25,
+    "min_samples_before_log": 10,
+
+    "log_before_warmup": true,
 
     "jitter_window": 60,
     "min_samples_for_jitter": 25,
     "max_weight": 30000.0,
 
-    "min_beacons_for_warmup": 25,
-    "min_samples_before_log": 25,
-
-    "initial_offset_ms": 50.0,
-    "bootstrap_theta_max_s": 0.0,
-    "bootstrap_peers": [],
-
-    "drift_damping": 0.0,
-
-    "coap_timeout_s": 0.5,
-    "beacon_period_s": 0.5,
-    "beacon_slot_ms": 50.0,
-    "beacon_n_slots": 8,
+    "kalman": {
+      "q_offset": 1e-8,
+      "q_drift": 1e-11,
+      "q_bias": 1e-13,
+      "r_base": 2e-7,
+      "r_virtual": 1e-2
+    },
 
     "ui_window_s": 600,
     "ui_bin_s": 0.5,
@@ -55,6 +43,7 @@
   "B": {
     "ip": "192.168.178.48",
     "parent": "C",
+    "telemetry_sink": "C",
     "neighbors": ["C", "A"],
     "sensor_type": "potentiometer",
     "led_pin": 5
@@ -67,14 +56,13 @@
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
-    "sync": {
-      "is_root": false
-    }
+    "sync": { "is_root": false }
   },
 
   "D": {
     "ip": "192.168.178.59",
     "parent": "C",
+    "telemetry_sink": "C",
     "neighbors": ["A", "C"],
     "sensor_type": "potentiometer",
     "led_pin": 5,

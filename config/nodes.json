@@ -35,7 +35,7 @@
     "ip": "192.168.178.59",
     "parent": "B",
     "telemetry_sink": "C",
-    "neighbors": ["B", "D"],
+    "neighbors": ["C", "D"],
     "sensor_type": "potentiometer",
     "led_pin": 5
   },
@@ -52,7 +52,7 @@
   "C": {
     "ip": "192.168.178.49",
     "parent": null,
-    "neighbors": ["B", "D"],
+    "neighbors": ["A", "D"],
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",

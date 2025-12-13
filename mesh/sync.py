@@ -379,7 +379,6 @@ class SyncModule:
     # -----------------------------------------------------------------
 
     async def send_beacons(self, client_ctx: aiocoap.Context) -> None:
-        # DEBUG: Am Anfang der Funktion
         print(f"[DEBUG] {self.node_id}: send_beacons called, is_root={self._is_root}, IS_WINDOWS={IS_WINDOWS}")
 
         if IS_WINDOWS or self._is_root:
@@ -387,12 +386,16 @@ class SyncModule:
 
         meas: List[Measurement] = []
 
+        print(f"[DEBUG] {self.node_id}: Starting beacon loop, neighbors={self.neighbors}")
+
         for peer_id in self.neighbors:
             ip = self.neighbor_ips.get(peer_id)
             if not ip:
+                print(f"[DEBUG] {self.node_id}: No IP for {peer_id}, skipping")
                 continue
 
             uri = f"coap://{ip}/sync/beacon"
+            print(f"[DEBUG] {self.node_id} → {peer_id}: Sending beacon to {uri}")
 
             t1_m = time.monotonic()
             payload = {
@@ -406,7 +409,9 @@ class SyncModule:
             req = aiocoap.Message(code=aiocoap.POST, uri=uri, payload=json.dumps(payload).encode())
             try:
                 resp = await client_ctx.request(req).response
-            except Exception:
+                print(f"[DEBUG] {self.node_id} → {peer_id}: Got response!")
+            except Exception as e:
+                print(f"[DEBUG] {self.node_id} → {peer_id}: Request FAILED: {type(e).__name__}: {e}")
                 continue
 
             t4_m = time.monotonic()
@@ -417,7 +422,9 @@ class SyncModule:
                 t3_m = float(data["t3"])
                 peer_offset = float(data["offset"])
                 peer_boot_epoch = float(data.get("boot_epoch"))
-            except Exception:
+                print(f"[DEBUG] {self.node_id} → {peer_id}: Parsed response OK")
+            except Exception as e:
+                print(f"[DEBUG] {self.node_id} → {peer_id}: Parse FAILED: {type(e).__name__}: {e}")
                 continue
 
             t1 = t1_m + self._boot_epoch
@@ -439,9 +446,17 @@ class SyncModule:
 
             if not did_bs:
                 meas.append((peer_id, rtt, theta, peer_offset))
+                print(f"[DEBUG] {self.node_id} → {peer_id}: Added to measurements")
+            else:
+                print(f"[DEBUG] {self.node_id} → {peer_id}: Bootstrapped, skipping measurement")
 
-            # FIX: Logge Link-Metriken nach jedem erfolgreichen Beacon!
-            self._log_link_metrics(peer_id, rtt, theta)
+            # Link metrics logging
+            await self._log_link_metrics(peer_id, rtt, theta, client_ctx)
+
+        print(f"[DEBUG] {self.node_id}: Beacon loop done, collected {len(meas)} measurements")
 
         if meas:
+            print(f"[DEBUG] {self.node_id}: Calling _apply_global_control with {len(meas)} measurements")
             self._apply_global_control(meas)
+        else:
+            print(f"[DEBUG] {self.node_id}: NO measurements, skipping control")

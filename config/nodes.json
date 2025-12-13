@@ -2,7 +2,7 @@
   "sync": {
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 5.0,
+    "max_slew_per_second_ms": 1.0,
 
     "coap_timeout_s": 0.6,
     "beacon_period_s": 0.5,

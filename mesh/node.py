@@ -209,11 +209,26 @@ class MeshNode:
             return
 
         site = build_site(self)
+
+        log.info("[%s] CoAP server: creating server context…", self.id)
+
         try:
-            self._coap_server_ctx = await aiocoap.Context.create_server_context(site)
-            log.info("[%s] CoAP server started", self.id)
+            # Hard timeout, damit “hängen” sichtbar wird
+            self._coap_server_ctx = await asyncio.wait_for(
+                aiocoap.Context.create_server_context(
+                    site,
+                    bind=("0.0.0.0", 5683),  # IPv4 überall binden
+                ),
+                timeout=5.0,
+            )
+            log.info("[%s] CoAP server started on 0.0.0.0:5683", self.id)
+
+        except asyncio.TimeoutError:
+            log.error("[%s] CoAP server start TIMEOUT (create_server_context hung)", self.id)
+            raise
+
         except Exception as e:
-            log.error("[%s] CoAP server failed to start: %s", self.id, e)
+            log.exception("[%s] CoAP server failed to start", self.id)
             raise
 
         try:

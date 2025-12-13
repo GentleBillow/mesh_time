@@ -540,6 +540,7 @@ class SyncModule:
 
                     meas = await asyncio.wait_for(q.get(), timeout=timeout)
                     measurement_buffer.append(meas)
+
                 except asyncio.TimeoutError:
                     pass
 
@@ -551,10 +552,13 @@ class SyncModule:
                         measurement_buffer.clear()
                     last_control = now
 
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                log.info("[%s] Control loop cancelled", self.node_id)
+                return
+
             except Exception as e:
                 log.exception("[%s] Control loop error: %s", self.node_id, e)
                 await asyncio.sleep(1.0)
-
     # -----------------------------------------------------------------
     # ROBUST: Start/Stop
     # -----------------------------------------------------------------

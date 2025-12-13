@@ -2,7 +2,7 @@
   "sync": {
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 1.0,
+    "max_slew_per_second_ms": 5.0,
 
     "coap_timeout_s": 0.6,
     "beacon_period_s": 0.5,
@@ -19,12 +19,16 @@
     "max_weight": 30000.0,
 
     "kalman": {
-      "use_gauge": true,
+      "use_offset_gauge": true,
+      "r_offset_gauge": 1.0,
+
+      "use_bias_gauge": true,
+      "r_bias_gauge": 1e-2,
+
       "q_offset": 1e-8,
       "q_drift": 1e-14,
       "q_bias": 1e-13,
-      "r_base": 2e-7,
-      "r_virtual": 1.0
+      "r_base": 2e-7
     },
 
     "ui_window_s": 600,

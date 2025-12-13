@@ -16,6 +16,10 @@ class KalmanController:
 
     Measurements:
       z_ij = peer_offset - theta_ij ≈ offset - bias_ij
+
+    Gauges (optional, independent):
+      - Offset gauge: anchors absolute offset to 0 (removes global offset ambiguity)
+      - Bias gauge:   softly prefers per-peer bias ≈ 0 (prevents bias random-walk / overfitting)
     """
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
@@ -28,6 +32,13 @@ class KalmanController:
 
         # Measurement noise base
         self.r_base = float(cfg.get("r_base", 1e-6))
+
+        # Gauge config
+        self.use_offset_gauge = bool(cfg.get("use_offset_gauge", cfg.get("use_gauge", False)))
+        self.r_offset_gauge   = float(cfg.get("r_offset_gauge", cfg.get("r_virtual", 1e-2)))
+
+        self.use_bias_gauge   = bool(cfg.get("use_bias_gauge", False))
+        self.r_bias_gauge     = float(cfg.get("r_bias_gauge", 1e-2))
 
         # Internal state (initialized lazily)
         self._x = None           # state vector
@@ -45,9 +56,7 @@ class KalmanController:
     # ------------------------------------------------------------
 
     def _ensure_state(self, peers: List[str]) -> None:
-        """
-        Ensure state vector contains all peers in deterministic order.
-        """
+        """Ensure state vector contains all peers in deterministic order."""
         for p in sorted(peers):
             if p not in self._peer_index:
                 self._peer_index[p] = len(self._peer_index)
@@ -79,6 +88,18 @@ class KalmanController:
 
     # ------------------------------------------------------------
 
+    @staticmethod
+    def _kf_update(x: np.ndarray, P: np.ndarray, H: np.ndarray, z: float, R: float) -> tuple[np.ndarray, np.ndarray]:
+        """Generic scalar measurement update."""
+        y = np.array([[z]]) - (H @ x)
+        S = (H @ P @ H.T) + np.array([[R]])
+        K = P @ H.T @ np.linalg.inv(S)
+        x = x + (K @ y)
+        P = (np.eye(P.shape[0]) - (K @ H)) @ P
+        return x, P
+
+    # ------------------------------------------------------------
+
     def compute_delta(
         self,
         offset_s: float,
@@ -86,7 +107,6 @@ class KalmanController:
         weight_fn: WeightFn,
         dt_s: float,
     ) -> float:
-
         if not measurements:
             return 0.0
 
@@ -95,7 +115,6 @@ class KalmanController:
 
         x = self._x
         P = self._P
-
         dim = x.shape[0]
 
         # ---------------- Prediction ----------------
@@ -105,62 +124,56 @@ class KalmanController:
         Q = np.zeros((dim, dim))
         Q[0, 0] = self.q_offset * dt_s
         Q[1, 1] = self.q_drift * dt_s
-        for _, idx in self._peer_index.items():
-            Q[2 + idx, 2 + idx] = self.q_bias * dt_s
+        for _, bidx in self._peer_index.items():
+            Q[2 + bidx, 2 + bidx] = self.q_bias * dt_s
 
         x = F @ x
         P = F @ P @ F.T + Q
 
         # ---------------- Update (per measurement) ----------------
         for peer_id, _rtt, theta, peer_offset in measurements:
-            bias_idx = self._peer_index[peer_id]
-            idx = 2 + bias_idx
+            bidx = self._peer_index[peer_id]
+            idx = 2 + bidx
 
-            z = peer_offset - theta
+            z = peer_offset - theta  # ≈ offset - bias_peer
 
             H = np.zeros((1, dim))
             H[0, 0] = 1.0
             H[0, idx] = -1.0
 
             w = float(weight_fn(peer_id))
-            R = np.array([[self.r_base / max(w, 1e-9)]])
+            R = float(self.r_base / max(w, 1e-9))
 
-            y = np.array([[z]]) - H @ x
-            S = H @ P @ H.T + R
-            K = P @ H.T @ np.linalg.inv(S)
-
-            x = x + K @ y
-            P = (np.eye(dim) - K @ H) @ P
-
+            x, P = self._kf_update(x, P, H, z=float(z), R=R)
 
         # ==========================================================
-        # Optional virtual gauge (fixes global offset ambiguity)
+        # Optional gauges (independent)
         # ==========================================================
-        if self.cfg.get("use_gauge", False):
+
+        # --- Offset gauge: offset ≈ 0
+        if self.use_offset_gauge:
             H = np.zeros((1, dim))
             H[0, 0] = 1.0
+            x, P = self._kf_update(x, P, H, z=0.0, R=float(self.r_offset_gauge))
 
-            z = np.array([[0.0]])
-
-            R_virtual = np.array([
-                [float(self.cfg.get("r_virtual", 1e-2))]
-            ])
-
-            y = z - H @ x
-            S = H @ P @ H.T + R_virtual
-            K = P @ H.T @ np.linalg.inv(S)
-
-            x = x + K @ y
-            P = (np.eye(dim) - K @ H) @ P
+        # --- Bias gauge: bias_peer ≈ 0  (applied per known peer)
+        if self.use_bias_gauge and self._peer_index:
+            for _peer, bidx in self._peer_index.items():
+                idx = 2 + bidx
+                H = np.zeros((1, dim))
+                H[0, idx] = 1.0
+                x, P = self._kf_update(x, P, H, z=0.0, R=float(self.r_bias_gauge))
 
         # ---------------- Output ----------------
-        old_offset = offset_s
+        old_offset = float(offset_s)
         new_offset = float(x[0, 0])
 
         self._x = x
         self._P = P
 
         return new_offset - old_offset
+
+    # ------------------------------------------------------------
 
     def commit_applied_offset(self, offset_s: float) -> None:
         """
@@ -187,4 +200,10 @@ class KalmanController:
             "offset_ms": float(self._x[0, 0] * 1000.0),
             "drift_ppm": float(self._x[1, 0] * 1e6),
             "bias_ms": bias_ms,
+            "gauges": {
+                "use_offset_gauge": self.use_offset_gauge,
+                "r_offset_gauge": float(self.r_offset_gauge),
+                "use_bias_gauge": self.use_bias_gauge,
+                "r_bias_gauge": float(self.r_bias_gauge),
+            }
         }

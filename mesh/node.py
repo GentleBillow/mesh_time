@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-# mesh/node.py - FIXED VERSION mit Link-Metrics Telemetrie
+# mesh/node.py - SIMPLIFIED VERSION ohne Callback-Komplexität
 """
-MeshNode — mit Link-Metrics Telemetrie Support
+MeshNode — SIMPLIFIED mit direkter Telemetrie
 
-FIX: Sendet Link-Metriken (theta, rtt, sigma) von Nodes ohne Storage
-via CoAP an den Sink.
+FIX: Keine Callbacks mehr, direkte IP-Übergabe an SyncModule.
 """
 
 from __future__ import annotations
@@ -56,13 +55,13 @@ class MeshNode:
         self.telemetry_sink_id = self.cfg.get("telemetry_sink") or self.parent or "C"
         self.telemetry_sink_ip = self._resolve_ip(self.telemetry_sink_id)
 
-        # --- Sync config merge: global defaults + node overrides ---
+        # --- Sync config merge ---
         sync_cfg = self._merged_sync_cfg()
 
-        # FIX: Telemetrie-Callback für Nodes OHNE Storage
-        telemetry_callback = None
-        if self.storage is None and self.telemetry_sink_ip is not None:
-            telemetry_callback = self._create_telemetry_callback()
+        # SIMPLIFIED: Direkte IP-Übergabe statt Callback
+        telemetry_ip = None
+        if self.storage is None:  # Nur wenn kein lokales Storage
+            telemetry_ip = self.telemetry_sink_ip
 
         self.sync = SyncModule(
             node_id=self.id,
@@ -70,10 +69,10 @@ class MeshNode:
             neighbor_ips=self.neighbor_ips,
             sync_cfg=sync_cfg,
             storage=self.storage,
-            telemetry_callback=telemetry_callback,  # FIX: Callback übergeben
+            telemetry_sink_ip=telemetry_ip,  # SIMPLIFIED
         )
 
-        # --- Optional button (not used here, but kept) ---
+        # --- Optional button ---
         self.button_pin = self.cfg.get("button_pin")
 
         # --- CoAP contexts ---
@@ -132,68 +131,6 @@ class MeshNode:
         return merged
 
     # ------------------------------------------------------------------
-    # FIX: Telemetrie-Callback für Link-Metriken
-    # ------------------------------------------------------------------
-
-    def _create_telemetry_callback(self):
-        """
-        Erstellt einen Callback der Link-Metriken via CoAP an den Sink sendet.
-        Wird von sync.py aufgerufen wenn KEIN lokales Storage vorhanden ist.
-        """
-
-        async def send_link_metrics(peer_id: str, theta_ms: float, rtt_ms: float, sigma_ms: Optional[float]):
-            """Sendet Link-Metriken an den Sink via CoAP."""
-            if IS_WINDOWS:
-                return
-
-            try:
-                ctx = await self._ensure_client_ctx()
-                if ctx is None:
-                    return
-
-                uri = f"coap://{self.telemetry_sink_ip}/relay/ingest/link"
-
-                t_wall = time.time()
-                t_mono = time.monotonic()
-                t_mesh = self.sync.mesh_time()
-
-                payload = {
-                    "node_id": self.id,
-                    "peer_id": peer_id,
-                    "theta_ms": theta_ms,
-                    "rtt_ms": rtt_ms,
-                    "sigma_ms": sigma_ms,
-                    "t_wall": t_wall,
-                    "t_mono": t_mono,
-                    "t_mesh": t_mesh,
-                    "offset": self.sync.get_offset(),
-                }
-
-                req = aiocoap.Message(
-                    code=aiocoap.POST,
-                    uri=uri,
-                    payload=json.dumps(payload).encode("utf-8"),
-                )
-                await asyncio.wait_for(ctx.request(req).response, timeout=0.5)
-
-            except Exception as e:
-                # Silent fail - Link-Telemetrie ist optional
-                pass
-
-        # Wrapper: async -> sync bridge
-        def callback(peer_id: str, theta_ms: float, rtt_ms: float, sigma_ms: Optional[float]):
-            """Sync wrapper der async Task erstellt."""
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Schedule as task
-                    asyncio.create_task(send_link_metrics(peer_id, theta_ms, rtt_ms, sigma_ms))
-            except Exception:
-                pass
-
-        return callback
-
-    # ------------------------------------------------------------------
     # CoAP contexts
     # ------------------------------------------------------------------
 
@@ -217,10 +154,7 @@ class MeshNode:
     # ------------------------------------------------------------------
 
     async def sync_loop(self) -> None:
-        """
-        Periodically send sync beacons (deterministic slotting).
-        Uses a persistent CoAP client context to reduce jitter/overhead.
-        """
+        """Periodically send sync beacons."""
         print(f"[{self.id}] sync_loop started")
 
         sync_global = (self.global_cfg.get("sync", {}) or {})
@@ -258,7 +192,6 @@ class MeshNode:
             except Exception as e:
                 print(f"[{self.id}] sync_loop: send_beacons failed: {e}")
 
-        # cleanup
         await self._shutdown_client_ctx()
 
     async def sensor_loop(self) -> None:
@@ -277,9 +210,7 @@ class MeshNode:
             await asyncio.sleep(0.01)
 
     async def coap_loop(self) -> None:
-        """
-        Start the CoAP server. On Windows dev mode: skip server.
-        """
+        """Start the CoAP server."""
         if IS_WINDOWS:
             print(f"[{self.id}] Windows dev mode: skipping CoAP server startup")
             while not self._stop.is_set():
@@ -300,9 +231,7 @@ class MeshNode:
             pass
 
     async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
-        """
-        FIX: Loggt globalen Offset UND sendet Link-Metriken via Telemetrie.
-        """
+        """Loggt globalen Node-Status (kein peer_id)."""
         print(f"[{self.id}] ntp_monitor_loop started (interval={interval}s)")
 
         while not self._stop.is_set():
@@ -312,7 +241,7 @@ class MeshNode:
             offset = self.sync.get_offset()
             err = t_mesh - t_wall
 
-            # 1) Local DB: IMMER globalen Offset loggen
+            # 1) Local DB: Globaler Status
             if self.storage is not None:
                 try:
                     self.storage.insert_ntp_reference(
@@ -322,7 +251,7 @@ class MeshNode:
                         t_mesh=t_mesh,
                         offset=offset,
                         err_mesh_vs_wall=err,
-                        peer_id=None,  # Globaler Status hat kein peer_id
+                        peer_id=None,  # Globaler Status
                         theta_ms=None,
                         rtt_ms=None,
                         sigma_ms=None,
@@ -330,7 +259,7 @@ class MeshNode:
                 except Exception as e:
                     print(f"[{self.id}] ntp_monitor_loop: local DB insert failed: {e}")
 
-            # 2) Sink: Sende globalen Status (ohne Link-Metriken)
+            # 2) Sink: Globaler Status via Telemetrie
             if self.sync.is_warmed_up() and self.telemetry_sink_ip is not None:
                 try:
                     ctx = await self._ensure_client_ctx()
@@ -371,7 +300,6 @@ class MeshNode:
             (self.ntp_monitor_loop(), f"{self.id}:ntp"),
         ]:
             t = asyncio.create_task(coro)
-            # Python >=3.8 only — safe guard for 3.7
             if hasattr(t, "set_name"):
                 t.set_name(name)
             tasks.append(t)

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# mesh/node.py - ROBUST VERSION für sync_robust.py
+# mesh/node.py - ROBUST VERSION (Py3.7 safe, no cross-loop primitives)
 
 from __future__ import annotations
 
@@ -29,14 +29,17 @@ class MeshNode:
         self.cfg = node_cfg or {}
         self.global_cfg = global_cfg or {}
 
-        # Setup logging
+        # Logging config (idempotent-ish, OK for your project usage)
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
-        # --- Stop flag ---
-        self._stop = asyncio.Event()
+        # NOTE: NEVER create asyncio primitives (Event/Queue/Lock) here.
+        # They would bind to whichever loop happens to be current, and Py3.7 will bite you.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stop: Optional[asyncio.Event] = None
+        self._coap_ready: Optional[asyncio.Event] = None
 
         # --- Sensor ---
         self.sensor = DummySensor(sensor_type=self.cfg.get("sensor_type", "dummy"))
@@ -59,7 +62,6 @@ class MeshNode:
         # --- Sync config merge ---
         sync_cfg = self._merged_sync_cfg()
 
-        # ROBUST: Direkte IP-Übergabe
         telemetry_ip = None
         if self.storage is None:
             telemetry_ip = self.telemetry_sink_ip
@@ -76,7 +78,6 @@ class MeshNode:
         # --- CoAP contexts ---
         self._coap_server_ctx: Optional[aiocoap.Context] = None
         self._coap_client_ctx: Optional[aiocoap.Context] = None
-        self._coap_ready = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -130,7 +131,7 @@ class MeshNode:
         return merged
 
     # ------------------------------------------------------------------
-    # CoAP contexts
+    # CoAP client context
     # ------------------------------------------------------------------
 
     async def _ensure_client_ctx(self) -> Optional[aiocoap.Context]:
@@ -149,112 +150,53 @@ class MeshNode:
             self._coap_client_ctx = None
 
     # ------------------------------------------------------------------
-    # ROBUST: Sync Loop (simplified)
+    # Loops
     # ------------------------------------------------------------------
 
     async def sync_loop(self) -> None:
-        """
-        ROBUST: Startet einfach nur die Sync-Worker.
-        Kein slotting mehr nötig - jeder Peer-Worker managed sein Timing.
-        """
+        """Start sync workers and wait for stop."""
+        assert self._stop is not None
+
         log.info("[%s] sync_loop started", self.id)
 
         if IS_WINDOWS:
             log.info("[%s] Windows dev mode: skipping sync workers", self.id)
-            while not self._stop.is_set():
-                await asyncio.sleep(1.0)
+            await self._stop.wait()
             return
 
-        # Get client context
         ctx = await self._ensure_client_ctx()
         if ctx is None:
             return
 
         try:
-            # ROBUST: Start all peer workers
             await self.sync.start(ctx)
-
-            # Wait until stop
             await self._stop.wait()
-
         finally:
-            # ROBUST: Stop all workers
             await self.sync.stop()
             await self._shutdown_client_ctx()
 
-    # ------------------------------------------------------------------
-    # Other loops (unchanged)
-    # ------------------------------------------------------------------
-
     async def sensor_loop(self) -> None:
+        assert self._stop is not None
         log.info("[%s] sensor_loop started", self.id)
+
         while not self._stop.is_set():
-            value = self.sensor.read()
-            t_mesh = self.sync.mesh_time()
-            log.debug("[%s] sensor reading: value=%.3f, t_mesh=%.3f", self.id, value, t_mesh)
+            _ = self.sensor.read()
+            _ = self.sync.mesh_time()
             await asyncio.sleep(1.0)
 
     async def led_loop(self) -> None:
+        assert self._stop is not None
         log.info("[%s] led_loop started", self.id)
+
         while not self._stop.is_set():
             if self.led is not None:
                 self.led.update(self.sync.mesh_time())
             await asyncio.sleep(0.01)
 
-    async def coap_loop(self) -> None:
-        """Start the CoAP server."""
-        if IS_WINDOWS:
-            log.info("[%s] Windows dev mode: skipping CoAP server", self.id)
-            while not self._stop.is_set():
-                await asyncio.sleep(3600)
-            return
-
-        site = build_site(self)
-
-        bind_ip = "0.0.0.0"
-        bind_port = 5683
-
-        log.info("[%s] CoAP server: creating server context… bind=%s:%d", self.id, bind_ip, bind_port)
-
-        # Make it an explicit task so we can cancel without deadlocking on cancellation
-        task = asyncio.create_task(
-            aiocoap.Context.create_server_context(site, bind=(bind_ip, bind_port))
-        )
-
-        try:
-            self._coap_server_ctx = await asyncio.wait_for(task, timeout=3.0)
-            log.info("[%s] CoAP server started (bind=%s:%d)", self.id, bind_ip, bind_port)
-            self._coap_ready.set()
-
-
-        except asyncio.TimeoutError:
-            log.error("[%s] CoAP server start TIMEOUT (bind=%s:%d)", self.id, bind_ip, bind_port)
-            log.error("[%s] coap task done=%s cancelled=%s", self.id, task.done(), task.cancelled())
-            self._coap_ready.set()  # damit run_async nicht ewig wartet
-
-            task.cancel()
-            raise
-
-        except asyncio.CancelledError:
-            log.exception("[%s] CoAP server cancelled!", self.id)
-            self._coap_ready.set()  # damit run_async nicht ewig wartet
-            task.cancel()
-            raise
-
-        except Exception:
-            log.exception("[%s] CoAP server failed to start", self.id)
-            self._coap_ready.set()  # damit run_async nicht ewig wartet
-            task.cancel()
-            raise
-
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            pass
-
-
     async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
-        """Loggt globalen Node-Status."""
+        """Periodic telemetry + optional local DB logging."""
+        assert self._stop is not None
+
         log.info("[%s] ntp_monitor_loop started (interval=%.1fs)", self.id, interval)
 
         while not self._stop.is_set():
@@ -282,9 +224,7 @@ class MeshNode:
                 except Exception as e:
                     log.error("[%s] ntp_monitor_loop: DB insert failed: %s", self.id, e)
 
-
-            # 2) Telemetry: IMMER senden (auch vor warmup), damit UI alle Nodes sieht.
-            # Warmup ist ein Regler/Sigma-Thema, aber fürs "Node lebt" + offset Plot wollen wir Daten ab Start.
+            # 2) Telemetry (best effort)
             if self.telemetry_sink_ip is not None:
                 try:
                     ctx = await self._ensure_client_ctx()
@@ -297,7 +237,7 @@ class MeshNode:
                             "t_mesh": t_mesh,
                             "offset": offset,
                             "err_mesh_vs_wall": err,
-                            "warmed_up": bool(self.sync.is_warmed_up()),  # optional, nice for debug
+                            "warmed_up": bool(self.sync.is_warmed_up()),
                         }
                         req = aiocoap.Message(
                             code=aiocoap.POST,
@@ -310,28 +250,92 @@ class MeshNode:
                 except Exception as e:
                     log.warning("[%s] ntp_monitor_loop: telemetry failed: %s", self.id, type(e).__name__)
 
+            await asyncio.sleep(interval)
+
+    async def coap_loop(self) -> None:
+        """Start CoAP server with hard timeout; always signals _coap_ready."""
+        assert self._stop is not None
+        assert self._coap_ready is not None
+
+        if IS_WINDOWS:
+            log.info("[%s] Windows dev mode: skipping CoAP server", self.id)
+            self._coap_ready.set()
+            await self._stop.wait()
+            return
+
+        site = build_site(self)
+
+        bind_ip = "0.0.0.0"
+        bind_port = 5683
+
+        task: Optional[asyncio.Task] = None
+        try:
+            log.info("[%s] CoAP server: creating server context… bind=%s:%d", self.id, bind_ip, bind_port)
+
+            # explicit task so we can cancel it on timeout safely
+            task = asyncio.create_task(
+                aiocoap.Context.create_server_context(site, bind=(bind_ip, bind_port))
+            )
+
+            self._coap_server_ctx = await asyncio.wait_for(task, timeout=3.0)
+            log.info("[%s] CoAP server started (bind=%s:%d)", self.id, bind_ip, bind_port)
+
+        except asyncio.TimeoutError:
+            log.error("[%s] CoAP server start TIMEOUT (bind=%s:%d)", self.id, bind_ip, bind_port)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
+        except asyncio.CancelledError:
+            # normal during shutdown if run_async cancels us
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
+        except Exception as e:
+            log.exception("[%s] CoAP server failed to start: %s", self.id, e)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
+
+        finally:
+            # ALWAYS unblock run_async (success or failure)
+            self._coap_ready.set()
+
+        # Keep alive until stop; shutdown is handled in run_async finally
+        await self._stop.wait()
+
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
     async def run_async(self) -> None:
+        self._loop = asyncio.get_running_loop()
+
+        # Create asyncio primitives ONLY here (bound to the correct running loop)
+        self._stop = asyncio.Event()
+        self._coap_ready = asyncio.Event()
+
         log.info("[%s] MeshNode starting with cfg: %s", self.id, self.cfg)
 
         tasks = []
 
-        # 1) CoAP zuerst starten
+        # 1) Start CoAP first
         coap_task = asyncio.create_task(self.coap_loop())
         if hasattr(coap_task, "set_name"):
             coap_task.set_name(f"{self.id}:coap")
         tasks.append(coap_task)
 
-        # 2) Warten bis CoAP ready ist (oder timeout)
+        # 2) Wait until CoAP signals ready (or timeout); proceed either way
         try:
             await asyncio.wait_for(self._coap_ready.wait(), timeout=4.0)
         except asyncio.TimeoutError:
             log.warning("[%s] CoAP ready wait TIMEOUT – continuing anyway", self.id)
 
-        # 3) Erst dann Sync / Sensor / LED / Monitor starten
+        # 3) Start remaining loops
         for coro, name in [
             (self.sync_loop(), f"{self.id}:sync"),
             (self.sensor_loop(), f"{self.id}:sensor"),
@@ -348,12 +352,20 @@ class MeshNode:
         except asyncio.CancelledError:
             pass
         finally:
-            self._stop.set()
+            # Signal stop first
+            if self._stop is not None:
+                self._stop.set()
+
+            # Cancel all tasks
             for t in tasks:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Shutdown client ctx
             await self._shutdown_client_ctx()
+
+            # Shutdown server ctx
             if self._coap_server_ctx is not None:
                 try:
                     await self._coap_server_ctx.shutdown()

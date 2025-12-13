@@ -332,6 +332,21 @@ def get_ntp_timeseries(
                 delta_ms = off[a] - off[b]
                 pairs.setdefault(pair_id, []).append({"t_wall": t_bin, "delta_ms": delta_ms, "bin": float(idx)})
 
+    # ------------------------------------------------------------
+    # UI Mean-Centering (PAIRWISE):
+    # Jede ΔOffset-Kurve pro Paar um ihren Mittelwert zentrieren,
+    # damit sie visuell um 0 liegt (Konvergenz erkennbarer).
+    # ------------------------------------------------------------
+    pair_means: Dict[str, float] = {}
+    for pair_id, pts in pairs.items():
+        if not pts:
+            continue
+        m = sum(float(p["delta_ms"]) for p in pts) / len(pts)
+        pair_means[pair_id] = m
+        for p in pts:
+            p["delta_ms"] = float(p["delta_ms"]) - m
+
+
     jitter: Dict[str, Dict[str, float]] = {}
     for pair_id, pts in pairs.items():
         if len(pts) < JITTER_MIN_SAMPLES:

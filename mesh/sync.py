@@ -366,6 +366,9 @@ class SyncModule:
     # -----------------------------------------------------------------
 
     async def send_beacons(self, client_ctx: aiocoap.Context) -> None:
+        # DEBUG: Am Anfang der Funktion
+        print(f"[DEBUG] {self.node_id}: send_beacons called, is_root={self._is_root}, IS_WINDOWS={IS_WINDOWS}")
+
         if IS_WINDOWS or self._is_root:
             return
 

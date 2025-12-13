@@ -2,7 +2,7 @@
   "sync": {
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 5.0,
+    "max_slew_per_second_ms": 50.0,
 
     "coap_timeout_s": 0.6,
     "beacon_period_s": 0.5,
@@ -48,7 +48,7 @@
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
-    "sync": { "is_root": false }
+    "sync": { "is_root": true }
   },
 
   "B": {

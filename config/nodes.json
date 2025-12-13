@@ -19,8 +19,9 @@
     "max_weight": 30000.0,
 
     "kalman": {
+      "use_gauge": false,
       "q_offset": 1e-8,
-      "q_drift": 1e-11,
+      "q_drift": 0.0,
       "q_bias": 1e-13,
       "r_base": 2e-7,
       "r_virtual": 1e-2
@@ -33,18 +34,9 @@
 
   "A": {
     "ip": "192.168.178.59",
-    "parent": "B",
-    "telemetry_sink": "C",
-    "neighbors": ["C", "D"],
-    "sensor_type": "potentiometer",
-    "led_pin": 5
-  },
-
-  "B": {
-    "ip": "192.168.178.48",
     "parent": "C",
     "telemetry_sink": "C",
-    "neighbors": ["C", "A"],
+    "neighbors": ["C", "B"],
     "sensor_type": "potentiometer",
     "led_pin": 5
   },
@@ -52,14 +44,14 @@
   "C": {
     "ip": "192.168.178.49",
     "parent": null,
-    "neighbors": ["A", "D"],
+    "neighbors": ["A", "B"],
     "sensor_type": "potentiometer",
     "led_pin": 5,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
     "sync": { "is_root": false }
   },
 
-  "D": {
+  "B": {
     "ip": "192.168.178.60",
     "parent": "C",
     "telemetry_sink": "C",

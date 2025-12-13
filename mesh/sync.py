@@ -324,15 +324,20 @@ class SyncModule:
 
     def _apply_global_control(self, meas: List[Measurement]) -> None:
         dt = self._compute_dt()
-        delta = self._controller.compute_delta(self._offset, meas, self._weight_for_peer, dt)
-        delta = self._global_slew_clip(delta, dt)
-        self._offset += delta
+
+        delta_desired = self._controller.compute_delta(
+            self._offset, meas, self._weight_for_peer, dt
+        )
+
+        delta_applied = self._global_slew_clip(delta_desired, dt)
+        self._offset += delta_applied
+
+        # 🔴 CRITICAL: tell controller what actually happened
+        if hasattr(self._controller, "commit_applied_offset"):
+            self._controller.commit_applied_offset(self._offset)
 
         if self._drift_damping > 0.0:
             self._offset *= max(0.0, 1.0 - self._drift_damping * dt)
-
-        log.info("[%s] control: n_meas=%d, Δ=%.3f ms, offset=%.3f ms",
-                 self.node_id, len(meas), delta * 1000, self._offset * 1000)
 
     # -----------------------------------------------------------------
     # ROBUST: Link Metrics Logging (mit Timeout)

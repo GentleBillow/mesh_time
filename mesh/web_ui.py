@@ -287,6 +287,13 @@ def get_ntp_timeseries(
         if (prev is None) or (t >= prev[0]):
             bucket[node] = (t, offset_ms)
 
+    for idx, bucket in bins.items():
+        if len(bucket) < 2:
+            continue
+        mean = sum(off for (_t, off) in bucket.values()) / len(bucket)
+        for node, (t_last, off_ms) in list(bucket.items()):
+            bucket[node] = (t_last, off_ms - mean)
+
     series: Dict[str, List[Dict[str, float]]] = {}
     for idx in sorted(bins.keys()):
         bucket = bins[idx]

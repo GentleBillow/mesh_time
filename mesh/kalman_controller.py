@@ -132,25 +132,26 @@ class KalmanController:
             x = x + K @ y
             P = (np.eye(dim) - K @ H) @ P
 
+
         # ==========================================================
-        # Virtual gauge measurement (ONCE per cycle)
-        # z = 0 ≈ offset   with large R
+        # Optional virtual gauge (fixes global offset ambiguity)
         # ==========================================================
-        H = np.zeros((1, dim))
-        H[0, 0] = 1.0           # only offset
+        if self.cfg.get("use_gauge", False):
+            H = np.zeros((1, dim))
+            H[0, 0] = 1.0
 
-        z = np.array([[0.0]])   # mean offset = 0
+            z = np.array([[0.0]])
 
-        R_virtual = np.array([
-            [self.cfg.get("r_virtual", 1e-2)]
-        ])
+            R_virtual = np.array([
+                [float(self.cfg.get("r_virtual", 1e-2))]
+            ])
 
-        y = z - H @ x
-        S = H @ P @ H.T + R_virtual
-        K = P @ H.T @ np.linalg.inv(S)
+            y = z - H @ x
+            S = H @ P @ H.T + R_virtual
+            K = P @ H.T @ np.linalg.inv(S)
 
-        x = x + K @ y
-        P = (np.eye(dim) - K @ H) @ P
+            x = x + K @ y
+            P = (np.eye(dim) - K @ H) @ P
 
         # ---------------- Output ----------------
         old_offset = offset_s
@@ -161,6 +162,13 @@ class KalmanController:
 
         return new_offset - old_offset
 
+    def commit_applied_offset(self, offset_s: float) -> None:
+        """
+        HARD state alignment.
+        Must be called after slew-limited offset was applied.
+        """
+        if self._x is not None:
+            self._x[0, 0] = float(offset_s)
 
     # ------------------------------------------------------------
 

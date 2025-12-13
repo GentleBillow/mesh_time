@@ -302,15 +302,28 @@ class SyncModule:
         return max(-max_step, min(max_step, delta_s))
 
     def _apply_global_control(self, meas: List[Measurement]) -> None:
+        if not meas:
+            print(f"[{self.node_id}] WARNING: No measurements for control!")
+            return
+
         dt = self._compute_dt()
-        delta = self._controller.compute_delta(self._offset, meas, self._weight_for_peer, dt)
+
+        try:
+            delta = self._controller.compute_delta(self._offset, meas, self._weight_for_peer, dt)
+        except Exception as e:
+            print(f"[{self.node_id}] ERROR in controller: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
         delta = self._global_slew_clip(delta, dt)
-        self._offset += delta
 
-        if self._drift_damping > 0.0:
-            self._offset *= max(0.0, 1.0 - self._drift_damping * dt)
+        # DEBUG
+        print(
+            f"[{self.node_id}] control: n_meas={len(meas)}, Δ={delta * 1000:.3f} ms, offset={self._offset * 1000:.3f} ms")
 
-        print(f"[{self.node_id}] control: Δ={delta * 1000:.3f} ms, offset={self._offset * 1000:.3f} ms")
+        if abs(delta * 1000) > 50:  # Warnung bei großen Sprüngen
+            print(f"[{self.node_id}] WARNING: Large delta! {delta * 1000:.1f} ms")
 
     # -----------------------------------------------------------------
     # FIX: Link Metrics Logging/Telemetry

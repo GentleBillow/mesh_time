@@ -19,7 +19,7 @@
     "max_weight": 30000.0,
 
     "kalman": {
-      "use_gauge": false,
+      "use_gauge": true,
       "q_offset": 1e-8,
       "q_drift": 0.0,
       "q_bias": 1e-13,

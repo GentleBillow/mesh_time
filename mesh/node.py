@@ -210,32 +210,28 @@ class MeshNode:
 
         site = build_site(self)
 
-        log.info("[%s] CoAP server: creating server context…", self.id)
-
         try:
-            # Hard timeout, damit “hängen” sichtbar wird
+            log.info("[%s] CoAP server: creating server context…", self.id)
+
+            # FIX: explicit bind + timeout (prevents "hang forever")
             self._coap_server_ctx = await asyncio.wait_for(
-                aiocoap.Context.create_server_context(
-                    site,
-                    bind=("0.0.0.0", 5683),  # IPv4 überall binden
-                ),
-                timeout=5.0,
+                aiocoap.Context.create_server_context(site, bind=("0.0.0.0", 5683)),
+                timeout=3.0
             )
-            log.info("[%s] CoAP server started on 0.0.0.0:5683", self.id)
+
+            log.info("[%s] CoAP server started", self.id)
 
         except asyncio.TimeoutError:
-            log.error("[%s] CoAP server start TIMEOUT (create_server_context hung)", self.id)
+            log.error("[%s] CoAP server start TIMEOUT (port busy? broken bind?)", self.id)
             raise
-
         except Exception as e:
-            log.exception("[%s] CoAP server failed to start", self.id)
+            log.error("[%s] CoAP server failed to start: %s", self.id, e)
             raise
 
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
             pass
-
     async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
         """Loggt globalen Node-Status."""
         log.info("[%s] ntp_monitor_loop started (interval=%.1fs)", self.id, interval)

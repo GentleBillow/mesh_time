@@ -210,32 +210,40 @@ class MeshNode:
 
         site = build_site(self)
 
-        # FIX: hard IPv4 bind (no IPv6 funny business) + timeout + full exception
-        bind_ip = "0.0.0.0"
+        # FIX: bind to the node's configured IPv4 (avoids aiocoap hanging on 0.0.0.0)
+        bind_ip = (self.cfg.get("ip") or "0.0.0.0")
         bind_port = 5683
 
+        log.info("[%s] CoAP server: creating server context… bind=%s:%d", self.id, bind_ip, bind_port)
+
+        # Make it an explicit task so we can cancel without deadlocking on cancellation
+        task = asyncio.create_task(
+            aiocoap.Context.create_server_context(site, bind=(bind_ip, bind_port))
+        )
+
         try:
-            log.info("[%s] CoAP server: creating server context… bind=%s:%d", self.id, bind_ip, bind_port)
-
-            self._coap_server_ctx = await asyncio.wait_for(
-                aiocoap.Context.create_server_context(site, bind=(bind_ip, bind_port)),
-                timeout=3.0
-            )
-
-            log.info("[%s] CoAP server started", self.id)
+            self._coap_server_ctx = await asyncio.wait_for(task, timeout=3.0)
+            log.info("[%s] CoAP server started (bind=%s:%d)", self.id, bind_ip, bind_port)
 
         except asyncio.TimeoutError:
-            log.error("[%s] CoAP server start TIMEOUT (bind=%s:%d).", self.id, bind_ip, bind_port)
+            log.error("[%s] CoAP server start TIMEOUT (bind=%s:%d)", self.id, bind_ip, bind_port)
+            task.cancel()   # IMPORTANT: cancel, but don't await forever
             raise
-        except Exception as e:
-            # IMPORTANT: log the exception (yours currently prints nothing useful)
-            log.exception("[%s] CoAP server failed to start: %r", self.id, e)
+
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+
+        except Exception:
+            task.cancel()
+            log.exception("[%s] CoAP server failed to start", self.id)
             raise
 
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
             pass
+
 
     async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
         """Loggt globalen Node-Status."""

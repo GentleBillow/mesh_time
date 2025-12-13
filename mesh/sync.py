@@ -107,15 +107,30 @@ class PIController(BaseController):
 
 
 # ---------------------------------------------------------------------
-# ROBUST: Task spawn helper (aus Forum)
+# ROBUST: Task spawn helper (Python 3.7 compatible)
 # ---------------------------------------------------------------------
 
 def spawn_task(coro, name: str) -> asyncio.Task:
     """
-    Spawns a task with proper exception handling.
-    Crashes are logged, not silently swallowed.
+    Spawn an asyncio task with:
+      - Python 3.7 compatibility (no name= kwarg)
+      - explicit exception logging (no silent failures)
+      - graceful cancellation handling
+
+    Behaviour:
+      - CancelledError → INFO
+      - Any other exception → ERROR + traceback
     """
-    task = asyncio.create_task(coro, name=name)
+
+    # Python 3.7: no `name=` argument
+    task = asyncio.create_task(coro)
+
+    # Set task name if supported (Py ≥ 3.8)
+    if hasattr(task, "set_name"):
+        try:
+            task.set_name(name)
+        except Exception:
+            pass
 
     def _done_callback(t: asyncio.Task):
         try:
@@ -123,7 +138,8 @@ def spawn_task(coro, name: str) -> asyncio.Task:
         except asyncio.CancelledError:
             log.info("Task cancelled: %s", name)
         except Exception:
-            log.exception("Task CRASHED: %s", name)  # NICHT SILENT!
+            # This is CRITICAL: never swallow task crashes
+            log.exception("Task CRASHED: %s", name)
 
     task.add_done_callback(_done_callback)
     return task

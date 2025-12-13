@@ -232,6 +232,7 @@ class MeshNode:
             raise
 
         except asyncio.CancelledError:
+            log.exception("[%s] CoAP server cancelled!", self.id)
             task.cancel()
             raise
 

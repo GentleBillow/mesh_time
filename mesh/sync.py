@@ -224,9 +224,10 @@ class SyncModule:
         self._peer: Dict[str, PeerStats] = {}
         self._last_global_update_mono: Optional[float] = None
 
-        # ROBUST: Measurement queue (thread-safe)
-        self._measurement_queue: asyncio.Queue = asyncio.Queue()
+        # ROBUST: Measurement queue (MUST be created in running loop on Py3.7)
+        self._measurement_queue: Optional[asyncio.Queue] = None
         self._worker_tasks: List[asyncio.Task] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # -----------------------------------------------------------------
     # Public API
@@ -486,7 +487,9 @@ class SyncModule:
 
                 # Queue measurement for control
                 if not did_bs:
-                    await self._measurement_queue.put((peer_id, rtt, theta, peer_offset))
+                    q = self._measurement_queue
+                    if q is not None:
+                        await q.put((peer_id, rtt, theta, peer_offset))
 
                 # Log metrics
                 await self._log_link_metrics(peer_id, rtt, theta, client_ctx)
@@ -530,10 +533,12 @@ class SyncModule:
                 timeout = max(0.1, self._base_interval - (time.monotonic() - last_control))
 
                 try:
-                    meas = await asyncio.wait_for(
-                        self._measurement_queue.get(),
-                        timeout=timeout
-                    )
+                    q = self._measurement_queue
+                    if q is None:
+                        await asyncio.sleep(0.2)
+                        continue
+
+                    meas = await asyncio.wait_for(q.get(), timeout=timeout)
                     measurement_buffer.append(meas)
                 except asyncio.TimeoutError:
                     pass
@@ -562,6 +567,12 @@ class SyncModule:
         if IS_WINDOWS or self._is_root:
             log.info("[%s] Skipping beacon workers (Windows or Root)", self.node_id)
             return
+
+        # ---- FIX (Py3.7): create asyncio primitives in the running loop ----
+        self._loop = asyncio.get_running_loop()
+        if self._measurement_queue is None:
+            self._measurement_queue = asyncio.Queue()
+        # -------------------------------------------------------------------
 
         # Start control loop
         self._worker_tasks.append(
@@ -593,3 +604,5 @@ class SyncModule:
 
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks.clear()
+        self._measurement_queue = None
+        self._loop = None

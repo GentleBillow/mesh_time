@@ -76,6 +76,7 @@ class MeshNode:
         # --- CoAP contexts ---
         self._coap_server_ctx: Optional[aiocoap.Context] = None
         self._coap_client_ctx: Optional[aiocoap.Context] = None
+        self._coap_ready = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -210,8 +211,7 @@ class MeshNode:
 
         site = build_site(self)
 
-        # FIX: bind to the node's configured IPv4 (avoids aiocoap hanging on 0.0.0.0)
-        bind_ip = (self.cfg.get("ip") or "0.0.0.0")
+        bind_ip = "0.0.0.0"
         bind_port = 5683
 
         log.info("[%s] CoAP server: creating server context… bind=%s:%d", self.id, bind_ip, bind_port)
@@ -224,21 +224,27 @@ class MeshNode:
         try:
             self._coap_server_ctx = await asyncio.wait_for(task, timeout=3.0)
             log.info("[%s] CoAP server started (bind=%s:%d)", self.id, bind_ip, bind_port)
+            self._coap_ready.set()
+
 
         except asyncio.TimeoutError:
             log.error("[%s] CoAP server start TIMEOUT (bind=%s:%d)", self.id, bind_ip, bind_port)
             log.error("[%s] coap task done=%s cancelled=%s", self.id, task.done(), task.cancelled())
+            self._coap_ready.set()  # damit run_async nicht ewig wartet
+
             task.cancel()
             raise
 
         except asyncio.CancelledError:
             log.exception("[%s] CoAP server cancelled!", self.id)
+            self._coap_ready.set()  # damit run_async nicht ewig wartet
             task.cancel()
             raise
 
         except Exception:
-            task.cancel()
             log.exception("[%s] CoAP server failed to start", self.id)
+            self._coap_ready.set()  # damit run_async nicht ewig wartet
+            task.cancel()
             raise
 
         try:
@@ -312,8 +318,21 @@ class MeshNode:
         log.info("[%s] MeshNode starting with cfg: %s", self.id, self.cfg)
 
         tasks = []
+
+        # 1) CoAP zuerst starten
+        coap_task = asyncio.create_task(self.coap_loop())
+        if hasattr(coap_task, "set_name"):
+            coap_task.set_name(f"{self.id}:coap")
+        tasks.append(coap_task)
+
+        # 2) Warten bis CoAP ready ist (oder timeout)
+        try:
+            await asyncio.wait_for(self._coap_ready.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            log.warning("[%s] CoAP ready wait TIMEOUT – continuing anyway", self.id)
+
+        # 3) Erst dann Sync / Sensor / LED / Monitor starten
         for coro, name in [
-            (self.coap_loop(), f"{self.id}:coap"),
             (self.sync_loop(), f"{self.id}:sync"),
             (self.sensor_loop(), f"{self.id}:sensor"),
             (self.led_loop(), f"{self.id}:led"),
@@ -330,12 +349,10 @@ class MeshNode:
             pass
         finally:
             self._stop.set()
-
             for t in tasks:
                 if not t.done():
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-
             await self._shutdown_client_ctx()
             if self._coap_server_ctx is not None:
                 try:

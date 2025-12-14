@@ -2,11 +2,14 @@
 # mesh/kalman_controller.py
 
 from __future__ import annotations
+from typing import Optional
 import numpy as np
 from typing import Dict, Any, List, Tuple, Callable
 
 Measurement = Tuple[str, float, float, float]
 WeightFn = Callable[[str], float]
+NoiseFn = Callable[[str, float], float]
+
 
 
 class KalmanController:
@@ -106,7 +109,9 @@ class KalmanController:
         measurements: List[Measurement],
         weight_fn: WeightFn,
         dt_s: float,
+        noise_fn: Optional[NoiseFn] = None,
     ) -> float:
+
         if not measurements:
             return 0.0
 
@@ -141,8 +146,11 @@ class KalmanController:
             H[0, 0] = 1.0
             H[0, idx] = -1.0
 
-            w = float(weight_fn(peer_id))
-            R = float(self.r_base / max(w, 1e-9))
+            if noise_fn is not None:
+                R = float(noise_fn(peer_id, float(_rtt)))
+            else:
+                w = float(weight_fn(peer_id))
+                R = float(self.r_base / max(w, 1e-9))
 
             x, P = self._kf_update(x, P, H, z=float(z), R=R)
 

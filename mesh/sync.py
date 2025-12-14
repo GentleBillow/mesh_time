@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable
 
+import concurrent.futures
+
 import aiocoap
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -34,6 +36,7 @@ class PeerStats:
     good_samples: int = 0
     last_theta_epoch: Optional[float] = None
     rtt_last: Optional[float] = None
+    rtt_baseline: Optional[float] = None
     state: str = "DOWN"  # UP or DOWN
 
 
@@ -205,6 +208,11 @@ class SyncModule:
         else:
             raise ValueError(f"[{self.node_id}] unknown controller '{ctrl_name}'")
 
+        # Adaptive R (Kalman measurement noise) config
+        ar = (sync_cfg.get("kalman", {}) or {}).get("adaptive_r", {}) or {}
+        self._R_min = float(ar.get("R_min", 2.5e-9))          # seconds^2
+        self._c_rtt = float(ar.get("c_rtt", 0.5))
+
         # limits / timing
         self._max_slew_per_second_ms = float(sync_cfg.get("max_slew_per_second_ms", 10.0))
 
@@ -234,7 +242,14 @@ class SyncModule:
     # -----------------------------------------------------------------
 
     def mesh_time(self) -> float:
-        return time.time() + self._offset
+        """
+        Monotonic mesh time.
+
+        Uses local monotonic clock + boot_epoch to get a wall-like epoch,
+        then applies the mesh offset. This stays strictly monotonic even if
+        system wall time jumps (NTP adjustments, manual changes, DST, etc.).
+        """
+        return time.monotonic() + self._boot_epoch + self._offset
 
     def get_offset(self) -> float:
         return self._offset
@@ -276,11 +291,37 @@ class SyncModule:
             iqr = self._compute_iqr(st.rtt_samples)
             st.sigma = max(0.7413 * iqr, 1e-6)
 
+            # Robust baseline RTT (median of window)
+            xs_sorted = sorted(st.rtt_samples)
+            st.rtt_baseline = self._quantile_sorted(xs_sorted, 0.50)
+
+
     def _weight_for_peer(self, peer_id: str) -> float:
         st = self._peer.get(peer_id)
         if not st or st.sigma is None:
             return 1.0
         return min(1.0 / (st.sigma * st.sigma), self._max_weight)
+
+    def _noise_for_peer(self, peer_id: str, rtt_s: float) -> float:
+        """
+        Adaptive measurement variance R (seconds^2) for Kalman.
+        Uses:
+          - sigma_rtt from IQR (PeerStats.sigma)
+          - rtt baseline (PeerStats.rtt_baseline)
+          - rtt excess penalty (queueing proxy)
+        """
+        st = self._peer.get(peer_id)
+        if st is None:
+            return 1e-6
+
+        sigma_rtt = float(st.sigma) if st.sigma is not None else 0.0
+        R = (sigma_rtt * sigma_rtt) / 4.0
+
+        rtt0 = st.rtt_baseline if st.rtt_baseline is not None else (st.rtt_last or rtt_s)
+        excess = max(0.0, float(rtt_s) - float(rtt0))
+        R += (self._c_rtt * excess) ** 2
+
+        return max(self._R_min, R)
 
     # -----------------------------------------------------------------
     # Bootstrap
@@ -325,14 +366,20 @@ class SyncModule:
     def _apply_global_control(self, meas: List[Measurement]) -> None:
         dt = self._compute_dt()
 
-        delta_desired = self._controller.compute_delta(
-            self._offset, meas, self._weight_for_peer, dt
-        )
+        if self._controller.__class__.__name__ == "KalmanController":
+            delta_desired = self._controller.compute_delta(
+                self._offset, meas, self._weight_for_peer, dt, noise_fn=self._noise_for_peer
+            )
+        else:
+            delta_desired = self._controller.compute_delta(
+                self._offset, meas, self._weight_for_peer, dt
+            )
+
 
         delta_applied = self._global_slew_clip(delta_desired, dt)
         self._offset += delta_applied
 
-        # 🔴 CRITICAL: tell controller what actually happened
+        #CRITICAL: tell controller what actually happened
         if hasattr(self._controller, "commit_applied_offset"):
             self._controller.commit_applied_offset(self._offset)
 

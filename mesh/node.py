@@ -244,7 +244,7 @@ class MeshNode:
                             uri=uri,
                             payload=json.dumps(payload).encode("utf-8"),
                         )
-                        await asyncio.wait_for(ctx.request(req).response, timeout=0.5)
+                        await asyncio.wait_for(ctx.request(req).response, timeout=1.5)
                 except asyncio.TimeoutError:
                     log.warning("[%s] ntp_monitor_loop: telemetry timeout", self.id)
                 except Exception as e:

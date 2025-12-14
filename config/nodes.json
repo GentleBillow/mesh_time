@@ -20,19 +20,19 @@
 
     "kalman": {
       "use_offset_gauge": true,
-      "r_offset_gauge": 100,
+      "r_offset_gauge": 10,
 
       "use_bias_gauge": true,
       "r_bias_gauge": 1e-2,
 
-      "q_offset": 1e-8,
-      "q_drift": 1e-14,
-      "q_bias": 1e-13,
+      "q_offset": 1e-9,
+      "q_drift": 1e-15,
+      "q_bias": 1e-14,
       "r_base": 2e-7,
 
       "adaptive_r": {
-        "R_min": 2.5e-9,
-        "c_rtt": 0.5
+        "R_min": 4e-8,
+        "c_rtt": 1
       }
     },
 

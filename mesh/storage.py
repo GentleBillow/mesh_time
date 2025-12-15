@@ -192,12 +192,13 @@ class Storage:
         theta_ms: Optional[float] = None,
         rtt_ms: Optional[float] = None,
         sigma_ms: Optional[float] = None,
-        # NEW (optional controller debug)
+        # controller debug (optional)
         delta_desired_ms: Optional[float] = None,
         delta_applied_ms: Optional[float] = None,
         dt_s: Optional[float] = None,
         slew_clipped: Optional[bool] = None,
-    ) -> None:        """
+    ) -> None:
+        """
         Loggt eine Zeit-Referenz / Sync-Observation.
         created_at ist immer Sink-Clock (time.time() beim Insert).
         """
@@ -208,8 +209,24 @@ class Storage:
 
             cols = self._table_cols(cur, "ntp_reference")
 
-            base_cols = ["node_id", "t_wall", "t_mono", "t_mesh", "offset", "err_mesh_vs_wall", "created_at"]
-            base_vals = [node_id, float(t_wall), float(t_mono), float(t_mesh), float(offset), float(err_mesh_vs_wall), ts]
+            base_cols = [
+                "node_id",
+                "t_wall",
+                "t_mono",
+                "t_mesh",
+                "offset",
+                "err_mesh_vs_wall",
+                "created_at",
+            ]
+            base_vals = [
+                node_id,
+                float(t_wall),
+                float(t_mono),
+                float(t_mesh),
+                float(offset),
+                float(err_mesh_vs_wall),
+                ts,
+            ]
 
             extra_cols = []
             extra_vals = []
@@ -230,7 +247,7 @@ class Storage:
                 extra_cols.append("sigma_ms")
                 extra_vals.append(sigma_ms)
 
-            # controller debug fields
+            # ---- controller debug fields ----
             if "delta_desired_ms" in cols:
                 extra_cols.append("delta_desired_ms")
                 extra_vals.append(delta_desired_ms)
@@ -245,9 +262,9 @@ class Storage:
 
             if "slew_clipped" in cols:
                 extra_cols.append("slew_clipped")
-                # store as 0/1, allow None
-                extra_vals.append(None if slew_clipped is None else (1 if bool(slew_clipped) else 0))
-
+                extra_vals.append(
+                    None if slew_clipped is None else (1 if bool(slew_clipped) else 0)
+                )
 
             all_cols = base_cols + extra_cols
             placeholders = ", ".join(["?"] * len(all_cols))
@@ -259,6 +276,7 @@ class Storage:
                 """,
                 tuple(base_vals + extra_vals),
             )
+
             conn.commit()
 
     # ------------------------------------------------------------------

@@ -232,6 +232,15 @@ class SyncModule:
         self._peer: Dict[str, PeerStats] = {}
         self._last_global_update_mono: Optional[float] = None
 
+        # Last controller action (for dashboard / logging)
+        self._last_control_debug: Dict[str, Any] = {
+            "dt_s": None,
+            "delta_desired_ms": None,
+            "delta_applied_ms": None,
+            "slew_clipped": None,
+            "t_wall": None,
+        }
+
         # ROBUST: Measurement queue (MUST be created in running loop on Py3.7)
         self._measurement_queue: Optional[asyncio.Queue] = None
         self._worker_tasks: List[asyncio.Task] = []
@@ -253,6 +262,10 @@ class SyncModule:
 
     def get_offset(self) -> float:
         return self._offset
+
+    def last_control_debug(self) -> Dict[str, Any]:
+        return dict(self._last_control_debug or {})
+
 
     def is_warmed_up(self) -> bool:
         return self._is_root or self._beacon_count >= self._min_beacons_for_warmup
@@ -377,6 +390,20 @@ class SyncModule:
 
 
         delta_applied = self._global_slew_clip(delta_desired, dt)
+
+        # --- controller debug (wanted vs applied) ---
+        delta_desired_ms = float(delta_desired * 1000.0)
+        delta_applied_ms = float(delta_applied * 1000.0)
+        slew_clipped = (abs(delta_applied - delta_desired) > 1e-12)
+
+        self._last_control_debug = {
+            "dt_s": float(dt),
+            "delta_desired_ms": delta_desired_ms,
+            "delta_applied_ms": delta_applied_ms,
+            "slew_clipped": bool(slew_clipped),
+            "t_wall": float(time.time()),
+        }
+
         self._offset += delta_applied
 
         #CRITICAL: tell controller what actually happened

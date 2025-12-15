@@ -310,6 +310,21 @@ class RelayIngestLinkResource(resource.Resource):
                 offset = float(data.get("offset", 0.0))
                 err = t_mesh - t_wall
 
+                # NEW: controller debug fields (optional)
+                delta_desired_ms = data.get("delta_desired_ms", None)
+                delta_applied_ms = data.get("delta_applied_ms", None)
+                dt_s = data.get("dt_s", None)
+                slew_clipped = data.get("slew_clipped", None)
+
+                delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
+                delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
+                dt_s = float(dt_s) if dt_s is not None else None
+                if slew_clipped is None:
+                    slew_clipped_b = None
+                else:
+                    slew_clipped_b = bool(slew_clipped)
+
+
                 # Insert into DB
                 st.insert_ntp_reference(
                     node_id=node_id,
@@ -322,6 +337,11 @@ class RelayIngestLinkResource(resource.Resource):
                     theta_ms=theta_ms,  # FIX: Link-Metriken
                     rtt_ms=rtt_ms,
                     sigma_ms=sigma_ms,
+                    # NEW
+                    delta_desired_ms=delta_desired_ms,
+                    delta_applied_ms=delta_applied_ms,
+                    dt_s=dt_s,
+                    slew_clipped=slew_clipped_b,
                 )
 
             except Exception as e:

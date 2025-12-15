@@ -206,6 +206,18 @@ class MeshNode:
             offset = self.sync.get_offset()
             err = t_mesh - t_wall
 
+            dbg = {}
+            try:
+                dbg = self.sync.last_control_debug()
+            except Exception:
+                dbg = {}
+
+            delta_desired_ms = dbg.get("delta_desired_ms", None)
+            delta_applied_ms = dbg.get("delta_applied_ms", None)
+            dt_s = dbg.get("dt_s", None)
+            slew_clipped = dbg.get("slew_clipped", None)
+
+
             # 1) Local DB
             if self.storage is not None:
                 try:
@@ -220,7 +232,13 @@ class MeshNode:
                         theta_ms=None,
                         rtt_ms=None,
                         sigma_ms=None,
+                        # NEW
+                        delta_desired_ms=delta_desired_ms,
+                        delta_applied_ms=delta_applied_ms,
+                        dt_s=dt_s,
+                        slew_clipped=slew_clipped,
                     )
+
                 except Exception as e:
                     log.error("[%s] ntp_monitor_loop: DB insert failed: %s", self.id, e)
 
@@ -238,7 +256,13 @@ class MeshNode:
                             "offset": offset,
                             "err_mesh_vs_wall": err,
                             "warmed_up": bool(self.sync.is_warmed_up()),
+                            # NEW
+                            "delta_desired_ms": delta_desired_ms,
+                            "delta_applied_ms": delta_applied_ms,
+                            "dt_s": dt_s,
+                            "slew_clipped": slew_clipped,
                         }
+
                         req = aiocoap.Message(
                             code=aiocoap.POST,
                             uri=uri,

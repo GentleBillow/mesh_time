@@ -121,6 +121,17 @@ class Storage:
             if "sigma_ms" not in cols:
                 cur.execute("ALTER TABLE ntp_reference ADD COLUMN sigma_ms REAL;")
 
+            # --- Migration: controller debug fields (for dashboard) ---
+            if "delta_desired_ms" not in cols:
+                cur.execute("ALTER TABLE ntp_reference ADD COLUMN delta_desired_ms REAL;")
+            if "delta_applied_ms" not in cols:
+                cur.execute("ALTER TABLE ntp_reference ADD COLUMN delta_applied_ms REAL;")
+            if "dt_s" not in cols:
+                cur.execute("ALTER TABLE ntp_reference ADD COLUMN dt_s REAL;")
+            if "slew_clipped" not in cols:
+                cur.execute("ALTER TABLE ntp_reference ADD COLUMN slew_clipped INTEGER;")  # 0/1
+
+
             # --- Indizes (UI Performance) ---
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sensor_readings_created_at ON sensor_readings(created_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sensor_readings_node_created ON sensor_readings(node_id, created_at);")
@@ -128,6 +139,8 @@ class Storage:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_ntp_reference_created_at ON ntp_reference(created_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_ntp_reference_node_created ON ntp_reference(node_id, created_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_ntp_reference_peer_created ON ntp_reference(peer_id, created_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ntp_reference_node_created_at ON ntp_reference(node_id, created_at);")
+
 
             conn.commit()
 
@@ -179,8 +192,12 @@ class Storage:
         theta_ms: Optional[float] = None,
         rtt_ms: Optional[float] = None,
         sigma_ms: Optional[float] = None,
-    ) -> None:
-        """
+        # NEW (optional controller debug)
+        delta_desired_ms: Optional[float] = None,
+        delta_applied_ms: Optional[float] = None,
+        dt_s: Optional[float] = None,
+        slew_clipped: Optional[bool] = None,
+    ) -> None:        """
         Loggt eine Zeit-Referenz / Sync-Observation.
         created_at ist immer Sink-Clock (time.time() beim Insert).
         """
@@ -212,6 +229,25 @@ class Storage:
             if "sigma_ms" in cols:
                 extra_cols.append("sigma_ms")
                 extra_vals.append(sigma_ms)
+
+            # controller debug fields
+            if "delta_desired_ms" in cols:
+                extra_cols.append("delta_desired_ms")
+                extra_vals.append(delta_desired_ms)
+
+            if "delta_applied_ms" in cols:
+                extra_cols.append("delta_applied_ms")
+                extra_vals.append(delta_applied_ms)
+
+            if "dt_s" in cols:
+                extra_cols.append("dt_s")
+                extra_vals.append(dt_s)
+
+            if "slew_clipped" in cols:
+                extra_cols.append("slew_clipped")
+                # store as 0/1, allow None
+                extra_vals.append(None if slew_clipped is None else (1 if bool(slew_clipped) else 0))
+
 
             all_cols = base_cols + extra_cols
             placeholders = ", ".join(["?"] * len(all_cols))

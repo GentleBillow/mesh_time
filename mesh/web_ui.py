@@ -297,19 +297,58 @@ def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
 # -----------------------------
 def tmesh_scale_to_ms(rows: List[sqlite3.Row]) -> float:
     """
-    Determine scale factor for t_mesh -> ms.
-    If t_mesh looks like epoch-ms (~1e12) -> scale=1
-    else assume seconds -> scale=1000
+    Robustly infer t_mesh units by comparing its increments to created_at increments.
+
+    We estimate r = median(Δt_mesh / Δcreated_at) over consecutive samples of the same node.
+      r ~ 1        => t_mesh in seconds
+      r ~ 1000     => t_mesh in milliseconds
+      r ~ 1e6      => t_mesh in microseconds
+    Then scale_to_ms = 1000 / r.
     """
-    vals = []
+    # gather per-node consecutive deltas
+    by_node: Dict[str, List[Tuple[float, float]]] = {}
     for r in rows:
+        nid = str(row_get(r, "node_id", "") or "")
+        tc = _f(row_get(r, "created_at"))
         tm = _f(row_get(r, "t_mesh"))
-        if tm is not None:
-            vals.append(abs(tm))
-    med = robust_median(vals) if vals else None
-    if med is not None and med > 1e11:
-        return 1.0
-    return 1000.0
+        if not nid or tc is None or tm is None:
+            continue
+        by_node.setdefault(nid, []).append((tc, tm))
+
+    ratios: List[float] = []
+    for nid, pts in by_node.items():
+        pts.sort(key=lambda x: x[0])
+        for i in range(1, len(pts)):
+            t0, m0 = pts[i - 1]
+            t1, m1 = pts[i]
+            dt = float(t1 - t0)
+            dm = float(m1 - m0)
+            if dt <= 1e-6:
+                continue
+            # ignore wild jumps / resets
+            if abs(dm) <= 0:
+                continue
+            ratio = dm / dt
+            # keep only plausible positive ratios
+            if ratio > 0 and ratio < 1e9:
+                ratios.append(ratio)
+
+    r_med = robust_median(ratios)
+    if r_med is None or r_med <= 0:
+        # fallback: assume seconds
+        return 1000.0
+
+    scale = 1000.0 / float(r_med)
+
+    # snap to nice scales if close (avoid tiny floating drift)
+    snaps = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 1000.0]
+    best = min(snaps, key=lambda s: abs(math.log10(scale) - math.log10(s)))
+    # only snap if within ~0.2 decades (~1.58x)
+    if abs(math.log10(scale) - math.log10(best)) < 0.2:
+        scale = best
+
+    return float(scale)
+
 
 
 # -----------------------------

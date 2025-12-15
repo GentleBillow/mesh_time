@@ -1,16 +1,6 @@
 # -*- coding: utf-8 -*-
-# mesh/web_ui.py
-#
-# MeshTime Dashboard (Single Page) — Operator + Debug
-#
-# Python: 3.7 compatible (NO walrus operator)
-#
-# FIXES APPLIED:
-# 1. Removed duplicate mesh_series building logic
-# 2. Fixed undefined 'scale' variable (now uses 'to_seconds')
-# 3. Consistent binning logic across all functions
-# 4. Fixed build_link_diagnostics binning
-# 5. Cleaner code structure
+# mesh/web_ui.py — CLEAN REWRITE (Backend)
+# Python 3.7 compatible
 
 from __future__ import annotations
 
@@ -33,69 +23,41 @@ from mesh.storage import Storage  # ensures schema exists
 app = Flask(__name__)
 
 # -----------------------------
-# UI tuning
+# Defaults / UI knobs
 # -----------------------------
-WINDOW_SECONDS_DEFAULT = 600.0
+WINDOW_S_DEFAULT = 600.0
 BIN_S_DEFAULT = 0.5
 MAX_NODE_POINTS_DEFAULT = 12000
 MAX_LINK_POINTS_DEFAULT = 24000
+MAX_CTRL_POINTS_DEFAULT = 12000
+
 HEATMAP_MAX_BINS = 60
 
-# Convergence thresholds
+# Simple convergence rules for overview (you can tune later)
 CONV_WINDOW_S = 30.0
 MIN_SAMPLES_WARMUP = 8
+FRESH_MIN_S = 3.0
+FRESH_MULT = 6.0
 
-THRESH_DELTA_APPLIED_MED_MS = 0.5
-THRESH_SLEW_CLIP_RATE = 0.20
 THRESH_LINK_SIGMA_MED_MS = 2.0
 
-FRESH_MIN_S = 3.0
-FRESH_MULT = 6.0  # fresh = max(FRESH_MIN_S, beacon_period_s * FRESH_MULT)
-
-# Stable links rule (B): require at least K stable links
-K_STABLE_LINKS_DEFAULT = 1
-
-
 # -----------------------------
-# Helpers (must never crash)
+# Helpers (robust)
 # -----------------------------
 def _json_error(msg: str, status: int = 500):
     return make_response(jsonify({"error": str(msg)}), int(status))
 
-
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.Connection(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
-
+    c = sqlite3.connect(str(DB_PATH))
+    c.row_factory = sqlite3.Row
+    return c
 
 def _table_cols(conn: sqlite3.Connection, table: str) -> Set[str]:
     try:
-        cur = conn.cursor()
-        rows = cur.execute("PRAGMA table_info(%s)" % table).fetchall()
+        rows = conn.execute("PRAGMA table_info(%s)" % table).fetchall()
         return set([r[1] for r in rows])
     except Exception:
         return set()
-
-
-def row_has(r: Any, key: str) -> bool:
-    try:
-        return key in r.keys()  # sqlite3.Row
-    except Exception:
-        try:
-            return key in r
-        except Exception:
-            return False
-
-
-def row_get(r: Any, key: str, default: Any = None) -> Any:
-    if not row_has(r, key):
-        return default
-    try:
-        return r[key]
-    except Exception:
-        return default
-
 
 def _f(x: Any) -> Optional[float]:
     try:
@@ -105,7 +67,6 @@ def _f(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def _utc(ts: Optional[float]) -> str:
     if ts is None:
         return "n/a"
@@ -114,35 +75,22 @@ def _utc(ts: Optional[float]) -> str:
     except Exception:
         return "n/a"
 
-
-def _quantile_sorted(xs: List[float], q: float) -> float:
-    n = len(xs)
-    if n <= 0:
-        return 0.0
-    if n == 1:
-        return float(xs[0])
-    pos = float(q) * float(n - 1)
-    lo = int(math.floor(pos))
-    hi = int(math.ceil(pos))
-    if lo == hi:
-        return float(xs[lo])
-    frac = pos - lo
-    return float(xs[lo] * (1.0 - frac) + xs[hi] * frac)
-
-
-def robust_median(values: List[float]) -> Optional[float]:
-    if not values:
+def median(xs: List[float]) -> Optional[float]:
+    if not xs:
         return None
-    xs = sorted(values)
-    return float(_quantile_sorted(xs, 0.5))
+    xs = sorted(xs)
+    n = len(xs)
+    if n % 2 == 1:
+        return float(xs[n // 2])
+    return 0.5 * (float(xs[n // 2 - 1]) + float(xs[n // 2]))
 
-
-def robust_iqr(values: List[float]) -> float:
-    if not values:
+def iqr(xs: List[float]) -> float:
+    if len(xs) < 4:
         return 0.0
-    xs = sorted(values)
-    return float(_quantile_sorted(xs, 0.75) - _quantile_sorted(xs, 0.25))
-
+    xs = sorted(xs)
+    q1 = xs[len(xs) // 4]
+    q3 = xs[(3 * len(xs)) // 4]
+    return float(q3 - q1)
 
 def load_config() -> Dict[str, Any]:
     try:
@@ -154,6 +102,15 @@ def load_config() -> Dict[str, Any]:
     except Exception:
         return {}
 
+def _beacon_period_s(cfg: Dict[str, Any]) -> float:
+    try:
+        sync = cfg.get("sync", {}) or {}
+        return float(sync.get("beacon_period_s", 0.5))
+    except Exception:
+        return 0.5
+
+def _fresh_thresh_s(cfg: Dict[str, Any]) -> float:
+    return max(float(FRESH_MIN_S), _beacon_period_s(cfg) * float(FRESH_MULT))
 
 def get_topology() -> Dict[str, Any]:
     cfg = load_config()
@@ -188,85 +145,87 @@ def get_topology() -> Dict[str, Any]:
 
     return {"nodes": nodes, "links": links}
 
-
-def _beacon_period_s(cfg: Dict[str, Any]) -> float:
-    try:
-        sync = cfg.get("sync", {}) or {}
-        return float(sync.get("beacon_period_s", 0.5))
-    except Exception:
-        return 0.5
-
-
-def _fresh_thresh_s(cfg: Dict[str, Any]) -> float:
-    bp = _beacon_period_s(cfg)
-    return max(FRESH_MIN_S, bp * FRESH_MULT)
-
-
-def _k_stable_links(cfg: Dict[str, Any]) -> int:
-    try:
-        sync = cfg.get("sync", {}) or {}
-        k = int(sync.get("ui_k_stable_links", K_STABLE_LINKS_DEFAULT))
-        return max(0, k)
-    except Exception:
-        return K_STABLE_LINKS_DEFAULT
-
-
-def controller_delta_scale_to_ms(rows: List[sqlite3.Row]) -> float:
+# -----------------------------
+# Unit inference: t_mesh scale
+# -----------------------------
+def infer_tmesh_to_seconds(rows: List[sqlite3.Row]) -> float:
     """
-    Deine delta_*_ms Werte sehen nach Sekunden aus (z.B. 0.03 ~= 30ms).
-    Wir inferieren: wenn median(|delta|) < 1.0 -> treat as seconds, scale 1000.
-    sonst -> already ms, scale 1.
+    Infer factor 'scale' such that:
+        t_mesh_seconds = t_mesh_raw * scale
+
+    We estimate r = median(Δt_mesh / Δcreated_at) over consecutive samples (same node).
+      r ~ 1        => t_mesh in seconds      => scale ~ 1
+      r ~ 1000     => t_mesh in ms          => scale ~ 1/1000
+      r ~ 1e6      => t_mesh in microseconds=> scale ~ 1/1e6
     """
-    vals = []
+    by_node: Dict[str, List[Tuple[float, float]]] = {}
     for r in rows:
-        for k in ("delta_desired_ms", "delta_applied_ms"):
-            v = _f(row_get(r, k))
-            if v is None:
-                continue
-            vals.append(abs(float(v)))
+        nid = str(r["node_id"]) if "node_id" in r.keys() else ""
+        tc = _f(r["created_at"]) if "created_at" in r.keys() else None
+        tm = _f(r["t_mesh"]) if "t_mesh" in r.keys() else None
+        if nid and tc is not None and tm is not None:
+            by_node.setdefault(nid, []).append((tc, tm))
 
-    m = robust_median(sorted(vals)) if vals else None
-    if m is None:
+    ratios: List[float] = []
+    for pts in by_node.values():
+        pts.sort(key=lambda x: x[0])
+        for i in range(1, len(pts)):
+            dt = float(pts[i][0] - pts[i - 1][0])
+            dm = float(pts[i][1] - pts[i - 1][1])
+            if dt <= 1e-6:
+                continue
+            if dm <= 0:
+                continue
+            ratios.append(dm / dt)
+
+    r_med = median(ratios)
+    if r_med is None or r_med <= 0:
         return 1.0
 
-    # Heuristik: <1.0 "ms" ist praktisch immer Sekunden im echten Leben (10-100ms Korrekturen).
-    if m < 1.0:
-        return 1000.0
-    return 1.0
+    inv = 1.0 / float(r_med)
 
+    # snap to nice powers to avoid floating jitter
+    for snap in (1.0, 1e-3, 1e-6):
+        if abs(math.log10(inv) - math.log10(snap)) < 0.25:
+            return float(snap)
+
+    return float(inv)
+
+def mesh_offset_ms(created_at_s: float, t_mesh_raw: float, scale_to_seconds: float) -> float:
+    return (float(t_mesh_raw) * float(scale_to_seconds) - float(created_at_s)) * 1000.0
 
 # -----------------------------
-# DB readers (robust to missing cols)
+# DB fetchers (robust to missing cols)
 # -----------------------------
 def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
     conn = get_conn()
     try:
         cols = _table_cols(conn, "ntp_reference")
-        if not ("node_id" in cols and "created_at" in cols):
-            return []
-
-        wanted = [
-            "id", "node_id", "created_at",
-            "t_mesh", "offset", "err_mesh_vs_wall",
-            "delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped",
-        ]
-        sel = [c for c in wanted if c in cols]
-        if not sel:
+        need = {"node_id", "created_at", "t_mesh"}
+        if not need.issubset(cols):
             return []
 
         cutoff = time.time() - float(window_s)
+
+        # node rows: peer_id NULL if column exists, else no filter
         peer_filter = "AND peer_id IS NULL" if "peer_id" in cols else ""
+
+        sel = ["node_id", "created_at", "t_mesh"]
+        if "offset" in cols:
+            sel.append("offset")
+        if "err_mesh_vs_wall" in cols:
+            sel.append("err_mesh_vs_wall")
+
         q = """
-            SELECT %s
+            SELECT {sel}
             FROM ntp_reference
             WHERE created_at >= ?
-            %s
+            {peer_filter}
             ORDER BY created_at ASC
             LIMIT ?
-        """ % (", ".join(sel), peer_filter)
+        """.format(sel=", ".join(sel), peer_filter=peer_filter)
 
-        cur = conn.cursor()
-        return cur.execute(q, (cutoff, int(limit))).fetchall()
+        return conn.execute(q, (cutoff, int(limit))).fetchall()
     except Exception:
         return []
     finally:
@@ -274,33 +233,32 @@ def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
             conn.close()
         except Exception:
             pass
-
 
 def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
     conn = get_conn()
     try:
         cols = _table_cols(conn, "ntp_reference")
-        need = set(["node_id", "peer_id", "created_at"])
+        need = {"node_id", "peer_id", "created_at"}
         if not need.issubset(cols):
             return []
 
-        wanted = ["id", "node_id", "peer_id", "created_at", "theta_ms", "rtt_ms", "sigma_ms"]
-        sel = [c for c in wanted if c in cols]
-        if "peer_id" not in sel:
-            return []
-
         cutoff = time.time() - float(window_s)
+
+        sel = ["node_id", "peer_id", "created_at"]
+        for c in ("theta_ms", "rtt_ms", "sigma_ms"):
+            if c in cols:
+                sel.append(c)
+
         q = """
-            SELECT %s
+            SELECT {sel}
             FROM ntp_reference
             WHERE created_at >= ?
               AND peer_id IS NOT NULL
             ORDER BY created_at ASC
             LIMIT ?
-        """ % (", ".join(sel),)
+        """.format(sel=", ".join(sel))
 
-        cur = conn.cursor()
-        return cur.execute(q, (cutoff, int(limit))).fetchall()
+        return conn.execute(q, (cutoff, int(limit))).fetchall()
     except Exception:
         return []
     finally:
@@ -309,37 +267,35 @@ def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
         except Exception:
             pass
 
-
 def fetch_controller_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
-    """
-    Controller/Kalman Felder sind bei dir in LINK-Rows (peer_id NOT NULL).
-    Deshalb: NICHT peer_id IS NULL filtern, sondern schlicht nach non-null Controller-Feldern.
-    """
     conn = get_conn()
     try:
         cols = _table_cols(conn, "ntp_reference")
         if not {"node_id", "created_at"}.issubset(cols):
             return []
 
-        ctrl_cols = ["delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped"]
-        present = [c for c in ctrl_cols if c in cols]
-        if not present:
+        ctrl_cols = [c for c in ("delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped") if c in cols]
+        if not ctrl_cols:
             return []
 
-        sel = ["id", "node_id", "created_at", "peer_id"] + present
         cutoff = time.time() - float(window_s)
+        nonnull = " OR ".join(["%s IS NOT NULL" % c for c in ctrl_cols])
 
-        nonnull = " OR ".join([f"{c} IS NOT NULL" for c in present])
+        sel = ["node_id", "created_at"]
+        if "peer_id" in cols:
+            sel.append("peer_id")
+        sel.extend(ctrl_cols)
 
-        q = f"""
-            SELECT {", ".join(sel)}
+        q = """
+            SELECT {sel}
             FROM ntp_reference
             WHERE created_at >= ?
               AND ({nonnull})
             ORDER BY created_at ASC
             LIMIT ?
-        """
-        return conn.cursor().execute(q, (cutoff, int(limit))).fetchall()
+        """.format(sel=", ".join(sel), nonnull=nonnull)
+
+        return conn.execute(q, (cutoff, int(limit))).fetchall()
     except Exception:
         return []
     finally:
@@ -348,74 +304,29 @@ def fetch_controller_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
         except Exception:
             pass
 
-
-# -----------------------------
-# Unit inference
-# -----------------------------
-def infer_tmesh_to_seconds(rows: List[sqlite3.Row]) -> float:
+def controller_delta_scale_to_ms(rows: List[sqlite3.Row]) -> float:
     """
-    Infer factor 'to_seconds' such that:
-        t_mesh_seconds = t_mesh_raw * to_seconds
-
-    We estimate r = median(Δt_mesh / Δcreated_at) over consecutive samples (same node).
-      r ~ 1        => t_mesh in seconds      => to_seconds ~ 1
-      r ~ 1000     => t_mesh in ms          => to_seconds ~ 1/1000
-      r ~ 1e6      => t_mesh in microseconds=> to_seconds ~ 1/1e6
+    Deine delta_*_ms Werte sehen nach Sekunden aus (z.B. 0.03 ~= 30ms).
+    Heuristik: wenn median(|delta|) < 1.0 -> treat as seconds, scale 1000.
     """
-    by_node = {}  # nid -> list[(created_at, t_mesh_raw)]
+    vals: List[float] = []
     for r in rows:
-        nid = str(row_get(r, "node_id", "") or "")
-        tc = _f(row_get(r, "created_at"))
-        tm = _f(row_get(r, "t_mesh"))
-        if (not nid) or (tc is None) or (tm is None):
-            continue
-        if nid not in by_node:
-            by_node[nid] = []
-        by_node[nid].append((tc, tm))
-
-    ratios = []
-    for nid, pts in by_node.items():
-        pts.sort(key=lambda x: x[0])
-        for i in range(1, len(pts)):
-            t0, m0 = pts[i - 1]
-            t1, m1 = pts[i]
-            dt = float(t1 - t0)
-            dm = float(m1 - m0)
-            if dt <= 1e-6:
-                continue
-            # ignore resets / wild negative jumps
-            if dm <= 0:
-                continue
-            ratio = dm / dt
-            if ratio > 0 and ratio < 1e12:
-                ratios.append(ratio)
-
-    r_med = robust_median(ratios)
-    if r_med is None or r_med <= 0:
-        return 1.0  # assume seconds
-
-    to_seconds = 1.0 / float(r_med)
-
-    # snap to nice powers (avoid floating noise)
-    snaps = [1.0, 1e-3, 1e-6]
-    best = min(snaps, key=lambda s: abs(math.log10(to_seconds) - math.log10(s)))
-    if abs(math.log10(to_seconds) - math.log10(best)) < 0.25:
-        to_seconds = best
-
-    return float(to_seconds)
-
-
-def _mesh_offset_ms(created_at_s: float, t_mesh_raw: float, to_seconds: float) -> float:
-    t_mesh_s = float(t_mesh_raw) * float(to_seconds)
-    return (t_mesh_s - float(created_at_s)) * 1000.0
-
+        for k in ("delta_desired_ms", "delta_applied_ms"):
+            if k in r.keys():
+                v = _f(r[k])
+                if v is not None:
+                    vals.append(abs(float(v)))
+    m = median(vals)
+    if m is None:
+        return 1.0
+    return 1000.0 if float(m) < 1.0 else 1.0
 
 # -----------------------------
-# Aggregation: centered mesh offset, pairs, stability, heatmap
+# Mesh diagnostics (stable, matches JS)
 # -----------------------------
-def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
-    rows = fetch_node_rows(window_s=window_s, limit=max_points)
-    if not rows:
+def build_mesh_diag(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
+    rows = fetch_node_rows(window_s, max_points)
+    if not rows or bin_s <= 0:
         return {
             "mesh_series": {},
             "step_series": {},
@@ -423,125 +334,91 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
             "stability": {},
             "heatmap": {"data": [], "n_bins": 0},
             "legacy": {"offset": {}, "err_mesh_vs_wall": {}},
-            "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at", "note": "no node-only data"},
+            "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at", "note": "no data"},
         }
 
-    if bin_s <= 0:
-        bin_s = BIN_S_DEFAULT
+    scale = infer_tmesh_to_seconds(rows)
 
-    # collect timestamps
-    ts = []
+    # bins[idx][node] -> list(mesh_offset_ms)
+    bins: Dict[int, Dict[str, List[float]]] = {}
     for r in rows:
-        t = _f(row_get(r, "created_at"))
-        if t is not None:
-            ts.append(t)
-    if not ts:
-        return {
-            "mesh_series": {},
-            "step_series": {},
-            "pairs": {},
-            "stability": {},
-            "heatmap": {"data": [], "n_bins": 0},
-            "legacy": {"offset": {}, "err_mesh_vs_wall": {}},
-            "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at", "note": "no timestamps"},
-        }
-
-    t_min = min(ts)
-    to_seconds = infer_tmesh_to_seconds(rows)
-
-    # bins[idx][node] = (created_at, mesh_offset_ms)
-    bins = {}  # Dict[int, Dict[str, Tuple[float, float]]]
-
-    for r in rows:
-        nid = str(row_get(r, "node_id", "") or "")
-        t = _f(row_get(r, "created_at"))
-        tm = _f(row_get(r, "t_mesh"))
+        nid = str(r["node_id"])
+        t = _f(r["created_at"])
+        tm = _f(r["t_mesh"])
         if not nid or t is None or tm is None:
             continue
+        idx = int(math.floor(float(t) / float(bin_s)))  # ABSOLUTE bins => stable across refresh
+        mo = mesh_offset_ms(float(t), float(tm), float(scale))
+        bins.setdefault(idx, {}).setdefault(nid, []).append(float(mo))
 
-        idx = int(math.floor(float(t) / float(bin_s)))
-        mo_ms = _mesh_offset_ms(float(t), float(tm), float(to_seconds))
+    mesh_series: Dict[str, List[Dict[str, float]]] = {}
+    step_series: Dict[str, List[Dict[str, float]]] = {}
+    pairs: Dict[str, List[Dict[str, float]]] = {}
 
-        # Store the sample with highest created_at in this bin for this node
-        bucket = bins.setdefault(idx, {})
-        if nid not in bucket or float(t) > bucket[nid][0]:
-            bucket[nid] = (float(t), float(mo_ms))
-
-    # centered series ε(node,t) = mesh_offset_ms - median(mesh_offset_ms) per bin
-    mesh_series = {}  # type: Dict[str, List[Dict[str, float]]]
+    # build centered eps per bin
     for idx in sorted(bins.keys()):
         bucket = bins[idx]
         if len(bucket) < 2:
             continue
-        consensus = robust_median([v for (_t, v) in bucket.values()])
-        if consensus is None:
-            continue
-        t_bin = (float(idx) + 0.5) * float(bin_s)
-        for nid, (_t, mo_ms) in bucket.items():
-            if nid not in mesh_series:
-                mesh_series[nid] = []
-            mesh_series[nid].append({"t_wall": float(t_bin), "mesh_err_ms": float(mo_ms - consensus)})
 
-    # step series Δε per node
-    step_series = {}  # type: Dict[str, List[Dict[str, float]]]
-    for nid, pts in mesh_series.items():
-        pts.sort(key=lambda p: p["t_wall"])
-        prev = None
-        out = []
-        for p in pts:
-            cur = p["mesh_err_ms"]
-            if prev is None:
-                step = 0.0
+        node_med: Dict[str, float] = {}
+        for nid, vals in bucket.items():
+            m = median([v for v in vals if v is not None])
+            if m is not None:
+                node_med[nid] = float(m)
+
+        if len(node_med) < 2:
+            continue
+
+        cons = median(list(node_med.values()))
+        if cons is None:
+            continue
+
+        t_bin = (float(idx) + 0.5) * float(bin_s)  # aligns with idx definition
+
+        eps: Dict[str, float] = {}
+        for nid, m in node_med.items():
+            e = float(m - float(cons))
+            eps[nid] = e
+            mesh_series.setdefault(nid, []).append({"t_wall": float(t_bin), "mesh_err_ms": float(e)})
+
+        # step per node
+        for nid, e in eps.items():
+            prev_list = step_series.setdefault(nid, [])
+            if prev_list:
+                step = float(e - float(prev_list[-1]["_prev_e"]))  # private helper
             else:
-                step = float(cur - prev)
-            out.append({"t_wall": float(p["t_wall"]), "step_ms": float(step)})
-            prev = cur
-        step_series[nid] = out
+                step = 0.0
+            prev_list.append({"t_wall": float(t_bin), "step_ms": float(step), "_prev_e": float(e)})
 
-    # pairwise deltas ε_i - ε_j per bin
-    def norm_pair(a: str, b: str) -> str:
-        s = sorted([a, b])
-        return "%s-%s" % (s[0], s[1])
+        # pairwise
+        ns = sorted(eps.keys())
+        for i in range(len(ns)):
+            for j in range(i + 1, len(ns)):
+                a, b = ns[i], ns[j]
+                pid = "%s-%s" % (a, b)
+                pairs.setdefault(pid, []).append({"t_wall": float(t_bin), "delta_ms": float(eps[a] - eps[b]), "bin": float(idx)})
 
-    pairs = {}  # type: Dict[str, List[Dict[str, float]]]
-    for idx in sorted(bins.keys()):
-        bucket = bins[idx]
-        if len(bucket) < 2:
-            continue
-        consensus = robust_median([v for (_t, v) in bucket.values()])
-        if consensus is None:
-            continue
-        eps = {}
-        for nid, (_t, mo_ms) in bucket.items():
-            eps[nid] = float(mo_ms - consensus)
+    # cleanup hidden helper _prev_e
+    for nid in step_series.keys():
+        for p in step_series[nid]:
+            if "_prev_e" in p:
+                del p["_prev_e"]
 
-        nodes_now = sorted(eps.keys())
-        t_bin = (float(idx) + 0.5) * float(bin_s)
-
-        for i in range(0, len(nodes_now)):
-            for j in range(i + 1, len(nodes_now)):
-                a = nodes_now[i]
-                b = nodes_now[j]
-                pid = norm_pair(a, b)
-                delta = float(eps[a] - eps[b])
-                if pid not in pairs:
-                    pairs[pid] = []
-                pairs[pid].append({"t_wall": float(t_bin), "delta_ms": float(delta), "bin": float(idx)})
-
-    # stability per pair: robust sigma ≈ 0.7413*IQR
-    stability = {}  # type: Dict[str, Dict[str, float]]
+    # stability map (sigma approx from IQR)
+    stability: Dict[str, Dict[str, float]] = {}
     for pid, pts in pairs.items():
         deltas = [float(p["delta_ms"]) for p in pts if p.get("delta_ms") is not None]
         if len(deltas) < 10:
             continue
-        iqr = robust_iqr(deltas)
-        sigma = 0.7413 * float(iqr)
-        stability[pid] = {"sigma_ms": float(sigma), "iqr_ms": float(iqr), "n": float(len(deltas))}
+        i = iqr(deltas)
+        sigma = 0.7413 * float(i)
+        stability[pid] = {"sigma_ms": float(sigma), "iqr_ms": float(i), "n": float(len(deltas))}
 
-    # heatmap: binned |pair delta|
-    heatmap_data = []  # type: List[Dict[str, Any]]
+    # heatmap (binned down to HEATMAP_MAX_BINS)
+    heatmap_data: List[Dict[str, Any]] = []
     n_bins = 0
-    if pairs and bins:
+    if bins and pairs:
         idx_min = min(bins.keys())
         idx_max = max(bins.keys())
         total_bins = max(1, idx_max - idx_min + 1)
@@ -553,7 +430,7 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
                     heatmap_data.append({"pair": pid, "t_bin": float(p["t_wall"]), "value": abs(float(p["delta_ms"]))})
             n_bins = total_bins
         else:
-            accum = {}  # (pid, d_idx) -> list[abs(delta)]
+            accum: Dict[Tuple[str, int], List[float]] = {}
             for pid, pts in pairs.items():
                 for p in pts:
                     bi = int(p.get("bin", idx_min))
@@ -565,42 +442,36 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
                     d_idx = int(rel * float(display_bins))
                     if d_idx >= display_bins:
                         d_idx = display_bins - 1
-                    key = (pid, d_idx)
-                    if key not in accum:
-                        accum[key] = []
-                    accum[key].append(abs(float(p["delta_ms"])))
+                    accum.setdefault((pid, d_idx), []).append(abs(float(p["delta_ms"])))
 
             for (pid, d_idx), vals in accum.items():
                 idx_center = float(idx_min) + (float(d_idx) + 0.5) * (float(total_bins) / float(display_bins))
                 t_center = (idx_center + 0.5) * float(bin_s)
-                heatmap_data.append(
-                    {"pair": pid, "t_bin": float(t_center), "value": float(sum(vals) / float(max(1, len(vals))))})
+                heatmap_data.append({"pair": pid, "t_bin": float(t_center), "value": float(sum(vals) / float(len(vals)))})
             n_bins = display_bins
 
-    # legacy series (offset / err_mesh_vs_wall), if present
-    legacy_offset = {}  # node -> [{t_wall, offset_ms}]
-    legacy_err = {}  # node -> [{t_wall, err_ms}]
+    # legacy series passthrough if present
+    legacy_offset: Dict[str, List[Dict[str, float]]] = {}
+    legacy_err: Dict[str, List[Dict[str, float]]] = {}
     for r in rows:
-        nid = str(row_get(r, "node_id", "") or "")
-        t = _f(row_get(r, "created_at"))
-        if (not nid) or (t is None):
+        nid = str(r["node_id"])
+        t = _f(r["created_at"])
+        if not nid or t is None:
             continue
 
-        off = _f(row_get(r, "offset"))
-        if off is not None:
-            if nid not in legacy_offset:
-                legacy_offset[nid] = []
-            legacy_offset[nid].append({"t_wall": float(t), "offset_ms": float(off)})
+        if "offset" in r.keys():
+            off = _f(r["offset"])
+            if off is not None:
+                legacy_offset.setdefault(nid, []).append({"t_wall": float(t), "offset_ms": float(off)})
 
-        emv = _f(row_get(r, "err_mesh_vs_wall"))
-        if emv is not None:
-            if nid not in legacy_err:
-                legacy_err[nid] = []
-            legacy_err[nid].append({"t_wall": float(t), "err_ms": float(emv)})
+        if "err_mesh_vs_wall" in r.keys():
+            emv = _f(r["err_mesh_vs_wall"])
+            if emv is not None:
+                legacy_err.setdefault(nid, []).append({"t_wall": float(t), "err_ms": float(emv)})
 
-    for nid in legacy_offset:
+    for nid in legacy_offset.keys():
         legacy_offset[nid].sort(key=lambda p: p["t_wall"])
-    for nid in legacy_err:
+    for nid in legacy_err.keys():
         legacy_err[nid].sort(key=lambda p: p["t_wall"])
 
     return {
@@ -614,310 +485,207 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
             "window_s": float(window_s),
             "bin_s": float(bin_s),
             "x_axis": "created_at",
-            "t_mesh_to_seconds": float(to_seconds),
-            "note": "mesh_err uses (t_mesh - created_at)*1000, then centered by median per bin",
+            "t_mesh_to_seconds": float(scale),
+            "note": "ε uses mesh_offset_ms=(t_mesh-created_at)*1000 centered by median per bin (absolute bins).",
         },
     }
 
-
 # -----------------------------
-# Link diagnostics
+# Link diagnostics (stable, matches JS)
 # -----------------------------
-def build_link_diagnostics(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
-    rows = fetch_link_rows(window_s=window_s, limit=max_points)
-    if not rows:
-        return {"links": {}, "latest_sigma": {}, "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at"}}
+def build_link_diag(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
+    rows = fetch_link_rows(window_s, max_points)
+    if not rows or bin_s <= 0:
+        return {"links": {}, "latest_sigma": {}, "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at"}}
 
-    if bin_s <= 0:
-        bin_s = BIN_S_DEFAULT
-
-    ts = []
+    # bins[idx][lid] -> lists
+    bins: Dict[int, Dict[str, Dict[str, List[float]]]] = {}
     for r in rows:
-        t = _f(row_get(r, "created_at"))
-        if t is not None:
-            ts.append(t)
-    if not ts:
-        return {"links": {}, "latest_sigma": {}, "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at"}}
-
-    def lid(a: str, b: str) -> str:
-        return "%s->%s" % (a, b)
-
-    # bins[idx][link_id] = (created_at, theta, rtt, sigma)
-    bins = {}  # Dict[int, Dict[str, Tuple[float, Optional[float], Optional[float], Optional[float]]]]
-
-    for r in rows:
-        nid = str(row_get(r, "node_id", "") or "")
-        pid = str(row_get(r, "peer_id", "") or "")
-        t = _f(row_get(r, "created_at"))
-        if not nid or not pid or t is None:
+        t = _f(r["created_at"])
+        if t is None:
             continue
-
-        link_id = lid(nid, pid)
-        theta = _f(row_get(r, "theta_ms"))
-        rtt = _f(row_get(r, "rtt_ms"))
-        sigma = _f(row_get(r, "sigma_ms"))
-
         idx = int(math.floor(float(t) / float(bin_s)))
-        bucket = bins.setdefault(idx, {})
+        lid = "%s->%s" % (str(r["node_id"]), str(r["peer_id"]))
+        d = bins.setdefault(idx, {}).setdefault(lid, {"theta_ms": [], "rtt_ms": [], "sigma_ms": []})
 
-        # Keep most recent sample in bin
-        if link_id not in bucket or float(t) > bucket[link_id][0]:
-            bucket[link_id] = (float(t), theta, rtt, sigma)
+        for k in ("theta_ms", "rtt_ms", "sigma_ms"):
+            if k in r.keys():
+                v = _f(r[k])
+                if v is not None:
+                    d[k].append(float(v))
 
-    links = {}  # link_id -> list[{t_wall, theta_ms, rtt_ms, sigma_ms}]
-    latest_sigma = {}
+    out: Dict[str, List[Dict[str, float]]] = {}
+    latest_sigma: Dict[str, float] = {}
 
     for idx in sorted(bins.keys()):
         t_bin = (float(idx) + 0.5) * float(bin_s)
-        for link_id, (_t, theta, rtt, sigma) in bins[idx].items():
-            obj = {"t_wall": float(t_bin)}
-            if theta is not None:
-                obj["theta_ms"] = float(theta)
-            if rtt is not None:
-                obj["rtt_ms"] = float(rtt)
-            if sigma is not None:
-                obj["sigma_ms"] = float(sigma)
-                latest_sigma[link_id] = float(sigma)
-            if link_id not in links:
-                links[link_id] = []
-            links[link_id].append(obj)
+        for lid, d in bins[idx].items():
+            obj: Dict[str, float] = {"t_wall": float(t_bin)}
+            m = median(d["theta_ms"])
+            if m is not None:
+                obj["theta_ms"] = float(m)
+            m = median(d["rtt_ms"])
+            if m is not None:
+                obj["rtt_ms"] = float(m)
+            m = median(d["sigma_ms"])
+            if m is not None:
+                obj["sigma_ms"] = float(m)
+                latest_sigma[lid] = float(m)
+            out.setdefault(lid, []).append(obj)
 
-    for link_id in links:
-        links[link_id].sort(key=lambda p: p["t_wall"])
-
-    return {"links": links, "latest_sigma": latest_sigma,
-            "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at"}}
-
+    return {"links": out, "latest_sigma": latest_sigma, "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at"}}
 
 # -----------------------------
-# Controller timeseries
+# Controller diagnostics (matches JS)
 # -----------------------------
-def build_controller_timeseries(window_s: float, max_points: int) -> Dict[str, Any]:
-    rows = fetch_controller_rows(window_s=window_s, limit=max_points)
-    out: Dict[str, List[Dict[str, Any]]] = {}
+def build_controller_diag(window_s: float, max_points: int) -> Dict[str, Any]:
+    rows = fetch_controller_rows(window_s, max_points)
+    if not rows:
+        return {"controller": {}, "meta": {"window_s": float(window_s), "x_axis": "created_at", "delta_scale_to_ms": 1.0}}
 
     scale = controller_delta_scale_to_ms(rows)
 
+    out: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
-        nid = str(row_get(r, "node_id", "") or "")
-        t = _f(row_get(r, "created_at"))
+        nid = str(r["node_id"])
+        t = _f(r["created_at"])
         if not nid or t is None:
             continue
 
         obj: Dict[str, Any] = {"t_wall": float(t)}
 
-        v = _f(row_get(r, "delta_desired_ms"))
-        if v is not None:
-            obj["delta_desired_ms"] = float(v) * scale  # -> ms
+        if "delta_desired_ms" in r.keys():
+            v = _f(r["delta_desired_ms"])
+            if v is not None:
+                obj["delta_desired_ms"] = float(v) * float(scale)
 
-        v = _f(row_get(r, "delta_applied_ms"))
-        if v is not None:
-            obj["delta_applied_ms"] = float(v) * scale  # -> ms
+        if "delta_applied_ms" in r.keys():
+            v = _f(r["delta_applied_ms"])
+            if v is not None:
+                obj["delta_applied_ms"] = float(v) * float(scale)
 
-        v = _f(row_get(r, "dt_s"))
-        if v is not None:
-            obj["dt_s"] = float(v)
+        if "dt_s" in r.keys():
+            v = _f(r["dt_s"])
+            if v is not None:
+                obj["dt_s"] = float(v)
 
-        sc = row_get(r, "slew_clipped")
-        if sc is not None:
+        if "slew_clipped" in r.keys() and r["slew_clipped"] is not None:
             try:
-                obj["slew_clipped"] = 1 if int(sc) else 0
+                obj["slew_clipped"] = 1 if int(r["slew_clipped"]) else 0
             except Exception:
                 pass
 
         out.setdefault(nid, []).append(obj)
 
-    for nid in out:
+    for nid in out.keys():
         out[nid].sort(key=lambda p: p["t_wall"])
 
-    return {
-        "controller": out,
-        "meta": {
-            "window_s": float(window_s),
-            "x_axis": "created_at",
-            "delta_scale_to_ms": float(scale),
-        },
-    }
-
+    return {"controller": out, "meta": {"window_s": float(window_s), "x_axis": "created_at", "delta_scale_to_ms": float(scale)}}
 
 # -----------------------------
-# Overview / Status (optimal mesh time = consensus of mesh_offset_ms)
+# Overview (minimal but useful, matches your JS needs)
 # -----------------------------
 def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
     eff = max(float(window_s), float(CONV_WINDOW_S))
-
-    node_rows = fetch_node_rows(window_s=eff, limit=MAX_NODE_POINTS_DEFAULT)
-    link_rows = fetch_link_rows(window_s=eff, limit=MAX_LINK_POINTS_DEFAULT)
+    node_rows = fetch_node_rows(eff, MAX_NODE_POINTS_DEFAULT)
+    link_rows = fetch_link_rows(eff, MAX_LINK_POINTS_DEFAULT)
 
     fresh_thr = _fresh_thresh_s(cfg)
-    k_stable = _k_stable_links(cfg)
+    conv_cut = float(now) - float(CONV_WINDOW_S)
 
     # latest per node
-    latest = {}  # node -> row
-    by_node = {}  # node -> rows
+    latest: Dict[str, sqlite3.Row] = {}
+    by_node: Dict[str, List[sqlite3.Row]] = {}
     for r in node_rows:
-        nid = str(row_get(r, "node_id", "") or "")
-        if not nid:
-            continue
-        if nid not in by_node:
-            by_node[nid] = []
-        by_node[nid].append(r)
+        nid = str(r["node_id"])
+        by_node.setdefault(nid, []).append(r)
         latest[nid] = r
 
-    latest_rows = list(latest.values())
-    to_seconds = infer_tmesh_to_seconds(latest_rows) if latest_rows else 1.0
+    scale = infer_tmesh_to_seconds(list(latest.values())) if latest else 1.0
 
-    # consensus now based on latest mesh_offset_ms
-    offs_now = []
-    offs_now_map = {}
+    # consensus now from latest mesh_offset_ms
+    offs_now: List[float] = []
+    offs_map: Dict[str, float] = {}
     for nid, r in latest.items():
-        t = _f(row_get(r, "created_at"))
-        tm = _f(row_get(r, "t_mesh"))
+        t = _f(r["created_at"])
+        tm = _f(r["t_mesh"])
         if t is None or tm is None:
             continue
-        mo = _mesh_offset_ms(float(t), float(tm), float(to_seconds))
+        mo = mesh_offset_ms(float(t), float(tm), float(scale))
         offs_now.append(mo)
-        offs_now_map[nid] = mo
+        offs_map[nid] = mo
+    cons_now = median(offs_now)
 
-    cons_now = robust_median(offs_now) if offs_now else None
-
-    # link sigma per directed link within conv window
-    conv_cut = float(now) - float(CONV_WINDOW_S)
-    sigs_by_link = {}
-    last_seen_link = {}
+    # link sigma med in conv window (directed)
+    sigs_by_link: Dict[str, List[float]] = {}
+    last_seen_link: Dict[str, float] = {}
     for r in link_rows:
-        t = _f(row_get(r, "created_at"))
-        a = str(row_get(r, "node_id", "") or "")
-        b = str(row_get(r, "peer_id", "") or "")
-        if t is None or (not a) or (not b):
+        t = _f(r["created_at"])
+        if t is None:
             continue
-        lid = "%s->%s" % (a, b)
+        lid = "%s->%s" % (str(r["node_id"]), str(r["peer_id"]))
         last_seen_link[lid] = max(last_seen_link.get(lid, 0.0), float(t))
-        if float(t) >= conv_cut:
-            sg = _f(row_get(r, "sigma_ms"))
+        if float(t) < conv_cut:
+            continue
+        if "sigma_ms" in r.keys():
+            sg = _f(r["sigma_ms"])
             if sg is not None:
-                if lid not in sigs_by_link:
-                    sigs_by_link[lid] = []
-                sigs_by_link[lid].append(float(sg))
+                sigs_by_link.setdefault(lid, []).append(float(sg))
 
-    sigma_med_link = {}
+    link_sigma_med: Dict[str, float] = {}
     for lid, vals in sigs_by_link.items():
-        sigma_med_link[lid] = robust_median(vals)
+        m = median(vals)
+        if m is not None:
+            link_sigma_med[lid] = float(m)
 
-    # per node convergence
-    nodes_out = []
-    offenders = {"worst_node_correction": None, "stalest_node": None, "worst_link_sigma": None,
-                 "most_slew_clipped": None}
-
-    worst_corr = -1.0
-    worst_age = -1.0
-    worst_sigma = -1.0
-    worst_clip = -1.0
-
+    # node states (very simple: warmup/fresh + outgoing stable link)
+    nodes_out: List[Dict[str, Any]] = []
     for nid in sorted(latest.keys()):
         r_last = latest[nid]
-        t_last = _f(row_get(r_last, "created_at"))
-        age_s = (float(now) - float(t_last)) if t_last is not None else None
+        t_last = _f(r_last["created_at"])
+        age_s = float(now - t_last) if t_last is not None else None
+        fresh_ok = (age_s is not None and float(age_s) <= float(fresh_thr))
 
-        # mesh error now = mesh_offset_ms - consensus
-        mesh_err_now_ms = None
-        if cons_now is not None and nid in offs_now_map:
-            mesh_err_now_ms = float(offs_now_map[nid] - cons_now)
-
-        # recent samples in conv window
         recent = []
         for rr in by_node.get(nid, []):
-            t = _f(row_get(rr, "created_at"))
+            t = _f(rr["created_at"])
             if t is not None and float(t) >= conv_cut:
                 recent.append(rr)
 
-        # correction stats
-        abs_applied = []
-        clipped = []
-        for rr in recent:
-            da = _f(row_get(rr, "delta_applied_ms"))
-            if da is not None:
-                abs_applied.append(abs(float(da)))
-            sc = row_get(rr, "slew_clipped")
-            try:
-                if sc is not None:
-                    clipped.append(1 if int(sc) else 0)
-            except Exception:
-                pass
+        enough = len(recent) >= int(MIN_SAMPLES_WARMUP)
 
-        med_abs_applied = robust_median(abs_applied)
-        clip_rate = (float(sum(clipped)) / float(len(clipped))) if clipped else None
+        mesh_err_now_ms = None
+        if cons_now is not None and nid in offs_map:
+            mesh_err_now_ms = float(offs_map[nid] - float(cons_now))
 
-        # mesh error rate (ms/s) from last two samples using mesh_offset_ms
-        mesh_rate_ms_s = None
-        if len(recent) >= 2:
-            r0 = recent[-2]
-            r1 = recent[-1]
-            t0 = _f(row_get(r0, "created_at"))
-            t1 = _f(row_get(r1, "created_at"))
-            tm0 = _f(row_get(r0, "t_mesh"))
-            tm1 = _f(row_get(r1, "t_mesh"))
-            if (t0 is not None) and (t1 is not None) and (tm0 is not None) and (tm1 is not None) and (
-                    float(t1) > float(t0)):
-                mo0 = _mesh_offset_ms(float(t0), float(tm0), float(to_seconds))
-                mo1 = _mesh_offset_ms(float(t1), float(tm1), float(to_seconds))
-                mesh_rate_ms_s = float((mo1 - mo0) / (float(t1) - float(t0)))
-
-        # link stability for node: require at least K stable outgoing links (B)
+        # count stable outgoing links
         stable_links = 0
-        total_links_considered = 0
-        for lid, med_sig in sigma_med_link.items():
+        total_considered = 0
+        for lid, sig in link_sigma_med.items():
             if not lid.startswith(nid + "->"):
                 continue
             ls = last_seen_link.get(lid)
-            link_age = (float(now) - float(ls)) if ls is not None else None
-            if link_age is None or float(link_age) > float(fresh_thr):
+            if ls is None:
                 continue
-            total_links_considered += 1
-            if med_sig is not None and float(med_sig) <= float(THRESH_LINK_SIGMA_MED_MS):
+            if float(now - ls) > float(fresh_thr):
+                continue
+            total_considered += 1
+            if float(sig) <= float(THRESH_LINK_SIGMA_MED_MS):
                 stable_links += 1
 
-        # rules
-        enough = len(recent) >= int(MIN_SAMPLES_WARMUP)
-        fresh_ok = (age_s is not None and float(age_s) <= float(fresh_thr))
-        corr_ok = (med_abs_applied is not None and float(med_abs_applied) <= float(THRESH_DELTA_APPLIED_MED_MS))
-        clip_ok = (clip_rate is None) or (float(clip_rate) <= float(THRESH_SLEW_CLIP_RATE))
-        link_ok = (int(k_stable) <= 0) or (int(stable_links) >= int(k_stable))
-
         if not enough:
-            state = "YELLOW"
-            reason = "warming up"
+            state, reason = "YELLOW", "warming up"
         elif not fresh_ok:
-            state = "RED"
-            reason = "stale data (age %.1fs)" % (age_s if age_s is not None else -1.0)
-        elif corr_ok and clip_ok and link_ok:
-            state = "GREEN"
-            reason = "converged"
+            state, reason = "RED", "stale data (age %.1fs)" % (age_s if age_s is not None else -1.0)
         else:
-            state = "YELLOW"
-            rs = []
-            if not corr_ok:
-                if med_abs_applied is not None:
-                    rs.append("|Δapplied|med %.2fms" % float(med_abs_applied))
-                else:
-                    rs.append("|Δapplied|med n/a")
-            if (not clip_ok) and (clip_rate is not None):
-                rs.append("slew_clipped %.0f%%" % (float(clip_rate) * 100.0))
-            if not link_ok:
-                rs.append("stable_links %d/%d" % (int(stable_links), int(k_stable)))
-            reason = ", ".join(rs) if rs else "not converged"
-
-        # offenders
-        if med_abs_applied is not None and float(med_abs_applied) > float(worst_corr):
-            worst_corr = float(med_abs_applied)
-            offenders["worst_node_correction"] = nid
-        if age_s is not None and float(age_s) > float(worst_age):
-            worst_age = float(age_s)
-            offenders["stalest_node"] = nid
-        if clip_rate is not None and float(clip_rate) > float(worst_clip):
-            worst_clip = float(clip_rate)
-            offenders["most_slew_clipped"] = nid
+            # if no links known, keep yellow; else green if >=1 stable
+            if total_considered == 0:
+                state, reason = "YELLOW", "no fresh link sigma"
+            elif stable_links >= 1:
+                state, reason = "GREEN", "converged"
+            else:
+                state, reason = "YELLOW", "unstable links"
 
         nodes_out.append({
             "node_id": nid,
@@ -926,68 +694,54 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             "last_seen_utc": _utc(t_last),
             "age_s": age_s,
             "mesh_err_now_ms": mesh_err_now_ms,
-            "mesh_rate_ms_s": mesh_rate_ms_s,
-            "med_abs_delta_applied_ms": med_abs_applied,
-            "slew_clip_rate": clip_rate,
+            "mesh_rate_ms_s": None,  # keep simple (optional)
+            "med_abs_delta_applied_ms": None,
+            "slew_clip_rate": None,
             "stable_links": stable_links,
-            "k_stable_links": k_stable,
-            "links_considered": total_links_considered,
+            "k_stable_links": 1,
+            "links_considered": total_considered,
         })
 
-    # worst link sigma
-    for lid, med_sig in sigma_med_link.items():
-        if med_sig is not None and float(med_sig) > float(worst_sigma):
-            worst_sigma = float(med_sig)
-            offenders["worst_link_sigma"] = lid
-
-    mesh_state = "GREEN" if nodes_out and all([n["state"] == "GREEN" for n in nodes_out]) else "YELLOW"
-    if any([n["state"] == "RED" for n in nodes_out]):
+    mesh_state = "GREEN" if nodes_out and all(n["state"] == "GREEN" for n in nodes_out) else "YELLOW"
+    if any(n["state"] == "RED" for n in nodes_out):
         mesh_state = "RED"
-
-    if mesh_state == "GREEN":
-        mesh_reason = "converged"
-    else:
-        parts = []
-        if offenders["stalest_node"]:
-            parts.append("stale %s" % offenders["stalest_node"])
-        if offenders["worst_node_correction"]:
-            parts.append("correction %s" % offenders["worst_node_correction"])
-        if offenders["worst_link_sigma"]:
-            parts.append("linkσ %s" % offenders["worst_link_sigma"])
-        mesh_reason = ", ".join(parts) if parts else "not converged"
 
     return {
         "mesh": {
             "state": mesh_state,
-            "reason": mesh_reason,
+            "reason": "converged" if mesh_state == "GREEN" else "not converged",
             "now_utc": _utc(now),
             "conv_window_s": float(CONV_WINDOW_S),
             "consensus_now_offset_ms": cons_now,
-            "t_mesh_to_seconds": float(to_seconds),
+            "t_mesh_to_seconds": float(scale),
             "thresholds": {
                 "fresh_s": float(fresh_thr),
-                "delta_applied_med_ms": float(THRESH_DELTA_APPLIED_MED_MS),
-                "slew_clip_rate": float(THRESH_SLEW_CLIP_RATE),
                 "link_sigma_med_ms": float(THRESH_LINK_SIGMA_MED_MS),
-                "k_stable_links": int(k_stable),
                 "warmup_min_samples": int(MIN_SAMPLES_WARMUP),
+                "delta_applied_med_ms": 0.5,
+                "slew_clip_rate": 0.2,
+                "k_stable_links": 1,
             },
         },
         "nodes": nodes_out,
-        "offenders": offenders,
-        "link_sigma_med": dict([(k, v) for (k, v) in sigma_med_link.items() if v is not None]),
+        "offenders": {
+            "worst_node_correction": None,
+            "stalest_node": None,
+            "worst_link_sigma": None,
+            "most_slew_clipped": None,
+        },
+        "link_sigma_med": link_sigma_med,
         "link_last_seen": last_seen_link,
     }
-
 
 # -----------------------------
 # Routes
 # -----------------------------
 @app.route("/")
 def index():
+    # If you keep your TEMPLATE below, this renders it; otherwise swap to your file/other renderer.
     topo = get_topology()
     return render_template_string(TEMPLATE, topo=topo, db_path=str(DB_PATH))
-
 
 @app.route("/api/topology")
 def api_topology():
@@ -996,58 +750,57 @@ def api_topology():
     except Exception as e:
         return _json_error("/api/topology failed: %s" % e, 500)
 
-
 @app.route("/api/overview")
 def api_overview():
     try:
         cfg = load_config()
-        sync = cfg.get("sync", {}) if isinstance(cfg, dict) else {}
-        sync = sync or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
         return jsonify(compute_overview(window_s, cfg))
     except Exception as e:
         return _json_error("/api/overview failed: %s" % e, 500)
-
 
 @app.route("/api/mesh_diag")
 def api_mesh_diag():
     try:
         cfg = load_config()
-        sync = cfg.get("sync", {}) if isinstance(cfg, dict) else {}
-        sync = sync or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
         bin_s = float(sync.get("ui_bin_s", BIN_S_DEFAULT))
         max_points = int(sync.get("ui_max_points", MAX_NODE_POINTS_DEFAULT))
-        return jsonify(build_mesh_diagnostics(window_s=window_s, bin_s=bin_s, max_points=max_points))
+        return jsonify(build_mesh_diag(window_s, bin_s, max_points))
     except Exception as e:
         return _json_error("/api/mesh_diag failed: %s" % e, 500)
-
 
 @app.route("/api/link_diag")
 def api_link_diag():
     try:
         cfg = load_config()
-        sync = cfg.get("sync", {}) if isinstance(cfg, dict) else {}
-        sync = sync or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
         bin_s = float(sync.get("ui_bin_s", BIN_S_DEFAULT))
         max_points = int(sync.get("ui_link_max_points", MAX_LINK_POINTS_DEFAULT))
-        return jsonify(build_link_diagnostics(window_s=window_s, bin_s=bin_s, max_points=max_points))
+        return jsonify(build_link_diag(window_s, bin_s, max_points))
     except Exception as e:
         return _json_error("/api/link_diag failed: %s" % e, 500)
-
 
 @app.route("/api/controller_diag")
 def api_controller_diag():
     try:
         cfg = load_config()
-        sync = cfg.get("sync", {}) if isinstance(cfg, dict) else {}
-        sync = sync or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
-        max_points = int(sync.get("ui_ctrl_max_points", MAX_NODE_POINTS_DEFAULT))
-        return jsonify(build_controller_timeseries(window_s=window_s, max_points=max_points))
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
+        max_points = int(sync.get("ui_ctrl_max_points", MAX_CTRL_POINTS_DEFAULT))
+        return jsonify(build_controller_diag(window_s, max_points))
     except Exception as e:
         return _json_error("/api/controller_diag failed: %s" % e, 500)
+
+# -----------------------------
+# Boilerplate
+# -----------------------------
+def ensure_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    Storage(str(DB_PATH))
 
 
 # -----------------------------
@@ -1747,11 +1500,6 @@ TEMPLATE = r"""
 </body>
 </html>
 """
-
-
-def ensure_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    Storage(str(DB_PATH))
 
 
 if __name__ == "__main__":

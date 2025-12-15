@@ -3,20 +3,12 @@
 #
 # MeshTime Dashboard (Single Page) — Operator + Debug
 #
-# Key principles:
-#   - created_at (sink clock) is the global x-axis
+# Principles:
+#   - x-axis is created_at (sink clock)
 #   - "theoretisch optimale Meshzeit" = robust consensus = median(t_mesh across nodes) per time bin
-#   - primary: centered mesh time error ε_i(t) = t_mesh(i,t) - t*(t)   (ms)
-#   - pairwise and link metrics are diagnosis, not "truth"
-#   - MUST NEVER crash due to None / missing columns
-#
-# DB: table ntp_reference
-#   - node-only rows: peer_id IS NULL (or peer_id col may not exist)
-#   - link rows:      peer_id NOT NULL
-#
-# Fields used (if present):
-#   node-only: node_id, created_at, t_mesh, offset (optional), delta_desired_ms, delta_applied_ms, dt_s, slew_clipped
-#   link:     node_id, peer_id, created_at, theta_ms, rtt_ms, sigma_ms
+#   - primary: centered mesh error ε_i(t) = t_mesh(i,t) - consensus(t)   (ms)
+#   - never crash on missing columns / None
+#   - NO "ms twice" bug: robust unit inference + consistent scaling
 
 from __future__ import annotations
 
@@ -41,11 +33,11 @@ app = Flask(__name__)
 # -----------------------------
 # UI tuning
 # -----------------------------
-WINDOW_SECONDS_DEFAULT = 600.0      # UI window
-BIN_S_DEFAULT = 0.5                # bin width on created_at axis
-MAX_NODE_POINTS_DEFAULT = 12000
-MAX_LINK_POINTS_DEFAULT = 24000
-HEATMAP_MAX_BINS = 50
+WINDOW_SECONDS_DEFAULT = 600.0
+BIN_S_DEFAULT = 0.5
+MAX_NODE_POINTS_DEFAULT = 20000
+MAX_LINK_POINTS_DEFAULT = 30000
+HEATMAP_MAX_BINS = 60
 
 # Convergence thresholds
 CONV_WINDOW_S = 30.0
@@ -56,10 +48,10 @@ THRESH_SLEW_CLIP_RATE = 0.20
 THRESH_LINK_SIGMA_MED_MS = 2.0
 
 FRESH_MIN_S = 3.0
-FRESH_MULT = 6.0  # fresh = max(FRESH_MIN_S, beacon_period_s * FRESH_MULT)
+FRESH_MULT = 6.0
 
-# Stable links rule (B): require at least K stable links
 K_STABLE_LINKS_DEFAULT = 1
+
 
 # -----------------------------
 # Helpers (must never crash)
@@ -148,13 +140,6 @@ def robust_iqr(values: List[float]) -> float:
     return float(_quantile_sorted(xs, 0.75) - _quantile_sorted(xs, 0.25))
 
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    try:
-        return max(float(lo), min(float(hi), float(v)))
-    except Exception:
-        return float(lo)
-
-
 def load_config() -> Dict[str, Any]:
     try:
         if not CFG_PATH.exists():
@@ -190,7 +175,6 @@ def get_topology() -> Dict[str, Any]:
                 neigh = str(neigh)
             except Exception:
                 continue
-            # undirected link list for drawing; metrics are directed in DB
             if node_id < neigh:
                 links.append({"source": node_id, "target": neigh})
 
@@ -220,7 +204,7 @@ def _k_stable_links(cfg: Dict[str, Any]) -> int:
 
 
 # -----------------------------
-# DB readers (robust to missing cols)
+# DB readers
 # -----------------------------
 def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
     conn = get_conn()
@@ -231,7 +215,7 @@ def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
 
         wanted = [
             "id", "node_id", "created_at",
-            "t_mesh", "offset",
+            "t_mesh", "offset", "err_mesh_vs_wall",
             "delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped",
         ]
         sel = [c for c in wanted if c in cols]
@@ -293,76 +277,102 @@ def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
 
 
 # -----------------------------
-# t_mesh scaling (no mystery factor)
+# Unit inference (fixes "ms twice")
 # -----------------------------
-def tmesh_scale_to_ms(rows: List[sqlite3.Row]) -> float:
+def infer_time_unit_per_second_from_deltas(rows: List[sqlite3.Row], value_col: str) -> Optional[float]:
     """
-    Robustly infer t_mesh units by comparing its increments to created_at increments.
+    Infer unit factor relative to seconds based on median ratio:
+      ratio = Δvalue / Δcreated_at
 
-    We estimate r = median(Δt_mesh / Δcreated_at) over consecutive samples of the same node.
-      r ~ 1        => t_mesh in seconds
-      r ~ 1000     => t_mesh in milliseconds
-      r ~ 1e6      => t_mesh in microseconds
-    Then scale_to_ms = 1000 / r.
+    If value is:
+      - seconds: ratio ~ 1
+      - milliseconds: ratio ~ 1000
+      - microseconds: ratio ~ 1e6
+
+    Returns the snapped unit_per_second in {1, 1e3, 1e6} if confident, else None.
     """
-    # gather per-node consecutive deltas
     by_node: Dict[str, List[Tuple[float, float]]] = {}
+
     for r in rows:
         nid = str(row_get(r, "node_id", "") or "")
         tc = _f(row_get(r, "created_at"))
-        tm = _f(row_get(r, "t_mesh"))
-        if not nid or tc is None or tm is None:
+        vv = _f(row_get(r, value_col))
+        if not nid or tc is None or vv is None:
             continue
-        by_node.setdefault(nid, []).append((tc, tm))
+        by_node.setdefault(nid, []).append((tc, vv))
 
     ratios: List[float] = []
-    for nid, pts in by_node.items():
+    for pts in by_node.values():
         pts.sort(key=lambda x: x[0])
         for i in range(1, len(pts)):
-            t0, m0 = pts[i - 1]
-            t1, m1 = pts[i]
+            t0, v0 = pts[i - 1]
+            t1, v1 = pts[i]
             dt = float(t1 - t0)
-            dm = float(m1 - m0)
+            dv = float(v1 - v0)
             if dt <= 1e-6:
                 continue
-            # ignore wild jumps / resets
-            if abs(dm) <= 0:
+            # ignore tiny dv and resets
+            if abs(dv) <= 0:
                 continue
-            ratio = dm / dt
-            # keep only plausible positive ratios
-            if ratio > 0 and ratio < 1e9:
-                ratios.append(ratio)
+            ratio = dv / dt
+            if ratio <= 0:
+                continue
+            # plausible ranges to avoid glitches nuking the median
+            if ratio < 1e-3 or ratio > 1e9:
+                continue
+            ratios.append(ratio)
 
     r_med = robust_median(ratios)
     if r_med is None or r_med <= 0:
-        # fallback: assume seconds
+        return None
+
+    # snap in log-space
+    candidates = [1.0, 1e3, 1e6]
+    best = min(candidates, key=lambda c: abs(math.log10(r_med) - math.log10(c)))
+
+    # accept only if within ~0.35 decades (~2.2x)
+    if abs(math.log10(r_med) - math.log10(best)) <= 0.35:
+        return float(best)
+    return None
+
+
+def scale_value_to_ms(rows: List[sqlite3.Row], value_col: str) -> float:
+    """
+    Returns scale such that: value_ms = value_raw * scale
+
+    For t_mesh: inferred via delta-ratio (best).
+    For offset/err_mesh_vs_wall: try delta-ratio if possible, else magnitude heuristic.
+    """
+    unit_per_s = infer_time_unit_per_second_from_deltas(rows, value_col)
+
+    if unit_per_s is not None:
+        # if value unit is (unit_per_s * seconds), then ms = value * (1000 / unit_per_s)
+        return float(1000.0 / unit_per_s)
+
+    # fallback heuristic by magnitude of absolute median
+    vals = []
+    for r in rows:
+        v = _f(row_get(r, value_col))
+        if v is None:
+            continue
+        vals.append(abs(float(v)))
+    med = robust_median(vals) if vals else None
+    if med is None:
+        # safest default for time-like fields in this project is seconds
         return 1000.0
 
-    scale = 1000.0 / float(r_med)
-
-    # snap to nice scales if close (avoid tiny floating drift)
-    snaps = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 1000.0]
-    best = min(snaps, key=lambda s: abs(math.log10(scale) - math.log10(s)))
-    # only snap if within ~0.2 decades (~1.58x)
-    if abs(math.log10(scale) - math.log10(best)) < 0.2:
-        scale = best
-
-    return float(scale)
-
+    # typical offsets/errors are small if in seconds (<10), huge if in us
+    if med >= 1e5:
+        return 0.001  # us -> ms
+    if med >= 1e2:
+        return 1.0    # ms -> ms
+    return 1000.0     # s -> ms
 
 
 # -----------------------------
-# Aggregation: centered mesh time, pairs, stability, heatmap
+# Aggregation: centered mesh + old node plots + pairs etc.
 # -----------------------------
 def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
-    """
-    Returns:
-      mesh_series: per node [{t_wall, mesh_err_ms}]  where mesh_err_ms = t_mesh_ms - median(t_mesh_ms across nodes) per bin
-      step_series: per node [{t_wall, step_ms}]      where step_ms = Δ(mesh_err_ms) per node
-      pairs: per pair [{t_wall, delta_ms, bin}]
-      stability: per pair {sigma_ms, iqr_ms, n}
-      heatmap: {data:[{pair,t_bin,value}], n_bins}
-    """
     rows = fetch_node_rows(window_s=window_s, limit=max_points)
     if not rows:
         return {
@@ -371,18 +381,20 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
             "pairs": {},
             "stability": {},
             "heatmap": {"data": [], "n_bins": 0},
+            "offset_series": {},
+            "err_mesh_vs_wall_series": {},
             "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at", "note": "no node-only data"},
         }
 
     if bin_s <= 0:
         bin_s = BIN_S_DEFAULT
 
-    # axis & scale
-    ts = []
-    for r in rows:
-        t = _f(row_get(r, "created_at"))
-        if t is not None:
-            ts.append(t)
+    # scale inference (no ms-twice)
+    scale_tmesh = scale_value_to_ms(rows, "t_mesh")
+    scale_offset = scale_value_to_ms(rows, "offset") if any(row_get(r, "offset") is not None for r in rows) else 1000.0
+    scale_err = scale_value_to_ms(rows, "err_mesh_vs_wall") if any(row_get(r, "err_mesh_vs_wall") is not None for r in rows) else 1000.0
+
+    ts = [t for r in rows if (t := _f(row_get(r, "created_at"))) is not None]
     if not ts:
         return {
             "mesh_series": {},
@@ -390,11 +402,37 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
             "pairs": {},
             "stability": {},
             "heatmap": {"data": [], "n_bins": 0},
+            "offset_series": {},
+            "err_mesh_vs_wall_series": {},
             "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at", "note": "no timestamps"},
         }
-    t_min = min(ts)
-    scale = tmesh_scale_to_ms(rows)
 
+    t_min = min(ts)
+
+    # also export legacy series (offset/err_mesh_vs_wall), raw timeline (no binning needed)
+    offset_series: Dict[str, List[Dict[str, float]]] = {}
+    err_series: Dict[str, List[Dict[str, float]]] = {}
+
+    for r in rows:
+        nid = str(row_get(r, "node_id", "") or "")
+        t = _f(row_get(r, "created_at"))
+        if not nid or t is None:
+            continue
+
+        off = _f(row_get(r, "offset"))
+        if off is not None:
+            offset_series.setdefault(nid, []).append({"t_wall": float(t), "offset_ms": float(off * scale_offset)})
+
+        emvw = _f(row_get(r, "err_mesh_vs_wall"))
+        if emvw is not None:
+            err_series.setdefault(nid, []).append({"t_wall": float(t), "err_mesh_vs_wall_ms": float(emvw * scale_err)})
+
+    for nid in offset_series:
+        offset_series[nid].sort(key=lambda p: p["t_wall"])
+    for nid in err_series:
+        err_series[nid].sort(key=lambda p: p["t_wall"])
+
+    # bin node t_mesh for consensus
     # bins[idx][node] = (t_last, tmesh_ms)
     bins: Dict[int, Dict[str, Tuple[float, float]]] = {}
     for r in rows:
@@ -409,20 +447,20 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
         bucket = bins.setdefault(idx, {})
         prev = bucket.get(nid)
         if (prev is None) or (t >= prev[0]):
-            bucket[nid] = (t, tm * scale)
+            bucket[nid] = (t, float(tm) * scale_tmesh)
 
-    # compute centered ε per bin and build mesh_series
+    # compute centered ε per bin
     mesh_series: Dict[str, List[Dict[str, float]]] = {}
     for idx in sorted(bins.keys()):
         bucket = bins[idx]
         if len(bucket) < 2:
             continue
-        consensus = robust_median([v for (_t, v) in bucket.values()])
-        if consensus is None:
+        consensus_ms = robust_median([v for (_t, v) in bucket.values()])
+        if consensus_ms is None:
             continue
         t_bin = t_min + (idx + 0.5) * bin_s
         for nid, (_t, tmesh_ms) in bucket.items():
-            mesh_series.setdefault(nid, []).append({"t_wall": float(t_bin), "mesh_err_ms": float(tmesh_ms - consensus)})
+            mesh_series.setdefault(nid, []).append({"t_wall": float(t_bin), "mesh_err_ms": float(tmesh_ms - consensus_ms)})
 
     # per-node step series (Δε)
     step_series: Dict[str, List[Dict[str, float]]] = {}
@@ -431,7 +469,7 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
         prev = None
         out = []
         for p in pts:
-            cur = p["mesh_err_ms"]
+            cur = float(p["mesh_err_ms"])
             step = 0.0 if prev is None else float(cur - prev)
             out.append({"t_wall": float(p["t_wall"]), "step_ms": float(step)})
             prev = cur
@@ -442,16 +480,14 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
         return "-".join(sorted([a, b]))
 
     pairs: Dict[str, List[Dict[str, float]]] = {}
-    # Rebuild per bin epsilon map from mesh_series is tricky (missing nodes per bin).
-    # Use original bins + consensus again and compute ε on the fly per bin.
     for idx in sorted(bins.keys()):
         bucket = bins[idx]
         if len(bucket) < 2:
             continue
-        consensus = robust_median([v for (_t, v) in bucket.values()])
-        if consensus is None:
+        consensus_ms = robust_median([v for (_t, v) in bucket.values()])
+        if consensus_ms is None:
             continue
-        eps = {nid: (tmesh_ms - consensus) for nid, (_t, tmesh_ms) in bucket.items()}
+        eps = {nid: (tmesh_ms - consensus_ms) for nid, (_t, tmesh_ms) in bucket.items()}
         nodes_now = sorted(eps.keys())
         t_bin = t_min + (idx + 0.5) * bin_s
         for i in range(len(nodes_now)):
@@ -510,12 +546,23 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
         "pairs": pairs,
         "stability": stability,
         "heatmap": {"data": heatmap_data, "n_bins": int(n_bins)},
-        "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at", "t_mesh_scale_to_ms": float(scale)},
+        "offset_series": offset_series,
+        "err_mesh_vs_wall_series": err_series,
+        "meta": {
+            "window_s": float(window_s),
+            "bin_s": float(bin_s),
+            "x_axis": "created_at",
+            "scale": {
+                "t_mesh_to_ms": float(scale_tmesh),
+                "offset_to_ms": float(scale_offset),
+                "err_mesh_vs_wall_to_ms": float(scale_err),
+            },
+        },
     }
 
 
 # -----------------------------
-# Link series (theta/rtt/sigma) + latest sigma
+# Link diagnostics
 # -----------------------------
 def build_link_diagnostics(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
     rows = fetch_link_rows(window_s=window_s, limit=max_points)
@@ -525,13 +572,10 @@ def build_link_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
     if bin_s <= 0:
         bin_s = BIN_S_DEFAULT
 
-    ts = []
-    for r in rows:
-        t = _f(row_get(r, "created_at"))
-        if t is not None:
-            ts.append(t)
+    ts = [t for r in rows if (t := _f(row_get(r, "created_at"))) is not None]
     if not ts:
         return {"links": {}, "latest_sigma": {}, "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at"}}
+
     t_min = min(ts)
 
     def lid(a: str, b: str) -> str:
@@ -611,7 +655,7 @@ def build_controller_timeseries(window_s: float, max_points: int) -> Dict[str, A
 
 
 # -----------------------------
-# Overview / Status (optimal mesh time, not vs C)
+# Overview / Status (optimal mesh time, not vs C) + stable links rule
 # -----------------------------
 def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
@@ -623,7 +667,6 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
     fresh_thr = _fresh_thresh_s(cfg)
     k_stable = _k_stable_links(cfg)
 
-    # latest per node
     latest: Dict[str, sqlite3.Row] = {}
     by_node: Dict[str, List[sqlite3.Row]] = {}
     for r in node_rows:
@@ -633,18 +676,18 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
         by_node.setdefault(nid, []).append(r)
         latest[nid] = r
 
-    # consensus now based on latest t_mesh
-    scale = tmesh_scale_to_ms(list(latest.values())) if latest else 1000.0
-    tmesh_now = []
+    # consensus now based on latest t_mesh (scaled correctly)
+    scale_tmesh = scale_value_to_ms(list(latest.values()), "t_mesh") if latest else 1000.0
+    tmesh_now_ms: List[float] = []
     tmesh_now_map: Dict[str, float] = {}
     for nid, r in latest.items():
         tm = _f(row_get(r, "t_mesh"))
         if tm is not None:
-            v = tm * scale
-            tmesh_now.append(v)
-            tmesh_now_map[nid] = v
+            v_ms = float(tm) * scale_tmesh
+            tmesh_now_ms.append(v_ms)
+            tmesh_now_map[nid] = v_ms
 
-    cons_now = robust_median(tmesh_now) if tmesh_now else None
+    consensus_now_ms = robust_median(tmesh_now_ms) if tmesh_now_ms else None
 
     # link sigma per directed link within conv window
     conv_cut = now - float(CONV_WINDOW_S)
@@ -665,7 +708,6 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     sigma_med_link: Dict[str, Optional[float]] = {lid: robust_median(vals) for lid, vals in sigs_by_link.items()}
 
-    # per node convergence
     nodes_out: List[Dict[str, Any]] = []
     offenders = {"worst_node_correction": None, "stalest_node": None, "worst_link_sigma": None, "most_slew_clipped": None}
 
@@ -679,19 +721,16 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
         t_last = _f(row_get(r_last, "created_at"))
         age_s = (now - t_last) if t_last is not None else None
 
-        # mesh error now = t_mesh_ms - consensus
         mesh_err_now_ms = None
-        if cons_now is not None and nid in tmesh_now_map:
-            mesh_err_now_ms = float(tmesh_now_map[nid] - cons_now)
+        if consensus_now_ms is not None and nid in tmesh_now_map:
+            mesh_err_now_ms = float(tmesh_now_map[nid] - consensus_now_ms)
 
-        # recent samples in conv window
         recent = []
         for rr in by_node.get(nid, []):
             t = _f(row_get(rr, "created_at"))
             if t is not None and t >= conv_cut:
                 recent.append(rr)
 
-        # correction stats
         abs_applied = []
         clipped = []
         for rr in recent:
@@ -708,7 +747,6 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
         med_abs_applied = robust_median(abs_applied)
         clip_rate = (sum(clipped) / len(clipped)) if clipped else None
 
-        # mesh error rate (ms/s) from last two node-only samples (t_mesh)
         mesh_rate_ms_s = None
         if len(recent) >= 2:
             r0 = recent[-2]
@@ -718,15 +756,14 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             tm0 = _f(row_get(r0, "t_mesh"))
             tm1 = _f(row_get(r1, "t_mesh"))
             if t0 is not None and t1 is not None and tm0 is not None and tm1 is not None and t1 > t0:
-                mesh_rate_ms_s = float(((tm1 - tm0) * scale) / (t1 - t0))
+                mesh_rate_ms_s = float(((tm1 - tm0) * scale_tmesh) / (t1 - t0))
 
-        # link stability for node: require at least K stable outgoing links (B)
+        # stable links rule (B): require at least K stable outgoing links
         stable_links = 0
         total_links_considered = 0
         for lid, med_sig in sigma_med_link.items():
             if not lid.startswith(nid + "->"):
                 continue
-            # link is UP if it has recent samples
             ls = last_seen_link.get(lid)
             link_age = (now - ls) if ls is not None else None
             if link_age is None or link_age > fresh_thr:
@@ -735,7 +772,6 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             if med_sig is not None and med_sig <= THRESH_LINK_SIGMA_MED_MS:
                 stable_links += 1
 
-        # rules
         enough = len(recent) >= MIN_SAMPLES_WARMUP
         fresh_ok = (age_s is not None and age_s <= fresh_thr)
         corr_ok = (med_abs_applied is not None and med_abs_applied <= THRESH_DELTA_APPLIED_MED_MS)
@@ -747,7 +783,7 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             reason = "warming up"
         elif not fresh_ok:
             state = "RED"
-            reason = f"stale data (age {age_s:.1f}s)"
+            reason = f"stale data (age {age_s:.1f}s)" if age_s is not None else "stale data"
         elif corr_ok and clip_ok and link_ok:
             state = "GREEN"
             reason = "converged"
@@ -762,7 +798,6 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
                 rs.append(f"stable_links {stable_links}/{k_stable}")
             reason = ", ".join(rs) if rs else "not converged"
 
-        # offenders
         if med_abs_applied is not None and med_abs_applied > worst_corr:
             worst_corr = med_abs_applied
             offenders["worst_node_correction"] = nid
@@ -788,18 +823,15 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             "links_considered": total_links_considered,
         })
 
-    # worst link sigma (use medians when available)
     for lid, med_sig in sigma_med_link.items():
         if med_sig is not None and med_sig > worst_sigma:
             worst_sigma = med_sig
             offenders["worst_link_sigma"] = lid
 
-    # mesh-level status
     mesh_state = "GREEN" if nodes_out and all(n["state"] == "GREEN" for n in nodes_out) else "YELLOW"
     if any(n["state"] == "RED" for n in nodes_out):
         mesh_state = "RED"
 
-    # mesh-level reason is deterministic
     if mesh_state == "GREEN":
         mesh_reason = "converged"
     else:
@@ -818,8 +850,8 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             "reason": mesh_reason,
             "now_utc": _utc(now),
             "conv_window_s": float(CONV_WINDOW_S),
-            "consensus_now_ms": cons_now,
-            "t_mesh_scale_to_ms": float(scale),
+            "consensus_now_ms": consensus_now_ms,
+            "scale_t_mesh_to_ms": float(scale_tmesh),
             "thresholds": {
                 "fresh_s": float(fresh_thr),
                 "delta_applied_med_ms": float(THRESH_DELTA_APPLIED_MED_MS),
@@ -831,7 +863,6 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
         },
         "nodes": nodes_out,
         "offenders": offenders,
-        # for topology coloring
         "link_sigma_med": {k: v for k, v in sigma_med_link.items() if v is not None},
         "link_last_seen": last_seen_link,
     }
@@ -985,7 +1016,6 @@ TEMPLATE = r"""
     </div>
   </div>
 
-  <!-- 10-second answer header + node tiles -->
   <div class="card" style="margin-top:1rem;">
     <div class="row sp">
       <div class="row">
@@ -1006,6 +1036,7 @@ TEMPLATE = r"""
     </div>
 
     <div class="sub" style="margin-top:0.6rem;" id="offendersLine">lade…</div>
+    <div class="sub mono" style="margin-top:0.35rem;" id="scaleLine">scale: …</div>
   </div>
 
   <div class="grid">
@@ -1013,7 +1044,7 @@ TEMPLATE = r"""
       <div class="card">
         <h2 style="font-size:1.05rem;">Topologie</h2>
         <canvas id="meshCanvas"></canvas>
-        <div class="sub">Node-Farbe = Konvergenz-Ampel. Link-Farbe/Dicke = σ (median im Conv-Window, max beider Richtungen).</div>
+        <div class="sub">Node-Farbe = Ampel. Link-Farbe/Dicke = σ (median im Conv-Window, max beider Richtungen).</div>
       </div>
 
       <div class="card" style="margin-top:1rem;">
@@ -1042,13 +1073,13 @@ TEMPLATE = r"""
 
     <div>
       <div class="card">
-        <h2 style="font-size:1.05rem;">Centered Mesh-Time: t_mesh(node) − Konsens (Median) über Zeit</h2>
-        <div class="sub">Das ist ε(node,t) in ms. Konsens wird pro Bin berechnet (robust, median).</div>
+        <h2 style="font-size:1.05rem;">Centered Mesh-Time: ε(node,t) = t_mesh(node) − Konsens (Median) (ms)</h2>
+        <div class="sub">Konsens wird pro Bin berechnet. ε ist der Plot, der “wirklich stimmt”.</div>
         <canvas id="meshChart" height="170"></canvas>
 
         <div class="plots">
           <div>
-            <h3 class="small">Pairwise Mesh-Error: ε_i − ε_j (ms)</h3>
+            <h3 class="small">Pairwise: ε_i − ε_j (ms)</h3>
             <canvas id="pairChart" height="150"></canvas>
           </div>
           <div>
@@ -1056,12 +1087,23 @@ TEMPLATE = r"""
             <canvas id="stepChart" height="150"></canvas>
           </div>
           <div>
-            <h3 class="small">Pair Stability (robust): σ ≈ 0.741·IQR(ε_i − ε_j) (ms)</h3>
+            <h3 class="small">Pair Stability: σ ≈ 0.741·IQR(ε_i − ε_j) (ms)</h3>
             <canvas id="stabilityBar" height="150"></canvas>
           </div>
           <div>
             <h3 class="small">Heatmap: |ε_i − ε_j| (ms) (binned)</h3>
             <canvas id="heatmapChart" height="150"></canvas>
+          </div>
+        </div>
+
+        <div class="plots" style="margin-top:1rem;">
+          <div>
+            <h3 class="small">offset (ms) (legacy)</h3>
+            <canvas id="offsetChart" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">err_mesh_vs_wall (ms) (legacy)</h3>
+            <canvas id="errChart" height="150"></canvas>
           </div>
         </div>
       </div>
@@ -1085,8 +1127,8 @@ TEMPLATE = r"""
           </div>
           <div class="small">
             <b>Interpretation:</b><br>
-            σ hoch → Link noisy/unstable → Konvergenz wird gelb/rot mit Grund.<br>
-            RTT spiky → Medium/Queueing. θ spiky → Asymmetrie/Peer/Bootstrap.
+            σ hoch → Link noisy/unstable → Ampel wird gelb/rot.<br>
+            RTT spiky → Queueing/Medium. θ spiky → Asymmetrie/Bootstrap.
           </div>
         </div>
       </div>
@@ -1116,7 +1158,7 @@ TEMPLATE = r"""
       </div>
 
       <div class="small muted" style="margin-top:1rem;">
-        Reality check: Wenn es “stabil aussieht”, aber Ampel ist gelb/rot → schau Reason: stale? correction? stable_links? slew_clipped?
+        Wenn es “stabil aussieht”, aber Ampel ist gelb/rot → schau Reason (stale? correction? stable_links? slew_clipped?).
       </div>
     </div>
   </div>
@@ -1126,6 +1168,7 @@ TEMPLATE = r"""
 
   let meshChart, pairChart, stepChart, stabilityBar, heatmapChart;
   let thetaChart, rttChart, sigmaBar;
+  let offsetChart, errChart;
   let deltaDesiredChart, deltaAppliedChart, dtLineChart, slewLineChart;
 
   function pillClass(state){
@@ -1401,7 +1444,6 @@ TEMPLATE = r"""
       return Math.max(s1,s2);
     }
 
-    // draw links with sigma-based style
     links.forEach(l=>{
       const a = pos[l.source], b = pos[l.target];
       if(!a || !b) return;
@@ -1420,7 +1462,6 @@ TEMPLATE = r"""
       ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
     });
 
-    // draw nodes
     nodes.forEach(node=>{
       const p = pos[node.id]; if(!p) return;
       const st = nodeStates[node.id] || 'YELLOW';
@@ -1479,6 +1520,9 @@ TEMPLATE = r"""
     stabilityBar   = mkBar(document.getElementById('stabilityBar').getContext('2d'), 'σ_pair', 'ms');
     heatmapChart   = mkHeatmap(document.getElementById('heatmapChart').getContext('2d'));
 
+    offsetChart    = mkLine(document.getElementById('offsetChart').getContext('2d'), 'ms');
+    errChart       = mkLine(document.getElementById('errChart').getContext('2d'), 'ms');
+
     thetaChart     = mkLine(document.getElementById('thetaChart').getContext('2d'), 'ms');
     rttChart       = mkLine(document.getElementById('rttChart').getContext('2d'), 'ms');
     sigmaBar       = mkBar(document.getElementById('sigmaBar').getContext('2d'), 'σ latest', 'ms');
@@ -1499,28 +1543,28 @@ TEMPLATE = r"""
         fetchJson('/api/controller_diag'),
       ]);
 
-      // header
       const M = ov.mesh || {};
       setMeshHeader(
         M.state || 'YELLOW',
         `${M.state || '…'}: ${M.reason || ''}`,
-        `now=${M.now_utc || 'n/a'} · conv_window=${M.conv_window_s || '?'}s · scale(t_mesh→ms)=${(M.t_mesh_scale_to_ms ?? '?')}`
+        `now=${M.now_utc || 'n/a'} · conv_window=${M.conv_window_s || '?'}s · t_mesh_scale=${(M.scale_t_mesh_to_ms ?? '?')} (raw→ms)`
       );
 
       const T = (M.thresholds || {});
       document.getElementById('thrLine').textContent =
         `fresh≤${T.fresh_s ?? '?'}s  |Δapplied|med≤${T.delta_applied_med_ms ?? '?'}ms  linkσmed≤${T.link_sigma_med_ms ?? '?'}ms  clip≤${Math.round((T.slew_clip_rate ?? 0)*100)}%  K_stable_links=${T.k_stable_links ?? '?'}  warmup≥${T.warmup_min_samples ?? '?'} samples`;
 
-      // offenders
       const off = ov.offenders || {};
       document.getElementById('offendersLine').textContent =
         `worst correction: ${off.worst_node_correction || '—'} · stalest: ${off.stalest_node || '—'} · most clipped: ${off.most_slew_clipped || '—'} · worst link σ: ${off.worst_link_sigma || '—'}`;
 
-      // node tiles + status table
+      const S = (mesh.meta && mesh.meta.scale) || {};
+      document.getElementById('scaleLine').textContent =
+        `scale: t_mesh→ms=${S.t_mesh_to_ms ?? '?'}  offset→ms=${S.offset_to_ms ?? '?'}  err_mesh_vs_wall→ms=${S.err_mesh_vs_wall_to_ms ?? '?'}`;
+
       renderNodeKpis(ov.nodes || []);
       renderStatusTable(ov.nodes || []);
 
-      // topology
       const nodeStates = {};
       (ov.nodes || []).forEach(n => { nodeStates[n.node_id] = n.state; });
 
@@ -1529,20 +1573,20 @@ TEMPLATE = r"""
       meshCanvas.height = meshCanvas.clientHeight;
       drawMesh(meshCanvas, topo, nodeStates, ov.link_sigma_med || {});
 
-      // plots: mesh/pairs/step/stability/heatmap
       updateLine(meshChart, mesh.mesh_series || {}, "mesh_err_ms", "Node ");
       updatePairs(pairChart, mesh.pairs || {});
       updateLine(stepChart, mesh.step_series || {}, "step_ms", "Node ");
       updateBarFromMap(stabilityBar, mesh.stability || {}, "sigma_ms");
       updateHeatmap(heatmapChart, mesh.heatmap || {data:[], n_bins:0});
 
-      // link plots
+      updateLine(offsetChart, mesh.offset_series || {}, "offset_ms", "Node ");
+      updateLine(errChart, mesh.err_mesh_vs_wall_series || {}, "err_mesh_vs_wall_ms", "Node ");
+
       const links = link.links || {};
       updateLine(thetaChart, links, "theta_ms", "");
       updateLine(rttChart, links, "rtt_ms", "");
       updateSigmaBar(sigmaBar, link.latest_sigma || {});
 
-      // controller node dropdown
       const ctrlMap = ctrl.controller || {};
       const sel = document.getElementById('ctrlNode');
       const nodeIds = Object.keys(ctrlMap).sort();

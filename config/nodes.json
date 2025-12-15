@@ -27,11 +27,11 @@
 
       "q_offset": 10e-9,
       "q_drift": 3e-15,
-      "q_bias": 3e-10,
-      "r_base": 2e-9,
+      "q_bias": 3e-8,
+      "r_base": 2e-4,
 
       "adaptive_r": {
-        "R_min": 1e-7,
+        "R_min": 1e-5,
         "c_rtt": 1
       }
     },

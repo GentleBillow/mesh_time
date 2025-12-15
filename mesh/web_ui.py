@@ -462,25 +462,48 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
     t_min = min(ts)
     to_seconds = infer_tmesh_to_seconds(rows)
 
-    # bins[idx][node] = (t_last, mesh_offset_ms)
-    bins = {}  # type: Dict[int, Dict[str, Tuple[float, float]]]
+    import math
+
+    # bins[idx][node] = list of tmesh_ms samples
+    bins = {}  # Dict[int, Dict[str, List[float]]]
+
     for r in rows:
         nid = str(row_get(r, "node_id", "") or "")
         t = _f(row_get(r, "created_at"))
         tm = _f(row_get(r, "t_mesh"))
-        if (not nid) or (t is None) or (tm is None):
+        if not nid or t is None or tm is None:
             continue
-        idx = int((float(t) - float(t_min)) / float(bin_s))
-        if idx < 0:
+
+        idx = int(math.floor(t / bin_s))  # <-- FIX: absolute bin
+        bucket = bins.setdefault(idx, {})
+        bucket.setdefault(nid, []).append(tm * scale)
+
+    mesh_series = {}
+    for idx in sorted(bins.keys()):
+        bucket = bins[idx]
+        if len(bucket) < 2:
             continue
-        mo = _mesh_offset_ms(float(t), float(tm), float(to_seconds))
-        bucket = bins.get(idx)
-        if bucket is None:
-            bucket = {}
-            bins[idx] = bucket
-        prev = bucket.get(nid)
-        if (prev is None) or (float(t) >= prev[0]):
-            bucket[nid] = (float(t), float(mo))
+
+        # per-node median inside bin
+        node_med = {}
+        for nid, vals in bucket.items():
+            m = robust_median([v for v in vals if v is not None])
+            if m is not None:
+                node_med[nid] = m
+
+        if len(node_med) < 2:
+            continue
+
+        consensus = robust_median(list(node_med.values()))
+        if consensus is None:
+            continue
+
+        t_bin = (idx + 0.5) * bin_s
+        for nid, m in node_med.items():
+            mesh_series.setdefault(nid, []).append({
+                "t_wall": float(t_bin),
+                "mesh_err_ms": float(m - consensus)
+            })
 
     # centered series ε(node,t) = mesh_offset_ms - median(mesh_offset_ms) per bin
     mesh_series = {}  # type: Dict[str, List[Dict[str, float]]]
@@ -658,28 +681,48 @@ def build_link_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
     def lid(a: str, b: str) -> str:
         return "%s->%s" % (a, b)
 
-    bins = {}  # idx -> link_id -> (t, theta, rtt, sigma)
-    for r in rows:
-        t = _f(row_get(r, "created_at"))
-        a = str(row_get(r, "node_id", "") or "")
-        b = str(row_get(r, "peer_id", "") or "")
-        if t is None or (not a) or (not b):
-            continue
-        theta = _f(row_get(r, "theta_ms"))
-        rtt = _f(row_get(r, "rtt_ms"))
-        sigma = _f(row_get(r, "sigma_ms"))
+    import math
 
-        idx = int((float(t) - float(t_min)) / float(bin_s))
-        if idx < 0:
+    # bins[idx][node] = list of tmesh_ms samples
+    bins = {}  # Dict[int, Dict[str, List[float]]]
+
+    for r in rows:
+        nid = str(row_get(r, "node_id", "") or "")
+        t = _f(row_get(r, "created_at"))
+        tm = _f(row_get(r, "t_mesh"))
+        if not nid or t is None or tm is None:
             continue
-        bid = bins.get(idx)
-        if bid is None:
-            bid = {}
-            bins[idx] = bid
-        link_id = lid(a, b)
-        prev = bid.get(link_id)
-        if (prev is None) or (float(t) >= prev[0]):
-            bid[link_id] = (float(t), theta, rtt, sigma)
+
+        idx = int(math.floor(t / bin_s))  # <-- FIX: absolute bin
+        bucket = bins.setdefault(idx, {})
+        bucket.setdefault(nid, []).append(tm * scale)
+
+    mesh_series = {}
+    for idx in sorted(bins.keys()):
+        bucket = bins[idx]
+        if len(bucket) < 2:
+            continue
+
+        # per-node median inside bin
+        node_med = {}
+        for nid, vals in bucket.items():
+            m = robust_median([v for v in vals if v is not None])
+            if m is not None:
+                node_med[nid] = m
+
+        if len(node_med) < 2:
+            continue
+
+        consensus = robust_median(list(node_med.values()))
+        if consensus is None:
+            continue
+
+        t_bin = (idx + 0.5) * bin_s
+        for nid, m in node_med.items():
+            mesh_series.setdefault(nid, []).append({
+                "t_wall": float(t_bin),
+                "mesh_err_ms": float(m - consensus)
+            })
 
     links = {}  # link_id -> list[{t_wall, theta_ms, rtt_ms, sigma_ms}]
     latest_sigma = {}

@@ -17,6 +17,11 @@
 #   - Pairwise ΔOffset + robust jitter + heatmap
 #   - Link metrics θ/RTT/σ
 #   - Controller debug (delta_desired/applied, dt, slew_clipped)
+#
+# HARD RULE:
+#   This server must NEVER crash due to formatting None values.
+
+from __future__ import annotations
 
 import json
 import math
@@ -24,7 +29,7 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 
 from flask import Flask, render_template_string, jsonify, make_response
 
@@ -69,6 +74,11 @@ def get_conn():
     return conn
 
 
+def _table_cols(conn: sqlite3.Connection, table: str) -> Set[str]:
+    cur = conn.cursor()
+    return {row[1] for row in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
 def load_config() -> Dict[str, Any]:
     if not CFG_PATH.exists():
         return {}
@@ -99,11 +109,6 @@ def get_topology() -> Dict[str, Any]:
     return {"nodes": nodes, "links": links}
 
 
-def _table_cols(conn: sqlite3.Connection, table: str) -> set:
-    cur = conn.cursor()
-    return {row[1] for row in cur.execute(f"PRAGMA table_info({table})").fetchall()}
-
-
 def _utc(ts: Optional[float]) -> str:
     if ts is None:
         return "n/a"
@@ -111,6 +116,45 @@ def _utc(ts: Optional[float]) -> str:
         return datetime.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return "n/a"
+
+
+# ---------- formatting helpers (NEVER crash on None) ----------
+def _f(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def fmt(x: Any, spec: str = ".2f", default: str = "n/a") -> str:
+    v = _f(x)
+    if v is None:
+        return default
+    try:
+        return format(v, spec)
+    except Exception:
+        return default
+
+
+def fmt_ms(x: Any, default: str = "n/a") -> str:
+    v = fmt(x, ".2f", default)
+    return v if v == default else f"{v} ms"
+
+
+def fmt_s(x: Any, default: str = "n/a") -> str:
+    v = fmt(x, ".1f", default)
+    return v if v == default else f"{v} s"
+
+
+def fmt_pct(x: Any, default: str = "n/a") -> str:
+    v = fmt(x, ".0f", default)
+    return v if v == default else f"{v}%"
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 # ------------------------------------------------------------
@@ -158,25 +202,42 @@ def robust_median(values: List[float]) -> float:
 
 
 # ------------------------------------------------------------
-# DB Readers (node-only vs link rows)
+# DB Readers (node-only vs link rows) - robust to missing columns
 # ------------------------------------------------------------
+def _select_existing(cols: Set[str], wanted: List[str]) -> List[str]:
+    return [c for c in wanted if c in cols]
+
+
 def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
     conn = get_conn()
-    cur = conn.cursor()
+    cols = _table_cols(conn, "ntp_reference")
+
+    wanted = [
+        "id", "node_id", "created_at", "offset",
+        "peer_id",  # for filter availability; might exist
+        "delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped",
+        "t_wall", "t_mesh", "t_mono", "err_mesh_vs_wall",
+    ]
+    sel = _select_existing(cols, wanted)
+
+    if "node_id" not in cols or "created_at" not in cols:
+        conn.close()
+        return []
+
+    # If peer_id exists: enforce node-only.
+    peer_filter = "AND peer_id IS NULL" if "peer_id" in cols else ""
+
     cutoff = time.time() - float(window_s)
-    rows = cur.execute(
-        """
-        SELECT id, node_id, created_at, offset,
-               delta_desired_ms, delta_applied_ms, dt_s, slew_clipped,
-               t_wall, t_mesh, t_mono, err_mesh_vs_wall
+    cur = conn.cursor()
+    q = f"""
+        SELECT {", ".join(sel)}
         FROM ntp_reference
         WHERE created_at >= ?
-          AND peer_id IS NULL
+        {peer_filter}
         ORDER BY created_at ASC
         LIMIT ?
-        """,
-        (cutoff, int(limit)),
-    ).fetchall()
+    """
+    rows = cur.execute(q, (cutoff, int(limit))).fetchall()
     conn.close()
     return rows
 
@@ -184,12 +245,14 @@ def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
 def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
     conn = get_conn()
     cols = _table_cols(conn, "ntp_reference")
+
     needed = {"peer_id", "theta_ms", "rtt_ms", "sigma_ms", "created_at", "node_id"}
     if not needed.issubset(cols):
         conn.close()
         return []
-    cur = conn.cursor()
+
     cutoff = time.time() - float(window_s)
+    cur = conn.cursor()
     rows = cur.execute(
         """
         SELECT id, node_id, peer_id, created_at, theta_ms, rtt_ms, sigma_ms
@@ -211,44 +274,41 @@ def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
 # ------------------------------------------------------------
 def compute_overview(window_s: float = WINDOW_SECONDS_DEFAULT) -> Dict[str, Any]:
     now = time.time()
-    node_rows = fetch_node_rows(window_s=max(window_s, CONV_WINDOW_S), limit=MAX_POINTS_DEFAULT)
-    link_rows = fetch_link_rows(window_s=max(window_s, CONV_WINDOW_S), limit=LINK_MAX_POINTS_DEFAULT)
+
+    # Always include at least the convergence window for scoring.
+    eff_window = max(float(window_s), float(CONV_WINDOW_S))
+
+    node_rows = fetch_node_rows(window_s=eff_window, limit=MAX_POINTS_DEFAULT)
+    link_rows = fetch_link_rows(window_s=eff_window, limit=LINK_MAX_POINTS_DEFAULT)
 
     # latest node sample per node
     latest: Dict[str, sqlite3.Row] = {}
     by_node_recent: Dict[str, List[sqlite3.Row]] = {}
 
     for r in node_rows:
-        nid = str(r["node_id"])
+        nid = str(r.get("node_id"))
         by_node_recent.setdefault(nid, []).append(r)
         latest[nid] = r
 
     # link sigmas per directed link in convergence window
     link_sigmas: Dict[str, List[float]] = {}
     link_latest_sigma: Dict[str, float] = {}
-    link_latest: Dict[str, sqlite3.Row] = {}
+
     for r in link_rows:
         lid = f"{r['node_id']}->{r['peer_id']}"
-        sig = r["sigma_ms"]
+        sig = _f(r["sigma_ms"])
         if sig is not None:
-            try:
-                s = float(sig)
-                link_sigmas.setdefault(lid, []).append(s)
-                link_latest_sigma[lid] = s
-            except Exception:
-                pass
-        link_latest[lid] = r
+            link_sigmas.setdefault(lid, []).append(sig)
+            link_latest_sigma[lid] = sig
 
     # compute "mesh median offset" from latest offsets
-    latest_offsets_ms = []
+    latest_offsets_ms: List[float] = []
     for r in latest.values():
-        try:
-            latest_offsets_ms.append(float(r["offset"]) * 1000.0)
-        except Exception:
-            pass
+        off = _f(r.get("offset"))
+        if off is not None:
+            latest_offsets_ms.append(off * 1000.0)
     mesh_median_ms = robust_median(latest_offsets_ms) if latest_offsets_ms else 0.0
 
-    # per-node metrics + convergence
     nodes_out: List[Dict[str, Any]] = []
     offenders = {
         "worst_node_delta": None,
@@ -262,43 +322,47 @@ def compute_overview(window_s: float = WINDOW_SECONDS_DEFAULT) -> Dict[str, Any]
     worst_sigma = -1.0
     worst_clip_rate = -1.0
 
+    conv_cut = now - float(CONV_WINDOW_S)
+
     for nid, r in sorted(latest.items(), key=lambda kv: kv[0]):
-        created_at = float(r["created_at"]) if r["created_at"] is not None else None
+        created_at = _f(r.get("created_at"))
         age_s = (now - created_at) if created_at is not None else None
 
         # offset centered around mesh median
         offset_ms = None
         centered_ms = None
-        try:
-            offset_ms = float(r["offset"]) * 1000.0
+        off = _f(r.get("offset"))
+        if off is not None:
+            offset_ms = off * 1000.0
             centered_ms = offset_ms - mesh_median_ms
-        except Exception:
-            offset_ms = None
-            centered_ms = None
 
-        # controller stats in last CONV_WINDOW_S
-        recent = [x for x in by_node_recent.get(nid, []) if (x["created_at"] is not None and float(x["created_at"]) >= now - CONV_WINDOW_S)]
-        deltas_applied = []
-        clipped = []
+        # controller stats in last CONV_WINDOW_S (from node-only rows)
+        recent = []
+        for x in by_node_recent.get(nid, []):
+            t = _f(x.get("created_at"))
+            if t is not None and t >= conv_cut:
+                recent.append(x)
+
+        deltas_applied: List[float] = []
+        clipped: List[int] = []
+
         for x in recent:
-            da = x["delta_applied_ms"]
+            da = _f(x.get("delta_applied_ms"))
             if da is not None:
-                try:
-                    deltas_applied.append(abs(float(da)))
-                except Exception:
-                    pass
-            sc = x["slew_clipped"]
-            if sc is not None:
-                try:
+                deltas_applied.append(abs(da))
+
+            sc = x.get("slew_clipped")
+            try:
+                if sc is not None:
                     clipped.append(1 if int(sc) else 0)
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         med_abs_delta_applied_ms = robust_median(deltas_applied) if deltas_applied else None
         clip_rate = (sum(clipped) / len(clipped)) if clipped else None
 
         # link sigma summary for links originating from nid
-        sigs_from_node = []
+        sigs_from_node: List[float] = []
         for lid, sigs in link_sigmas.items():
             if lid.startswith(nid + "->") and sigs:
                 sigs_from_node.extend(sigs)
@@ -310,28 +374,26 @@ def compute_overview(window_s: float = WINDOW_SECONDS_DEFAULT) -> Dict[str, Any]
         clip_ok = (clip_rate is None) or (clip_rate <= THRESH_SLEW_CLIP_RATE)
         link_ok = (link_sigma_med is None) or (link_sigma_med <= THRESH_LINK_SIGMA_MED_MS)
 
-        # traffic sanity: must have at least a few samples in window
         enough_samples = len(recent) >= 3
 
-        # state + reason
         if not enough_samples:
             state = "YELLOW"
             reason = "warming up / too few samples"
         elif not fresh_ok:
             state = "RED"
-            reason = f"stale data (age {age_s:.1f}s)"
+            reason = f"stale data (age {fmt(age_s,'.1f','n/a')}s)"
         elif delta_ok and clip_ok and link_ok:
             state = "GREEN"
             reason = "converged"
         else:
             state = "YELLOW"
-            reasons = []
+            reasons: List[str] = []
             if not delta_ok:
-                reasons.append(f"delta_applied_med {med_abs_delta_applied_ms:.2f}ms")
+                reasons.append(f"delta_applied_med {fmt(med_abs_delta_applied_ms,'.2f','n/a')}ms")
             if not clip_ok and clip_rate is not None:
-                reasons.append(f"slew_clipped {clip_rate*100:.0f}%")
+                reasons.append(f"slew_clipped {fmt(clip_rate * 100.0,'.0f','n/a')}%")
             if not link_ok and link_sigma_med is not None:
-                reasons.append(f"link_sigma_med {link_sigma_med:.2f}ms")
+                reasons.append(f"link_sigma_med {fmt(link_sigma_med,'.2f','n/a')}ms")
             reason = ", ".join(reasons) if reasons else "not converged"
 
         # offenders
@@ -360,7 +422,7 @@ def compute_overview(window_s: float = WINDOW_SECONDS_DEFAULT) -> Dict[str, Any]
             "reason": reason,
         })
 
-    # worst link sigma
+    # worst link sigma (latest in window)
     for lid, sig in link_latest_sigma.items():
         if sig is not None and sig > worst_sigma:
             worst_sigma = sig
@@ -379,7 +441,7 @@ def compute_overview(window_s: float = WINDOW_SECONDS_DEFAULT) -> Dict[str, Any]
                 "slew_clip_rate": THRESH_SLEW_CLIP_RATE,
                 "link_sigma_med_ms": THRESH_LINK_SIGMA_MED_MS,
             },
-        }
+        },
     }
 
 
@@ -388,16 +450,22 @@ def compute_overview(window_s: float = WINDOW_SECONDS_DEFAULT) -> Dict[str, Any]
 # ------------------------------------------------------------
 def get_status_snapshot(reference_node: str = "C") -> Dict[str, Any]:
     conn = get_conn()
-    cur = conn.cursor()
+    cols = _table_cols(conn, "ntp_reference")
+    if not {"node_id", "created_at", "offset"}.issubset(cols):
+        conn.close()
+        return {"rows": [], "reference_node": reference_node}
 
+    peer_filter = "WHERE peer_id IS NULL" if "peer_id" in cols else ""
+
+    cur = conn.cursor()
     last_by_node = cur.execute(
-        """
+        f"""
         SELECT r.*
         FROM ntp_reference r
         JOIN (
           SELECT node_id, MAX(id) AS max_id
           FROM ntp_reference
-          WHERE peer_id IS NULL
+          {peer_filter}
           GROUP BY node_id
         ) t ON t.node_id = r.node_id AND t.max_id = r.id
         ORDER BY r.node_id
@@ -411,37 +479,23 @@ def get_status_snapshot(reference_node: str = "C") -> Dict[str, Any]:
     ref_offset_ms: Optional[float] = None
     for r in last_by_node:
         if r["node_id"] == reference_node:
-            try:
-                ref_offset_ms = float(r["offset"]) * 1000.0
-            except Exception:
-                ref_offset_ms = None
+            off = _f(r.get("offset"))
+            if off is not None:
+                ref_offset_ms = off * 1000.0
 
     for r in last_by_node:
         node_id = r["node_id"]
 
-        offset_ms = None
-        created_at = None
-        t_wall = None
+        off = _f(r.get("offset"))
+        offset_ms = (off * 1000.0) if off is not None else None
 
-        try:
-            offset_ms = float(r["offset"]) * 1000.0
-        except Exception:
-            pass
-
-        try:
-            created_at = float(r["created_at"])
-        except Exception:
-            created_at = now
-
-        try:
-            t_wall = float(r["t_wall"]) if r["t_wall"] is not None else None
-        except Exception:
-            t_wall = None
-
+        created_at = _f(r.get("created_at"))
         age_s = (now - created_at) if created_at is not None else None
 
+        t_wall = _f(r.get("t_wall")) if "t_wall" in r.keys() else None
+
         delta_vs_ref_ms = None
-        if (offset_ms is not None) and (ref_offset_ms is not None):
+        if offset_ms is not None and ref_offset_ms is not None:
             delta_vs_ref_ms = offset_ms - ref_offset_ms
 
         rows_out.append({
@@ -468,52 +522,42 @@ def get_ntp_timeseries(
     max_points: int = MAX_POINTS_DEFAULT,
     bin_s: float = BIN_S_DEFAULT
 ) -> Dict[str, Any]:
-
-    rows = fetch_node_rows(window_s=window_seconds, limit=max_points)
+    rows = fetch_node_rows(window_s=float(window_seconds), limit=int(max_points))
 
     if not rows:
         return {
-            "series": {},
-            "pairs": {},
-            "jitter": {},
+            "series": {}, "pairs": {}, "jitter": {},
             "heatmap": {"data": [], "n_bins": 0},
             "meta": {"bin_s": bin_s, "window_seconds": window_seconds, "x_axis": "created_at"},
         }
 
     t_list: List[float] = []
     for r in rows:
-        try:
-            t_list.append(float(r["created_at"]))
-        except Exception:
-            pass
+        t = _f(r.get("created_at"))
+        if t is not None:
+            t_list.append(t)
 
     if not t_list:
         return {
-            "series": {},
-            "pairs": {},
-            "jitter": {},
+            "series": {}, "pairs": {}, "jitter": {},
             "heatmap": {"data": [], "n_bins": 0},
             "meta": {"bin_s": bin_s, "window_seconds": window_seconds, "x_axis": "created_at"},
         }
 
     t_min = min(t_list)
-    t_max = max(t_list)
-    if t_max <= t_min:
-        t_max = t_min + bin_s
+    if bin_s <= 0:
+        bin_s = BIN_S_DEFAULT
 
     # bins[idx][node] = (created_at, offset_ms)
     bins: Dict[int, Dict[str, Tuple[float, float]]] = {}
 
     for r in rows:
         node = str(r["node_id"])
-        try:
-            t = float(r["created_at"])
-        except Exception:
+        t = _f(r.get("created_at"))
+        off = _f(r.get("offset"))
+        if t is None or off is None:
             continue
-        try:
-            offset_ms = float(r["offset"]) * 1000.0
-        except Exception:
-            continue
+        offset_ms = off * 1000.0
 
         idx = int((t - t_min) / bin_s)
         if idx < 0:
@@ -544,11 +588,9 @@ def get_ntp_timeseries(
         pts.sort(key=lambda p: p["t_wall"])
         prev = None
         for p in pts:
-            if prev is None:
-                p["delta_offset_ms"] = 0.0
-            else:
-                p["delta_offset_ms"] = p["offset_ms"] - prev
-            prev = p["offset_ms"]
+            cur = p["offset_ms"]
+            p["delta_offset_ms"] = 0.0 if prev is None else (cur - prev)
+            prev = cur
 
     # pairwise deltas
     def norm_pair(a: str, b: str) -> str:
@@ -560,7 +602,6 @@ def get_ntp_timeseries(
         nodes_now = sorted(bucket.keys())
         if len(nodes_now) < 2:
             continue
-
         t_bin = t_min + (idx + 0.5) * bin_s
         off = {n: bucket[n][1] for n in nodes_now}
 
@@ -613,9 +654,9 @@ def get_ntp_timeseries(
             accum: Dict[Tuple[str, int], List[float]] = {}
             for pair_id, pts in pairs.items():
                 for p in pts:
-                    idx = int(p.get("bin", idx_min))
-                    idx = max(idx_min, min(idx_max, idx))
-                    rel = (idx - idx_min) / max(1.0, float(total_bins))
+                    bi = int(p.get("bin", idx_min))
+                    bi = max(idx_min, min(idx_max, bi))
+                    rel = (bi - idx_min) / max(1.0, float(total_bins))
                     d_idx = int(rel * display_bins)
                     if d_idx >= display_bins:
                         d_idx = display_bins - 1
@@ -647,20 +688,20 @@ def get_link_timeseries(
     max_points: int = LINK_MAX_POINTS_DEFAULT,
     bin_s: float = BIN_S_DEFAULT
 ) -> Dict[str, Any]:
-
-    rows = fetch_link_rows(window_s=window_seconds, limit=max_points)
+    rows = fetch_link_rows(window_s=float(window_seconds), limit=int(max_points))
     if not rows:
         return {"links": {}, "latest_sigma": {}, "meta": {"bin_s": bin_s, "window_seconds": window_seconds, "x_axis": "created_at"}}
 
     t_list: List[float] = []
     for r in rows:
-        try:
-            t_list.append(float(r["created_at"]))
-        except Exception:
-            pass
+        t = _f(r.get("created_at"))
+        if t is not None:
+            t_list.append(t)
     if not t_list:
         return {"links": {}, "latest_sigma": {}, "meta": {"bin_s": bin_s, "window_seconds": window_seconds, "x_axis": "created_at"}}
 
+    if bin_s <= 0:
+        bin_s = BIN_S_DEFAULT
     t_min = min(t_list)
 
     def lid(node_id: str, peer_id: str) -> str:
@@ -669,19 +710,19 @@ def get_link_timeseries(
     bins: Dict[int, Dict[str, Tuple[float, Optional[float], Optional[float], Optional[float]]]] = {}
 
     for r in rows:
-        try:
-            t = float(r["created_at"])
-        except Exception:
+        t = _f(r.get("created_at"))
+        if t is None:
             continue
+
         nid = str(r["node_id"])
         pid = str(r["peer_id"]) if r["peer_id"] is not None else None
         if not pid:
             continue
 
         link_id = lid(nid, pid)
-        theta_ms = float(r["theta_ms"]) if r["theta_ms"] is not None else None
-        rtt_ms = float(r["rtt_ms"]) if r["rtt_ms"] is not None else None
-        sigma_ms = float(r["sigma_ms"]) if r["sigma_ms"] is not None else None
+        theta_ms = _f(r.get("theta_ms"))
+        rtt_ms = _f(r.get("rtt_ms"))
+        sigma_ms = _f(r.get("sigma_ms"))
 
         idx = int((t - t_min) / bin_s)
         if idx < 0:
@@ -699,7 +740,7 @@ def get_link_timeseries(
         bucket = bins[idx]
         t_bin = t_min + (idx + 0.5) * bin_s
         for link_id, (_t, theta_ms, rtt_ms, sigma_ms) in bucket.items():
-            obj = {"t_wall": t_bin}
+            obj: Dict[str, Any] = {"t_wall": t_bin}
             if theta_ms is not None:
                 obj["theta_ms"] = theta_ms
             if rtt_ms is not None:
@@ -719,29 +760,34 @@ def get_link_timeseries(
 # Controller debug timeseries (node-only)
 # ------------------------------------------------------------
 def get_controller_timeseries(window_seconds: int = WINDOW_SECONDS_DEFAULT, max_points: int = 8000) -> Dict[str, Any]:
-    rows = fetch_node_rows(window_s=window_seconds, limit=max_points)
+    rows = fetch_node_rows(window_s=float(window_seconds), limit=int(max_points))
     by_node: Dict[str, List[Dict[str, Any]]] = {}
+
     for r in rows:
         nid = str(r["node_id"])
-        try:
-            t = float(r["created_at"])
-        except Exception:
+        t = _f(r.get("created_at"))
+        if t is None:
             continue
-        obj = {"t_wall": t}
+
+        obj: Dict[str, Any] = {"t_wall": t}
+
         for k in ["delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped"]:
+            if k not in r.keys():
+                continue
             v = r[k]
             if v is None:
                 continue
+
             if k == "slew_clipped":
                 try:
                     obj[k] = 1 if int(v) else 0
                 except Exception:
                     pass
             else:
-                try:
-                    obj[k] = float(v)
-                except Exception:
-                    pass
+                fv = _f(v)
+                if fv is not None:
+                    obj[k] = fv
+
         by_node.setdefault(nid, []).append(obj)
 
     for nid, pts in by_node.items():
@@ -771,6 +817,7 @@ def api_topology():
 def api_status():
     try:
         cfg = load_config()
+        # choose ref node: prefer C, else first lettered node
         ref = "C" if "C" in cfg else "A"
         return jsonify(get_status_snapshot(reference_node=ref))
     except Exception as e:
@@ -782,7 +829,7 @@ def api_overview():
     try:
         cfg = load_config()
         sync_cfg = (cfg.get("sync", {}) or {})
-        window_s = int(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        window_s = float(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
         return jsonify(compute_overview(window_s))
     except Exception as e:
         return _json_error(f"/api/overview failed: {e}", 500)
@@ -793,10 +840,10 @@ def api_ntp_timeseries():
     try:
         cfg = load_config()
         sync_cfg = (cfg.get("sync", {}) or {})
-        window_s = int(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        window_s = float(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
         bin_s = float(sync_cfg.get("ui_bin_s", BIN_S_DEFAULT))
         max_points = int(sync_cfg.get("ui_max_points", MAX_POINTS_DEFAULT))
-        return jsonify(get_ntp_timeseries(window_seconds=window_s, max_points=max_points, bin_s=bin_s))
+        return jsonify(get_ntp_timeseries(window_seconds=int(window_s), max_points=max_points, bin_s=bin_s))
     except Exception as e:
         return _json_error(f"/api/ntp_timeseries failed: {e}", 500)
 
@@ -806,10 +853,10 @@ def api_link_timeseries():
     try:
         cfg = load_config()
         sync_cfg = (cfg.get("sync", {}) or {})
-        window_s = int(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        window_s = float(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
         bin_s = float(sync_cfg.get("ui_bin_s", BIN_S_DEFAULT))
         max_points = int(sync_cfg.get("ui_link_max_points", LINK_MAX_POINTS_DEFAULT))
-        return jsonify(get_link_timeseries(window_seconds=window_s, max_points=max_points, bin_s=bin_s))
+        return jsonify(get_link_timeseries(window_seconds=int(window_s), max_points=max_points, bin_s=bin_s))
     except Exception as e:
         return _json_error(f"/api/link_timeseries failed: {e}", 500)
 
@@ -819,16 +866,16 @@ def api_controller_timeseries():
     try:
         cfg = load_config()
         sync_cfg = (cfg.get("sync", {}) or {})
-        window_s = int(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        window_s = float(sync_cfg.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
         max_points = int(sync_cfg.get("ui_ctrl_max_points", 8000))
-        return jsonify(get_controller_timeseries(window_seconds=window_s, max_points=max_points))
+        return jsonify(get_controller_timeseries(window_seconds=int(window_s), max_points=max_points))
     except Exception as e:
         return _json_error(f"/api/controller_timeseries failed: {e}", 500)
 
 
 @app.template_filter("datetime_utc")
 def datetime_utc(ts):
-    return _utc(ts)
+    return _utc(_f(ts))
 
 
 # ------------------------------------------------------------
@@ -1250,8 +1297,13 @@ TEMPLATE = r"""
     const offenders = ov?.offenders || {};
 
     const thr = meta.thresholds || {};
+    const freshS = (thr.fresh_s !== null && thr.fresh_s !== undefined) ? thr.fresh_s : '?';
+    const dmed   = (thr.delta_applied_med_ms !== null && thr.delta_applied_med_ms !== undefined) ? thr.delta_applied_med_ms : '?';
+    const clip   = (thr.slew_clip_rate !== null && thr.slew_clip_rate !== undefined) ? Math.round(thr.slew_clip_rate*100) : '?';
+    const lsig   = (thr.link_sigma_med_ms !== null && thr.link_sigma_med_ms !== undefined) ? thr.link_sigma_med_ms : '?';
+
     document.getElementById('overviewMeta').textContent =
-      `now=${meta.now_utc || 'n/a'} · conv_window=${meta.conv_window_s || '?'}s · thresholds: fresh≤${thr.fresh_s}s, |Δapplied|med≤${thr.delta_applied_med_ms}ms, clip≤${Math.round((thr.slew_clip_rate||0)*100)}%, linkσmed≤${thr.link_sigma_med_ms}ms`;
+      `now=${meta.now_utc || 'n/a'} · conv_window=${meta.conv_window_s || '?'}s · thresholds: fresh≤${freshS}s, |Δapplied|med≤${dmed}ms, clip≤${clip}%, linkσmed≤${lsig}ms`;
 
     const kpiWrap = document.getElementById('nodeKpis');
     kpiWrap.innerHTML = '';
@@ -1261,7 +1313,7 @@ TEMPLATE = r"""
       const age = (n.age_s !== null && n.age_s !== undefined) ? n.age_s.toFixed(1)+' s' : 'n/a';
       const da  = (n.med_abs_delta_applied_ms !== null && n.med_abs_delta_applied_ms !== undefined) ? n.med_abs_delta_applied_ms.toFixed(2)+' ms' : 'n/a';
       const sig = (n.link_sigma_med_ms !== null && n.link_sigma_med_ms !== undefined) ? n.link_sigma_med_ms.toFixed(2)+' ms' : '—';
-      const clip = (n.slew_clip_rate !== null && n.slew_clip_rate !== undefined) ? Math.round(n.slew_clip_rate*100)+'%' : '—';
+      const clipr = (n.slew_clip_rate !== null && n.slew_clip_rate !== undefined) ? Math.round(n.slew_clip_rate*100)+'%' : '—';
 
       const div = document.createElement('div');
       div.className = 'kpi';
@@ -1271,14 +1323,13 @@ TEMPLATE = r"""
           <span class="${pillClass(n.state)}">${n.state}</span>
         </div>
         <div class="value">${off}</div>
-        <div class="hint">age ${age} · |Δapplied|med ${da} · clip ${clip} · linkσmed ${sig}</div>
-        <div class="small muted">${n.reason}</div>
+        <div class="hint">age ${age} · |Δapplied|med ${da} · clip ${clipr} · linkσmed ${sig}</div>
+        <div class="small muted">${n.reason || ''}</div>
       `;
       kpiWrap.appendChild(div);
     });
 
-    const offLine = document.getElementById('offendersLine');
-    offLine.textContent =
+    document.getElementById('offendersLine').textContent =
       `worst |Δapplied|: ${offenders.worst_node_delta || '—'} · stalest: ${offenders.worst_node_freshness || '—'} · most clipped: ${offenders.most_slew_clipped || '—'} · worst link σ: ${offenders.worst_link_sigma || '—'}`;
   }
 
@@ -1365,7 +1416,7 @@ TEMPLATE = r"""
       const isRoot = !!node.is_root;
       const r = isRoot ? 20 : 16;
 
-      let fill = 'rgba(241,196,15,0.14)';  // yellow
+      let fill = 'rgba(241,196,15,0.14)';
       let stroke = '#f1c40f';
       if (st === 'GREEN'){ fill='rgba(46,204,113,0.18)'; stroke='#2ecc71'; }
       if (st === 'RED'){ fill='rgba(231,76,60,0.18)'; stroke='#e74c3c'; }
@@ -1420,14 +1471,12 @@ TEMPLATE = r"""
       updateLineChart(rttChart, links, "rtt_ms", "");
       updateLinkSigmaBar(linkSigmaBarChart, link.latest_sigma || {});
 
-      // controller
       const c = ctrl.controller || {};
       updateLineChart(deltaDesiredChart, c, "delta_desired_ms", "Node ");
       updateLineChart(deltaAppliedChart, c, "delta_applied_ms", "Node ");
       updateLineChart(dtChart, c, "dt_s", "Node ");
       updateLineChart(slewChart, c, "slew_clipped", "Node ");
 
-      // topology coloring based on overview states
       const nodeStates = {};
       (ov.nodes || []).forEach(n => { nodeStates[n.node_id] = n.state; });
 

@@ -28,7 +28,7 @@
       "q_offset": 10e-9,
       "q_drift": 3e-15,
       "q_bias": 3e-10,
-      "r_base": 2e-5,
+      "r_base": 2e-9,
 
       "adaptive_r": {
         "R_min": 1e-7,

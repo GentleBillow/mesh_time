@@ -2,7 +2,7 @@
   "sync": {
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 5,
+    "max_slew_per_second_ms": 10,
 
     "coap_timeout_s": 0.6,
     "beacon_period_s": 0.5,
@@ -28,7 +28,7 @@
       "q_offset": 10e-9,
       "q_drift": 3e-15,
       "q_bias": 3e-10,
-      "r_base": 2e-7,
+      "r_base": 2e-5,
 
       "adaptive_r": {
         "R_min": 1e-7,

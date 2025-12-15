@@ -222,6 +222,30 @@ def _k_stable_links(cfg: Dict[str, Any]) -> int:
     except Exception:
         return K_STABLE_LINKS_DEFAULT
 
+def controller_delta_scale_to_ms(rows: List[sqlite3.Row]) -> float:
+    """
+    Deine delta_*_ms Werte sehen nach Sekunden aus (z.B. 0.03 ~= 30ms).
+    Wir inferieren: wenn median(|delta|) < 1.0 -> treat as seconds, scale 1000.
+    sonst -> already ms, scale 1.
+    """
+    vals = []
+    for r in rows:
+        for k in ("delta_desired_ms", "delta_applied_ms"):
+            v = _f(row_get(r, k))
+            if v is None:
+                continue
+            vals.append(abs(float(v)))
+
+    m = robust_median(sorted(vals)) if vals else None
+    if m is None:
+        return 1.0
+
+    # Heuristik: <1.0 "ms" ist praktisch immer Sekunden im echten Leben (10-100ms Korrekturen).
+    if m < 1.0:
+        return 1000.0
+    return 1.0
+
+
 
 # -----------------------------
 # DB readers (robust to missing cols)
@@ -296,6 +320,46 @@ def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
             conn.close()
         except Exception:
             pass
+
+def fetch_controller_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
+    """
+    Controller/Kalman Felder sind bei dir in LINK-Rows (peer_id NOT NULL).
+    Deshalb: NICHT peer_id IS NULL filtern, sondern schlicht nach non-null Controller-Feldern.
+    """
+    conn = get_conn()
+    try:
+        cols = _table_cols(conn, "ntp_reference")
+        if not {"node_id", "created_at"}.issubset(cols):
+            return []
+
+        ctrl_cols = ["delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped"]
+        present = [c for c in ctrl_cols if c in cols]
+        if not present:
+            return []
+
+        sel = ["id", "node_id", "created_at", "peer_id"] + present
+        cutoff = time.time() - float(window_s)
+
+        nonnull = " OR ".join([f"{c} IS NOT NULL" for c in present])
+
+        q = f"""
+            SELECT {", ".join(sel)}
+            FROM ntp_reference
+            WHERE created_at >= ?
+              AND ({nonnull})
+            ORDER BY created_at ASC
+            LIMIT ?
+        """
+        return conn.cursor().execute(q, (cutoff, int(limit))).fetchall()
+    except Exception:
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 
 
 # -----------------------------
@@ -644,19 +708,30 @@ def build_link_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
 # Controller timeseries
 # -----------------------------
 def build_controller_timeseries(window_s: float, max_points: int) -> Dict[str, Any]:
-    rows = fetch_node_rows(window_s=window_s, limit=max_points)
-    out = {}  # node -> list
+    rows = fetch_controller_rows(window_s=window_s, limit=max_points)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+
+    scale = controller_delta_scale_to_ms(rows)
+
     for r in rows:
         nid = str(row_get(r, "node_id", "") or "")
         t = _f(row_get(r, "created_at"))
-        if (not nid) or (t is None):
+        if not nid or t is None:
             continue
-        obj = {"t_wall": float(t)}
 
-        for k in ["delta_desired_ms", "delta_applied_ms", "dt_s"]:
-            v = _f(row_get(r, k))
-            if v is not None:
-                obj[k] = float(v)
+        obj: Dict[str, Any] = {"t_wall": float(t)}
+
+        v = _f(row_get(r, "delta_desired_ms"))
+        if v is not None:
+            obj["delta_desired_ms"] = float(v) * scale  # -> ms
+
+        v = _f(row_get(r, "delta_applied_ms"))
+        if v is not None:
+            obj["delta_applied_ms"] = float(v) * scale  # -> ms
+
+        v = _f(row_get(r, "dt_s"))
+        if v is not None:
+            obj["dt_s"] = float(v)
 
         sc = row_get(r, "slew_clipped")
         if sc is not None:
@@ -665,14 +740,21 @@ def build_controller_timeseries(window_s: float, max_points: int) -> Dict[str, A
             except Exception:
                 pass
 
-        if nid not in out:
-            out[nid] = []
-        out[nid].append(obj)
+        out.setdefault(nid, []).append(obj)
 
     for nid in out:
         out[nid].sort(key=lambda p: p["t_wall"])
 
-    return {"controller": out, "meta": {"window_s": float(window_s), "x_axis": "created_at"}}
+    return {
+        "controller": out,
+        "meta": {
+            "window_s": float(window_s),
+            "x_axis": "created_at",
+            "delta_scale_to_ms": float(scale),
+        },
+    }
+
+
 
 
 # -----------------------------
@@ -1673,7 +1755,7 @@ TEMPLATE = r"""
     document.getElementById('ctrlNode').addEventListener('change', ()=>refresh());
     applyDebugVisibility();
     refresh();
-    setInterval(refresh, 2000);
+    setInterval(refresh, 250);
   });
 </script>
 

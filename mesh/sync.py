@@ -440,6 +440,7 @@ class SyncModule:
         # Option 1: Lokales Logging
         if self._storage is not None:
             try:
+                dbg = self.last_control_debug()
                 self._storage.insert_ntp_reference(
                     node_id=self.node_id,
                     t_wall=t_wall,
@@ -451,7 +452,13 @@ class SyncModule:
                     theta_ms=theta_ms,
                     rtt_ms=rtt_ms,
                     sigma_ms=sigma_ms,
+                    # NEW: controller debug
+                    delta_desired_ms=dbg.get("delta_desired_ms"),
+                    delta_applied_ms=dbg.get("delta_applied_ms"),
+                    dt_s=dbg.get("dt_s"),
+                    slew_clipped=dbg.get("slew_clipped"),
                 )
+
             except Exception as e:
                 log.error("[%s] DB logging failed for %s: %s", self.node_id, peer_id, e)
 
@@ -471,6 +478,15 @@ class SyncModule:
                     "t_mesh": t_mesh,
                     "offset": self._offset,
                 }
+
+                dbg = self.last_control_debug()
+                payload.update({
+                    "delta_desired_ms": dbg.get("delta_desired_ms"),
+                    "delta_applied_ms": dbg.get("delta_applied_ms"),
+                    "dt_s": dbg.get("dt_s"),
+                    "slew_clipped": dbg.get("slew_clipped"),
+                })
+
 
                 req = aiocoap.Message(
                     code=aiocoap.POST,

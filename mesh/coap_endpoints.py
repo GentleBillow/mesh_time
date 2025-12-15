@@ -319,6 +319,7 @@ class RelayIngestLinkResource(resource.Resource):
                 delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
                 delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
                 dt_s = float(dt_s) if dt_s is not None else None
+
                 if slew_clipped is None:
                     slew_clipped_b = None
                 else:

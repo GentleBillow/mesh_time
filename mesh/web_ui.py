@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
 # mesh/web_ui.py
 #
-# MeshTime Dashboard — Single Page (Operator + Debug)
+# MeshTime Dashboard (Single Page) — Operator + Debug
 #
-# PRINCIPLES:
-# - 10s answer: "Is mesh synchronized? If not, why (which node/link)?"
-# - Mesh-Time first-class: show t_mesh(node) relative to consensus (median) over time
-# - Deltas are diagnosis (links, controller), not truth
-# - created_at (sink clock) is the ONLY x-axis
-# - Units: seconds vs ms are explicit; convert exactly once
-# - Must never crash on None or missing columns
+# Key principles:
+#   - created_at (sink clock) is the global x-axis
+#   - "theoretisch optimale Meshzeit" = robust consensus = median(t_mesh across nodes) per time bin
+#   - primary: centered mesh time error ε_i(t) = t_mesh(i,t) - t*(t)   (ms)
+#   - pairwise and link metrics are diagnosis, not "truth"
+#   - MUST NEVER crash due to None / missing columns
+#
+# DB: table ntp_reference
+#   - node-only rows: peer_id IS NULL (or peer_id col may not exist)
+#   - link rows:      peer_id NOT NULL
+#
+# Fields used (if present):
+#   node-only: node_id, created_at, t_mesh, offset (optional), delta_desired_ms, delta_applied_ms, dt_s, slew_clipped
+#   link:     node_id, peer_id, created_at, theta_ms, rtt_ms, sigma_ms
 
 from __future__ import annotations
 
@@ -21,42 +28,42 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from flask import Flask, jsonify, make_response, render_template_string, request
+from flask import Flask, jsonify, make_response, render_template_string
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "mesh_data.sqlite"
 CFG_PATH = BASE_DIR / "config" / "nodes.json"
 
-from mesh.storage import Storage  # ensure schema
+from mesh.storage import Storage  # ensures schema exists
 
 app = Flask(__name__)
 
 # -----------------------------
-# Defaults / thresholds
+# UI tuning
 # -----------------------------
-WINDOW_S_DEFAULT = 120.0
-BIN_S_DEFAULT = 0.5
-MAX_NODE_POINTS = 12000
-MAX_LINK_POINTS = 24000
+WINDOW_SECONDS_DEFAULT = 600.0      # UI window
+BIN_S_DEFAULT = 0.5                # bin width on created_at axis
+MAX_NODE_POINTS_DEFAULT = 12000
+MAX_LINK_POINTS_DEFAULT = 24000
+HEATMAP_MAX_BINS = 50
 
-# convergence / operator thresholds
+# Convergence thresholds
 CONV_WINDOW_S = 30.0
 MIN_SAMPLES_WARMUP = 8
 
-# Freshness: default is max(T_FRESH_MIN, beacon_period * mult)
-T_FRESH_MIN_S = 3.0
-T_FRESH_MULT = 6.0  # 2*period*3 from your text => 6x
+THRESH_DELTA_APPLIED_MED_MS = 0.5
+THRESH_SLEW_CLIP_RATE = 0.20
+THRESH_LINK_SIGMA_MED_MS = 2.0
 
-T_DELTA_APPLIED_MED_MS = 0.5
-T_LINK_SIGMA_MED_MS = 2.0
-T_SLEW_CLIP_RATE = 0.20  # 20%
+FRESH_MIN_S = 3.0
+FRESH_MULT = 6.0  # fresh = max(FRESH_MIN_S, beacon_period_s * FRESH_MULT)
 
-HEATMAP_MAX_BINS = 50
+# Stable links rule (B): require at least K stable links
+K_STABLE_LINKS_DEFAULT = 1
 
-
-# ------------------------------------------------------------
-# Helpers (robust, never crash)
-# ------------------------------------------------------------
+# -----------------------------
+# Helpers (must never crash)
+# -----------------------------
 def _json_error(msg: str, status: int = 500):
     return make_response(jsonify({"error": str(msg)}), int(status))
 
@@ -103,15 +110,6 @@ def _f(x: Any) -> Optional[float]:
         return None
 
 
-def _i(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
-
-
 def _utc(ts: Optional[float]) -> str:
     if ts is None:
         return "n/a"
@@ -121,19 +119,13 @@ def _utc(ts: Optional[float]) -> str:
         return "n/a"
 
 
-def _median(xs: List[float]) -> Optional[float]:
-    if not xs:
-        return None
-    xs = sorted(xs)
-    n = len(xs)
-    return xs[n // 2] if (n % 2) else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
-
-
 def _quantile_sorted(xs: List[float], q: float) -> float:
     n = len(xs)
-    if n <= 1:
-        return float(xs[0]) if xs else 0.0
-    pos = q * (n - 1)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(xs[0])
+    pos = float(q) * (n - 1)
     lo = int(math.floor(pos))
     hi = int(math.ceil(pos))
     if lo == hi:
@@ -142,11 +134,25 @@ def _quantile_sorted(xs: List[float], q: float) -> float:
     return float(xs[lo] * (1.0 - frac) + xs[hi] * frac)
 
 
+def robust_median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    xs = sorted(values)
+    return float(_quantile_sorted(xs, 0.5))
+
+
 def robust_iqr(values: List[float]) -> float:
     if not values:
         return 0.0
     xs = sorted(values)
     return float(_quantile_sorted(xs, 0.75) - _quantile_sorted(xs, 0.25))
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    try:
+        return max(float(lo), min(float(hi), float(v)))
+    except Exception:
+        return float(lo)
 
 
 def load_config() -> Dict[str, Any]:
@@ -184,15 +190,38 @@ def get_topology() -> Dict[str, Any]:
                 neigh = str(neigh)
             except Exception:
                 continue
+            # undirected link list for drawing; metrics are directed in DB
             if node_id < neigh:
-                links.append({"a": node_id, "b": neigh})
+                links.append({"source": node_id, "target": neigh})
 
     return {"nodes": nodes, "links": links}
 
 
-# ------------------------------------------------------------
-# DB readers (robust to missing columns)
-# ------------------------------------------------------------
+def _beacon_period_s(cfg: Dict[str, Any]) -> float:
+    try:
+        sync = cfg.get("sync", {}) or {}
+        return float(sync.get("beacon_period_s", 0.5))
+    except Exception:
+        return 0.5
+
+
+def _fresh_thresh_s(cfg: Dict[str, Any]) -> float:
+    bp = _beacon_period_s(cfg)
+    return max(FRESH_MIN_S, bp * FRESH_MULT)
+
+
+def _k_stable_links(cfg: Dict[str, Any]) -> int:
+    try:
+        sync = cfg.get("sync", {}) or {}
+        k = int(sync.get("ui_k_stable_links", K_STABLE_LINKS_DEFAULT))
+        return max(0, k)
+    except Exception:
+        return K_STABLE_LINKS_DEFAULT
+
+
+# -----------------------------
+# DB readers (robust to missing cols)
+# -----------------------------
 def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
     conn = get_conn()
     try:
@@ -201,10 +230,8 @@ def fetch_node_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
             return []
 
         wanted = [
-            "id", "created_at", "node_id",
-            # time / mesh
+            "id", "node_id", "created_at",
             "t_mesh", "offset",
-            # controller debug
             "delta_desired_ms", "delta_applied_ms", "dt_s", "slew_clipped",
         ]
         sel = [c for c in wanted if c in cols]
@@ -240,7 +267,7 @@ def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
         if not need.issubset(cols):
             return []
 
-        wanted = ["id", "created_at", "node_id", "peer_id", "theta_ms", "rtt_ms", "sigma_ms"]
+        wanted = ["id", "node_id", "peer_id", "created_at", "theta_ms", "rtt_ms", "sigma_ms"]
         sel = [c for c in wanted if c in cols]
         if "peer_id" not in sel:
             return []
@@ -265,97 +292,265 @@ def fetch_link_rows(window_s: float, limit: int) -> List[sqlite3.Row]:
             pass
 
 
-# ------------------------------------------------------------
-# Core aggregation
-# ------------------------------------------------------------
-def _infer_beacon_period(cfg: Dict[str, Any]) -> float:
-    try:
-        sync_cfg = cfg.get("sync", {}) or {}
-        return float(sync_cfg.get("beacon_period_s", 0.5))
-    except Exception:
-        return 0.5
-
-
-def _fresh_thresh_s(cfg: Dict[str, Any]) -> float:
-    bp = _infer_beacon_period(cfg)
-    return max(T_FRESH_MIN_S, float(bp) * float(T_FRESH_MULT))
-
-
-def build_node_timeseries_mesh(window_s: float, bin_s: float) -> Dict[str, List[Dict[str, float]]]:
+# -----------------------------
+# t_mesh scaling (no mystery factor)
+# -----------------------------
+def tmesh_scale_to_ms(rows: List[sqlite3.Row]) -> float:
     """
-    Returns per node: [{t, mesh_ms}] where mesh_ms = (t_mesh_ms - consensus_ms) per bin.
-    t_mesh assumed seconds (or any unit) — we convert to ms ONCE if it looks like seconds.
-
-    Heuristic:
-      - if typical |t_mesh| is < 1e6 -> assume seconds and multiply by 1000
-      - if it's already ms-like (e.g., 1e12?), keep as-is? (unlikely)
+    Determine scale factor for t_mesh -> ms.
+    If t_mesh looks like epoch-ms (~1e12) -> scale=1
+    else assume seconds -> scale=1000
     """
-    rows = fetch_node_rows(window_s, MAX_NODE_POINTS)
-    if not rows:
-        return {}
-
-    # collect times
-    ts = [_f(row_get(r, "created_at")) for r in rows]
-    ts = [t for t in ts if t is not None]
-    if not ts:
-        return {}
-    t0 = min(ts)
-
-    # gather raw t_mesh magnitudes for heuristic
-    tmesh_vals = []
+    vals = []
     for r in rows:
         tm = _f(row_get(r, "t_mesh"))
         if tm is not None:
-            tmesh_vals.append(abs(tm))
-    scale = 1000.0  # default seconds->ms
-    if tmesh_vals:
-        med = _median(tmesh_vals) or 0.0
-        # if it's already in ms (e.g. values ~1e3..1e7 could still be seconds-of-epoch? but t_mesh likely small)
-        # treat "epoch seconds" (1.7e9) also as seconds -> ms (fine)
-        # treat "ms epoch" (1.7e12) -> do NOT scale
-        if med > 1e11:
-            scale = 1.0
+            vals.append(abs(tm))
+    med = robust_median(vals) if vals else None
+    if med is not None and med > 1e11:
+        return 1.0
+    return 1000.0
 
-    bins: Dict[int, Dict[str, Tuple[float, float]]] = {}  # idx -> node -> (t_last, tmesh_ms)
+
+# -----------------------------
+# Aggregation: centered mesh time, pairs, stability, heatmap
+# -----------------------------
+def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
+    """
+    Returns:
+      mesh_series: per node [{t_wall, mesh_err_ms}]  where mesh_err_ms = t_mesh_ms - median(t_mesh_ms across nodes) per bin
+      step_series: per node [{t_wall, step_ms}]      where step_ms = Δ(mesh_err_ms) per node
+      pairs: per pair [{t_wall, delta_ms, bin}]
+      stability: per pair {sigma_ms, iqr_ms, n}
+      heatmap: {data:[{pair,t_bin,value}], n_bins}
+    """
+    rows = fetch_node_rows(window_s=window_s, limit=max_points)
+    if not rows:
+        return {
+            "mesh_series": {},
+            "step_series": {},
+            "pairs": {},
+            "stability": {},
+            "heatmap": {"data": [], "n_bins": 0},
+            "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at", "note": "no node-only data"},
+        }
+
+    if bin_s <= 0:
+        bin_s = BIN_S_DEFAULT
+
+    # axis & scale
+    ts = []
     for r in rows:
-        node = str(row_get(r, "node_id", "") or "")
+        t = _f(row_get(r, "created_at"))
+        if t is not None:
+            ts.append(t)
+    if not ts:
+        return {
+            "mesh_series": {},
+            "step_series": {},
+            "pairs": {},
+            "stability": {},
+            "heatmap": {"data": [], "n_bins": 0},
+            "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at", "note": "no timestamps"},
+        }
+    t_min = min(ts)
+    scale = tmesh_scale_to_ms(rows)
+
+    # bins[idx][node] = (t_last, tmesh_ms)
+    bins: Dict[int, Dict[str, Tuple[float, float]]] = {}
+    for r in rows:
+        nid = str(row_get(r, "node_id", "") or "")
         t = _f(row_get(r, "created_at"))
         tm = _f(row_get(r, "t_mesh"))
-        if not node or t is None or tm is None:
+        if not nid or t is None or tm is None:
             continue
-        idx = int((t - t0) / max(bin_s, 1e-6))
+        idx = int((t - t_min) / bin_s)
+        if idx < 0:
+            continue
         bucket = bins.setdefault(idx, {})
-        prev = bucket.get(node)
+        prev = bucket.get(nid)
         if (prev is None) or (t >= prev[0]):
-            bucket[node] = (t, tm * scale)
+            bucket[nid] = (t, tm * scale)
 
-    out: Dict[str, List[Dict[str, float]]] = {}
+    # compute centered ε per bin and build mesh_series
+    mesh_series: Dict[str, List[Dict[str, float]]] = {}
     for idx in sorted(bins.keys()):
         bucket = bins[idx]
         if len(bucket) < 2:
             continue
-        consensus = _median([v for (_t, v) in bucket.values()])
+        consensus = robust_median([v for (_t, v) in bucket.values()])
         if consensus is None:
             continue
-        t_bin = t0 + (idx + 0.5) * bin_s
-        for node, (_t, tmesh_ms) in bucket.items():
-            out.setdefault(node, []).append({"t": float(t_bin), "mesh_ms": float(tmesh_ms - consensus)})
+        t_bin = t_min + (idx + 0.5) * bin_s
+        for nid, (_t, tmesh_ms) in bucket.items():
+            mesh_series.setdefault(nid, []).append({"t_wall": float(t_bin), "mesh_err_ms": float(tmesh_ms - consensus)})
 
-    # sort
-    for node, pts in out.items():
-        pts.sort(key=lambda p: p["t"])
-    return out
+    # per-node step series (Δε)
+    step_series: Dict[str, List[Dict[str, float]]] = {}
+    for nid, pts in mesh_series.items():
+        pts.sort(key=lambda p: p["t_wall"])
+        prev = None
+        out = []
+        for p in pts:
+            cur = p["mesh_err_ms"]
+            step = 0.0 if prev is None else float(cur - prev)
+            out.append({"t_wall": float(p["t_wall"]), "step_ms": float(step)})
+            prev = cur
+        step_series[nid] = out
+
+    # pairwise series using ε values per bin
+    def norm_pair(a: str, b: str) -> str:
+        return "-".join(sorted([a, b]))
+
+    pairs: Dict[str, List[Dict[str, float]]] = {}
+    # Rebuild per bin epsilon map from mesh_series is tricky (missing nodes per bin).
+    # Use original bins + consensus again and compute ε on the fly per bin.
+    for idx in sorted(bins.keys()):
+        bucket = bins[idx]
+        if len(bucket) < 2:
+            continue
+        consensus = robust_median([v for (_t, v) in bucket.values()])
+        if consensus is None:
+            continue
+        eps = {nid: (tmesh_ms - consensus) for nid, (_t, tmesh_ms) in bucket.items()}
+        nodes_now = sorted(eps.keys())
+        t_bin = t_min + (idx + 0.5) * bin_s
+        for i in range(len(nodes_now)):
+            for j in range(i + 1, len(nodes_now)):
+                a = nodes_now[i]
+                b = nodes_now[j]
+                pid = norm_pair(a, b)
+                delta = float(eps[a] - eps[b])
+                pairs.setdefault(pid, []).append({"t_wall": float(t_bin), "delta_ms": delta, "bin": float(idx)})
+
+    # stability per pair: robust sigma ≈ 0.7413*IQR
+    stability: Dict[str, Dict[str, float]] = {}
+    for pid, pts in pairs.items():
+        deltas = [float(p["delta_ms"]) for p in pts if p.get("delta_ms") is not None]
+        if len(deltas) < 10:
+            continue
+        iqr = robust_iqr(deltas)
+        sigma = 0.7413 * iqr
+        stability[pid] = {"sigma_ms": float(sigma), "iqr_ms": float(iqr), "n": float(len(deltas))}
+
+    # heatmap: binned |pair delta|
+    heatmap_data: List[Dict[str, Any]] = []
+    n_bins = 0
+    if pairs and bins:
+        idx_min = min(bins.keys())
+        idx_max = max(bins.keys())
+        total_bins = max(1, idx_max - idx_min + 1)
+        display_bins = min(HEATMAP_MAX_BINS, total_bins)
+
+        if display_bins == total_bins:
+            for pid, pts in pairs.items():
+                for p in pts:
+                    heatmap_data.append({"pair": pid, "t_bin": float(p["t_wall"]), "value": abs(float(p["delta_ms"]))})
+            n_bins = total_bins
+        else:
+            accum: Dict[Tuple[str, int], List[float]] = {}
+            for pid, pts in pairs.items():
+                for p in pts:
+                    bi = int(p.get("bin", idx_min))
+                    bi = max(idx_min, min(idx_max, bi))
+                    rel = (bi - idx_min) / max(1.0, float(total_bins))
+                    d_idx = int(rel * display_bins)
+                    if d_idx >= display_bins:
+                        d_idx = display_bins - 1
+                    accum.setdefault((pid, d_idx), []).append(abs(float(p["delta_ms"])))
+
+            for (pid, d_idx), vals in accum.items():
+                idx_center = idx_min + (d_idx + 0.5) * (total_bins / display_bins)
+                t_center = t_min + (idx_center + 0.5) * bin_s
+                heatmap_data.append({"pair": pid, "t_bin": float(t_center), "value": float(sum(vals) / max(1, len(vals)))})
+            n_bins = display_bins
+
+    return {
+        "mesh_series": mesh_series,
+        "step_series": step_series,
+        "pairs": pairs,
+        "stability": stability,
+        "heatmap": {"data": heatmap_data, "n_bins": int(n_bins)},
+        "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at", "t_mesh_scale_to_ms": float(scale)},
+    }
 
 
-def build_controller_timeseries(window_s: float) -> Dict[str, List[Dict[str, Any]]]:
-    rows = fetch_node_rows(window_s, MAX_NODE_POINTS)
+# -----------------------------
+# Link series (theta/rtt/sigma) + latest sigma
+# -----------------------------
+def build_link_diagnostics(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
+    rows = fetch_link_rows(window_s=window_s, limit=max_points)
+    if not rows:
+        return {"links": {}, "latest_sigma": {}, "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at"}}
+
+    if bin_s <= 0:
+        bin_s = BIN_S_DEFAULT
+
+    ts = []
+    for r in rows:
+        t = _f(row_get(r, "created_at"))
+        if t is not None:
+            ts.append(t)
+    if not ts:
+        return {"links": {}, "latest_sigma": {}, "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at"}}
+    t_min = min(ts)
+
+    def lid(a: str, b: str) -> str:
+        return f"{a}->{b}"
+
+    # bins[idx][link] = (t, theta, rtt, sigma)
+    bins: Dict[int, Dict[str, Tuple[float, Optional[float], Optional[float], Optional[float]]]] = {}
+    for r in rows:
+        t = _f(row_get(r, "created_at"))
+        a = str(row_get(r, "node_id", "") or "")
+        b = str(row_get(r, "peer_id", "") or "")
+        if t is None or not a or not b:
+            continue
+        theta = _f(row_get(r, "theta_ms"))
+        rtt = _f(row_get(r, "rtt_ms"))
+        sigma = _f(row_get(r, "sigma_ms"))
+
+        idx = int((t - t_min) / bin_s)
+        if idx < 0:
+            continue
+        bucket = bins.setdefault(idx, {})
+        prev = bucket.get(lid(a, b))
+        if (prev is None) or (t >= prev[0]):
+            bucket[lid(a, b)] = (t, theta, rtt, sigma)
+
+    links: Dict[str, List[Dict[str, Any]]] = {}
+    latest_sigma: Dict[str, float] = {}
+    for idx in sorted(bins.keys()):
+        t_bin = t_min + (idx + 0.5) * bin_s
+        for link_id, (_t, theta, rtt, sigma) in bins[idx].items():
+            obj: Dict[str, Any] = {"t_wall": float(t_bin)}
+            if theta is not None:
+                obj["theta_ms"] = float(theta)
+            if rtt is not None:
+                obj["rtt_ms"] = float(rtt)
+            if sigma is not None:
+                obj["sigma_ms"] = float(sigma)
+                latest_sigma[link_id] = float(sigma)
+            links.setdefault(link_id, []).append(obj)
+
+    for link_id, pts in links.items():
+        pts.sort(key=lambda p: p["t_wall"])
+
+    return {"links": links, "latest_sigma": latest_sigma, "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at"}}
+
+
+# -----------------------------
+# Controller timeseries
+# -----------------------------
+def build_controller_timeseries(window_s: float, max_points: int) -> Dict[str, Any]:
+    rows = fetch_node_rows(window_s=window_s, limit=max_points)
     out: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
-        node = str(row_get(r, "node_id", "") or "")
+        nid = str(row_get(r, "node_id", "") or "")
         t = _f(row_get(r, "created_at"))
-        if not node or t is None:
+        if not nid or t is None:
             continue
-        obj: Dict[str, Any] = {"t": float(t)}
+        obj: Dict[str, Any] = {"t_wall": float(t)}
 
         for k in ["delta_desired_ms", "delta_applied_ms", "dt_s"]:
             v = _f(row_get(r, k))
@@ -369,249 +564,101 @@ def build_controller_timeseries(window_s: float) -> Dict[str, List[Dict[str, Any
             except Exception:
                 pass
 
-        out.setdefault(node, []).append(obj)
+        out.setdefault(nid, []).append(obj)
 
-    for node, pts in out.items():
-        pts.sort(key=lambda p: p["t"])
-    return out
-
-
-def build_links_table_and_series(window_s: float, bin_s: float) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
-    """
-    returns:
-      - table: per directed link medians + age + UP/DOWN
-      - series: binned timeseries per link for heatmap (metric values)
-    """
-    rows = fetch_link_rows(window_s, MAX_LINK_POINTS)
-    now = time.time()
-    if not rows:
-        return [], {}
-
-    # bin per link
-    ts = [_f(row_get(r, "created_at")) for r in rows]
-    ts = [t for t in ts if t is not None]
-    if not ts:
-        return [], {}
-    t0 = min(ts)
-
-    # raw lists for medians (conv window)
-    conv_cut = now - CONV_WINDOW_S
-    vals_conv: Dict[str, Dict[str, List[float]]] = {}
-    last_seen: Dict[str, float] = {}
-
-    # binned series for heatmap
-    bins: Dict[int, Dict[str, Dict[str, float]]] = {}  # idx -> link -> {theta,rtt,sigma}
-
-    for r in rows:
-        t = _f(row_get(r, "created_at"))
-        nid = str(row_get(r, "node_id", "") or "")
-        pid = str(row_get(r, "peer_id", "") or "")
-        if t is None or not nid or not pid:
-            continue
-        lid = f"{nid}→{pid}"
-        last_seen[lid] = max(last_seen.get(lid, 0.0), float(t))
-
-        theta = _f(row_get(r, "theta_ms"))
-        rtt = _f(row_get(r, "rtt_ms"))
-        sigma = _f(row_get(r, "sigma_ms"))
-
-        if t >= conv_cut:
-            box = vals_conv.setdefault(lid, {"theta": [], "rtt": [], "sigma": []})
-            if theta is not None:
-                box["theta"].append(theta)
-            if rtt is not None:
-                box["rtt"].append(rtt)
-            if sigma is not None:
-                box["sigma"].append(sigma)
-
-        # heatmap bins (full window)
-        idx = int((t - t0) / max(bin_s, 1e-6))
-        b = bins.setdefault(idx, {})
-        prev = b.get(lid)
-        # keep the latest in the bin
-        if prev is None or t >= prev.get("_t", -1):
-            obj: Dict[str, float] = {"_t": float(t)}
-            if theta is not None:
-                obj["theta_ms"] = float(theta)
-            if rtt is not None:
-                obj["rtt_ms"] = float(rtt)
-            if sigma is not None:
-                obj["sigma_ms"] = float(sigma)
-            b[lid] = obj
-
-    # table build
-    table: List[Dict[str, Any]] = []
-    for lid in sorted(set(list(last_seen.keys()) + list(vals_conv.keys()))):
-        ls = last_seen.get(lid)
-        age = (now - ls) if ls is not None else None
-        box = vals_conv.get(lid, {"theta": [], "rtt": [], "sigma": []})
-        theta_med = _median(box["theta"])
-        rtt_med = _median(box["rtt"])
-        sigma_med = _median(box["sigma"])
-        state = "UP" if (age is not None and age <= 2.0 * window_s) else "DOWN"
-
-        table.append({
-            "link": lid,
-            "state": state,
-            "age_s": age,
-            "theta_med_ms": theta_med,
-            "rtt_med_ms": rtt_med,
-            "sigma_med_ms": sigma_med,
-            "n_sigma": len(box["sigma"]),
-        })
-
-    # series for heatmap: downsample bins to max bins
-    idxs = sorted(bins.keys())
-    if not idxs:
-        return table, {}
-
-    idx_min, idx_max = idxs[0], idxs[-1]
-    total_bins = max(1, idx_max - idx_min + 1)
-    display_bins = min(HEATMAP_MAX_BINS, total_bins)
-
-    series: Dict[str, List[Dict[str, Any]]] = {}
-    if display_bins == total_bins:
-        for idx in idxs:
-            t_bin = t0 + (idx + 0.5) * bin_s
-            for lid, obj in bins[idx].items():
-                rec = {"t": float(t_bin)}
-                for k in ["theta_ms", "rtt_ms", "sigma_ms"]:
-                    if k in obj:
-                        rec[k] = obj[k]
-                series.setdefault(lid, []).append(rec)
-    else:
-        # compress bins into display_bins (mean within compressed bin)
-        accum: Dict[Tuple[str, int], Dict[str, List[float]]] = {}
-        for idx in idxs:
-            rel = (idx - idx_min) / max(1.0, float(total_bins))
-            d_idx = int(rel * display_bins)
-            if d_idx >= display_bins:
-                d_idx = display_bins - 1
-            for lid, obj in bins[idx].items():
-                key = (lid, d_idx)
-                a = accum.setdefault(key, {"theta_ms": [], "rtt_ms": [], "sigma_ms": []})
-                for k in ["theta_ms", "rtt_ms", "sigma_ms"]:
-                    if k in obj:
-                        a[k].append(float(obj[k]))
-
-        for (lid, d_idx), a in accum.items():
-            idx_center = idx_min + (d_idx + 0.5) * (total_bins / display_bins)
-            t_center = t0 + (idx_center + 0.5) * bin_s
-            rec: Dict[str, Any] = {"t": float(t_center)}
-            for k in ["theta_ms", "rtt_ms", "sigma_ms"]:
-                rec[k] = float(sum(a[k]) / len(a[k])) if a[k] else None
-            series.setdefault(lid, []).append(rec)
-
-    for lid, pts in series.items():
-        pts.sort(key=lambda p: p["t"])
-
-    return table, series
+    for nid, pts in out.items():
+        pts.sort(key=lambda p: p["t_wall"])
+    return {"controller": out, "meta": {"window_s": float(window_s), "x_axis": "created_at"}}
 
 
+# -----------------------------
+# Overview / Status (optimal mesh time, not vs C)
+# -----------------------------
 def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Builds:
-    - mesh status header (mesh-level)
-    - node tiles (mesh-time centered NOW, offset/rate/freshness, converged state+reason)
-    - offenders
-    - link quality for topology (sigma med)
-    """
     now = time.time()
-    eff_window = max(window_s, CONV_WINDOW_S)
+    eff = max(float(window_s), float(CONV_WINDOW_S))
 
-    node_rows = fetch_node_rows(eff_window, MAX_NODE_POINTS)
-    link_rows = fetch_link_rows(eff_window, MAX_LINK_POINTS)
+    node_rows = fetch_node_rows(window_s=eff, limit=MAX_NODE_POINTS_DEFAULT)
+    link_rows = fetch_link_rows(window_s=eff, limit=MAX_LINK_POINTS_DEFAULT)
 
-    # group node-only by node
+    fresh_thr = _fresh_thresh_s(cfg)
+    k_stable = _k_stable_links(cfg)
+
+    # latest per node
+    latest: Dict[str, sqlite3.Row] = {}
     by_node: Dict[str, List[sqlite3.Row]] = {}
-    latest_node: Dict[str, sqlite3.Row] = {}
     for r in node_rows:
         nid = str(row_get(r, "node_id", "") or "")
         if not nid:
             continue
         by_node.setdefault(nid, []).append(r)
-        latest_node[nid] = r
+        latest[nid] = r
 
-    # compute latest t_mesh consensus centered (ms)
-    tmesh_latest_ms: Dict[str, float] = {}
-    # heuristic scaling like in timeseries
-    tmesh_vals = []
-    for r in latest_node.values():
+    # consensus now based on latest t_mesh
+    scale = tmesh_scale_to_ms(list(latest.values())) if latest else 1000.0
+    tmesh_now = []
+    tmesh_now_map: Dict[str, float] = {}
+    for nid, r in latest.items():
         tm = _f(row_get(r, "t_mesh"))
         if tm is not None:
-            tmesh_vals.append(abs(tm))
-    scale = 1000.0
-    med = _median(tmesh_vals) if tmesh_vals else None
-    if med is not None and med > 1e11:
-        scale = 1.0
+            v = tm * scale
+            tmesh_now.append(v)
+            tmesh_now_map[nid] = v
 
-    for nid, r in latest_node.items():
-        tm = _f(row_get(r, "t_mesh"))
-        if tm is not None:
-            tmesh_latest_ms[nid] = tm * scale
+    cons_now = robust_median(tmesh_now) if tmesh_now else None
 
-    consensus_now = _median(list(tmesh_latest_ms.values())) if tmesh_latest_ms else 0.0
-
-    # link sigma med in conv window per directed link
-    conv_cut = now - CONV_WINDOW_S
-    sig_by_link: Dict[str, List[float]] = {}
-    last_link_seen: Dict[str, float] = {}
+    # link sigma per directed link within conv window
+    conv_cut = now - float(CONV_WINDOW_S)
+    sigs_by_link: Dict[str, List[float]] = {}
+    last_seen_link: Dict[str, float] = {}
     for r in link_rows:
         t = _f(row_get(r, "created_at"))
-        nid = str(row_get(r, "node_id", "") or "")
-        pid = str(row_get(r, "peer_id", "") or "")
-        if t is None or not nid or not pid:
+        a = str(row_get(r, "node_id", "") or "")
+        b = str(row_get(r, "peer_id", "") or "")
+        if t is None or not a or not b:
             continue
-        lid = f"{nid}→{pid}"
-        last_link_seen[lid] = max(last_link_seen.get(lid, 0.0), t)
+        lid = f"{a}->{b}"
+        last_seen_link[lid] = max(last_seen_link.get(lid, 0.0), float(t))
         if t >= conv_cut:
             sg = _f(row_get(r, "sigma_ms"))
             if sg is not None:
-                sig_by_link.setdefault(lid, []).append(sg)
+                sigs_by_link.setdefault(lid, []).append(float(sg))
 
-    sigma_med_link: Dict[str, Optional[float]] = {
-        lid: _median(vals) for lid, vals in sig_by_link.items()
-    }
+    sigma_med_link: Dict[str, Optional[float]] = {lid: robust_median(vals) for lid, vals in sigs_by_link.items()}
 
-    # thresholds
-    fresh_thr = _fresh_thresh_s(cfg)
-
-    # per-node convergence
+    # per node convergence
     nodes_out: List[Dict[str, Any]] = []
-    offenders = {
-        "worst_node_delta": None,
-        "stalest_node": None,
-        "worst_link_sigma": None,
-        "most_slew_clipped": None,
-    }
-    worst_delta = -1.0
+    offenders = {"worst_node_correction": None, "stalest_node": None, "worst_link_sigma": None, "most_slew_clipped": None}
+
+    worst_corr = -1.0
     worst_age = -1.0
     worst_sigma = -1.0
     worst_clip = -1.0
 
-    for nid in sorted(latest_node.keys()):
-        r_last = latest_node[nid]
+    for nid in sorted(latest.keys()):
+        r_last = latest[nid]
         t_last = _f(row_get(r_last, "created_at"))
         age_s = (now - t_last) if t_last is not None else None
 
-        # mesh-time centered now
-        centered_ms = None
-        if nid in tmesh_latest_ms:
-            centered_ms = tmesh_latest_ms[nid] - (consensus_now or 0.0)
+        # mesh error now = t_mesh_ms - consensus
+        mesh_err_now_ms = None
+        if cons_now is not None and nid in tmesh_now_map:
+            mesh_err_now_ms = float(tmesh_now_map[nid] - cons_now)
 
-        # controller stats in conv window
+        # recent samples in conv window
         recent = []
-        for r in by_node.get(nid, []):
-            t = _f(row_get(r, "created_at"))
+        for rr in by_node.get(nid, []):
+            t = _f(row_get(rr, "created_at"))
             if t is not None and t >= conv_cut:
-                recent.append(r)
+                recent.append(rr)
 
+        # correction stats
         abs_applied = []
         clipped = []
         for rr in recent:
             da = _f(row_get(rr, "delta_applied_ms"))
             if da is not None:
-                abs_applied.append(abs(da))
+                abs_applied.append(abs(float(da)))
             sc = row_get(rr, "slew_clipped")
             try:
                 if sc is not None:
@@ -619,35 +666,42 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        med_abs_applied = _median(abs_applied)
+        med_abs_applied = robust_median(abs_applied)
         clip_rate = (sum(clipped) / len(clipped)) if clipped else None
 
-        # offset rate estimate (ms/s): from centered mesh-time last ~2 samples, robust-ish
-        # Use t_mesh centered NOW and previous bin approx via last 2 samples available in recent
-        rate_ms_s = None
+        # mesh error rate (ms/s) from last two node-only samples (t_mesh)
+        mesh_rate_ms_s = None
         if len(recent) >= 2:
-            r1 = recent[-1]
             r0 = recent[-2]
-            t1 = _f(row_get(r1, "created_at"))
+            r1 = recent[-1]
             t0 = _f(row_get(r0, "created_at"))
-            tm1 = _f(row_get(r1, "t_mesh"))
+            t1 = _f(row_get(r1, "created_at"))
             tm0 = _f(row_get(r0, "t_mesh"))
-            if t1 is not None and t0 is not None and tm1 is not None and tm0 is not None and t1 > t0:
-                rate_ms_s = ((tm1 - tm0) * scale * 1.0) / (t1 - t0)
+            tm1 = _f(row_get(r1, "t_mesh"))
+            if t0 is not None and t1 is not None and tm0 is not None and tm1 is not None and t1 > t0:
+                mesh_rate_ms_s = float(((tm1 - tm0) * scale) / (t1 - t0))
 
-        # link sigma med for node: collect outgoing link medians
-        out_sigs = []
-        for lid, sg_med in sigma_med_link.items():
-            if lid.startswith(nid + "→") and sg_med is not None:
-                out_sigs.append(float(sg_med))
-        node_link_sigma_med = _median(out_sigs)
+        # link stability for node: require at least K stable outgoing links (B)
+        stable_links = 0
+        total_links_considered = 0
+        for lid, med_sig in sigma_med_link.items():
+            if not lid.startswith(nid + "->"):
+                continue
+            # link is UP if it has recent samples
+            ls = last_seen_link.get(lid)
+            link_age = (now - ls) if ls is not None else None
+            if link_age is None or link_age > fresh_thr:
+                continue
+            total_links_considered += 1
+            if med_sig is not None and med_sig <= THRESH_LINK_SIGMA_MED_MS:
+                stable_links += 1
 
         # rules
         enough = len(recent) >= MIN_SAMPLES_WARMUP
         fresh_ok = (age_s is not None and age_s <= fresh_thr)
-        delta_ok = (med_abs_applied is not None and med_abs_applied <= T_DELTA_APPLIED_MED_MS)
-        link_ok = (node_link_sigma_med is None) or (node_link_sigma_med <= T_LINK_SIGMA_MED_MS)
-        clip_ok = (clip_rate is None) or (clip_rate <= T_SLEW_CLIP_RATE)
+        corr_ok = (med_abs_applied is not None and med_abs_applied <= THRESH_DELTA_APPLIED_MED_MS)
+        clip_ok = (clip_rate is None) or (clip_rate <= THRESH_SLEW_CLIP_RATE)
+        link_ok = (k_stable <= 0) or (stable_links >= k_stable)
 
         if not enough:
             state = "YELLOW"
@@ -655,24 +709,24 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
         elif not fresh_ok:
             state = "RED"
             reason = f"stale data (age {age_s:.1f}s)"
-        elif delta_ok and link_ok and clip_ok:
+        elif corr_ok and clip_ok and link_ok:
             state = "GREEN"
             reason = "converged"
         else:
             state = "YELLOW"
             rs = []
-            if not delta_ok:
+            if not corr_ok:
                 rs.append(f"|Δapplied|med {med_abs_applied:.2f}ms" if med_abs_applied is not None else "|Δapplied|med n/a")
-            if not link_ok:
-                rs.append(f"linkσmed {node_link_sigma_med:.2f}ms")
             if not clip_ok and clip_rate is not None:
                 rs.append(f"slew_clipped {clip_rate*100:.0f}%")
+            if not link_ok:
+                rs.append(f"stable_links {stable_links}/{k_stable}")
             reason = ", ".join(rs) if rs else "not converged"
 
-        # offenders tracking
-        if med_abs_applied is not None and med_abs_applied > worst_delta:
-            worst_delta = med_abs_applied
-            offenders["worst_node_delta"] = nid
+        # offenders
+        if med_abs_applied is not None and med_abs_applied > worst_corr:
+            worst_corr = med_abs_applied
+            offenders["worst_node_correction"] = nid
         if age_s is not None and age_s > worst_age:
             worst_age = age_s
             offenders["stalest_node"] = nid
@@ -684,168 +738,135 @@ def compute_overview(window_s: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
             "node_id": nid,
             "state": state,
             "reason": reason,
+            "last_seen_utc": _utc(t_last),
             "age_s": age_s,
-            "mesh_centered_ms": centered_ms,
-            "mesh_consensus_ms": consensus_now,
+            "mesh_err_now_ms": mesh_err_now_ms,
+            "mesh_rate_ms_s": mesh_rate_ms_s,
             "med_abs_delta_applied_ms": med_abs_applied,
             "slew_clip_rate": clip_rate,
-            "link_sigma_med_ms": node_link_sigma_med,
-            "mesh_rate_ms_s": rate_ms_s,
-            "last_seen_utc": _utc(t_last),
+            "stable_links": stable_links,
+            "k_stable_links": k_stable,
+            "links_considered": total_links_considered,
         })
 
-    # worst link sigma (use medians if possible; otherwise last seen sigma in conv window)
-    for lid, sg_med in sigma_med_link.items():
-        if sg_med is not None and sg_med > worst_sigma:
-            worst_sigma = sg_med
+    # worst link sigma (use medians when available)
+    for lid, med_sig in sigma_med_link.items():
+        if med_sig is not None and med_sig > worst_sigma:
+            worst_sigma = med_sig
             offenders["worst_link_sigma"] = lid
 
-    # mesh-level state: all green => green; any red with stale => red; else yellow
+    # mesh-level status
     mesh_state = "GREEN" if nodes_out and all(n["state"] == "GREEN" for n in nodes_out) else "YELLOW"
     if any(n["state"] == "RED" for n in nodes_out):
         mesh_state = "RED"
 
-    # mesh-level reason: summarize worst offenders deterministically
-    mesh_reason = "converged" if mesh_state == "GREEN" else ""
-    if mesh_state != "GREEN":
-        pieces = []
+    # mesh-level reason is deterministic
+    if mesh_state == "GREEN":
+        mesh_reason = "converged"
+    else:
+        parts = []
         if offenders["stalest_node"]:
-            pieces.append(f"stale {offenders['stalest_node']}")
-        if offenders["worst_node_delta"]:
-            pieces.append(f"correction {offenders['worst_node_delta']}")
+            parts.append(f"stale {offenders['stalest_node']}")
+        if offenders["worst_node_correction"]:
+            parts.append(f"correction {offenders['worst_node_correction']}")
         if offenders["worst_link_sigma"]:
-            pieces.append(f"linkσ {offenders['worst_link_sigma']}")
-        mesh_reason = ", ".join(pieces) if pieces else "not converged"
+            parts.append(f"linkσ {offenders['worst_link_sigma']}")
+        mesh_reason = ", ".join(parts) if parts else "not converged"
 
     return {
         "mesh": {
             "state": mesh_state,
             "reason": mesh_reason,
             "now_utc": _utc(now),
-            "conv_window_s": CONV_WINDOW_S,
+            "conv_window_s": float(CONV_WINDOW_S),
+            "consensus_now_ms": cons_now,
+            "t_mesh_scale_to_ms": float(scale),
             "thresholds": {
-                "fresh_s": fresh_thr,
-                "delta_applied_med_ms": T_DELTA_APPLIED_MED_MS,
-                "link_sigma_med_ms": T_LINK_SIGMA_MED_MS,
-                "slew_clip_rate": T_SLEW_CLIP_RATE,
-                "min_samples_warmup": MIN_SAMPLES_WARMUP,
+                "fresh_s": float(fresh_thr),
+                "delta_applied_med_ms": float(THRESH_DELTA_APPLIED_MED_MS),
+                "slew_clip_rate": float(THRESH_SLEW_CLIP_RATE),
+                "link_sigma_med_ms": float(THRESH_LINK_SIGMA_MED_MS),
+                "k_stable_links": int(k_stable),
+                "warmup_min_samples": int(MIN_SAMPLES_WARMUP),
             },
         },
         "nodes": nodes_out,
         "offenders": offenders,
-        "link_sigma_med": sigma_med_link,   # for topology coloring
-        "link_last_seen": last_link_seen,
+        # for topology coloring
+        "link_sigma_med": {k: v for k, v in sigma_med_link.items() if v is not None},
+        "link_last_seen": last_seen_link,
     }
 
 
-def build_heatmap(metric: str, link_series: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-    """
-    Returns heatmap data suitable for matrix chart:
-      [{link, t, v}]
-    metric in {theta_ms, sigma_ms, rtt_ms, freshness_s}
-    freshness uses per-link point age derived from series timestamps (relative to now)
-    """
-    now = time.time()
-    data = []
-    for lid, pts in link_series.items():
-        for p in pts:
-            t = _f(p.get("t"))
-            if t is None:
-                continue
-            if metric == "freshness_s":
-                v = now - t
-            else:
-                v = p.get(metric)
-            if v is None:
-                continue
-            try:
-                vv = float(v)
-            except Exception:
-                continue
-            data.append({"link": lid, "t": float(t), "v": vv})
-
-    # determine approximate bin count (unique time buckets)
-    times = sorted({d["t"] for d in data})
-    return {"data": data, "n_bins": len(times)}
-
-
-# ------------------------------------------------------------
-# Routes / API
-# ------------------------------------------------------------
+# -----------------------------
+# Routes
+# -----------------------------
 @app.route("/")
 def index():
     topo = get_topology()
     return render_template_string(TEMPLATE, topo=topo, db_path=str(DB_PATH))
 
 
+@app.route("/api/topology")
+def api_topology():
+    try:
+        return jsonify(get_topology())
+    except Exception as e:
+        return _json_error(f"/api/topology failed: {e}", 500)
+
+
 @app.route("/api/overview")
 def api_overview():
     try:
         cfg = load_config()
-        window_s = float((cfg.get("sync", {}) or {}).get("ui_window_s", WINDOW_S_DEFAULT))
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
         return jsonify(compute_overview(window_s, cfg))
     except Exception as e:
-        return _json_error(f"/api/overview failed: {e}")
+        return _json_error(f"/api/overview failed: {e}", 500)
 
 
-@app.route("/api/mesh_timeseries")
-def api_mesh_timeseries():
+@app.route("/api/mesh_diag")
+def api_mesh_diag():
     try:
         cfg = load_config()
-        sync = cfg.get("sync", {}) or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
         bin_s = float(sync.get("ui_bin_s", BIN_S_DEFAULT))
-        series = build_node_timeseries_mesh(window_s, bin_s)
-        return jsonify({"series": series, "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at"}})
+        max_points = int(sync.get("ui_max_points", MAX_NODE_POINTS_DEFAULT))
+        return jsonify(build_mesh_diagnostics(window_s=window_s, bin_s=bin_s, max_points=max_points))
     except Exception as e:
-        return _json_error(f"/api/mesh_timeseries failed: {e}")
+        return _json_error(f"/api/mesh_diag failed: {e}", 500)
 
 
-@app.route("/api/links")
-def api_links():
+@app.route("/api/link_diag")
+def api_link_diag():
     try:
         cfg = load_config()
-        sync = cfg.get("sync", {}) or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
         bin_s = float(sync.get("ui_bin_s", BIN_S_DEFAULT))
-        table, series = build_links_table_and_series(window_s, bin_s)
-        return jsonify({"table": table, "series": series, "meta": {"window_s": window_s, "bin_s": bin_s}})
+        max_points = int(sync.get("ui_link_max_points", MAX_LINK_POINTS_DEFAULT))
+        return jsonify(build_link_diagnostics(window_s=window_s, bin_s=bin_s, max_points=max_points))
     except Exception as e:
-        return _json_error(f"/api/links failed: {e}")
+        return _json_error(f"/api/link_diag failed: {e}", 500)
 
 
-@app.route("/api/heatmap")
-def api_heatmap():
-    try:
-        metric = str(request.args.get("metric", "sigma_ms"))
-        if metric not in {"theta_ms", "sigma_ms", "rtt_ms", "freshness_s"}:
-            metric = "sigma_ms"
-        cfg = load_config()
-        sync = cfg.get("sync", {}) or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
-        bin_s = float(sync.get("ui_bin_s", BIN_S_DEFAULT))
-        _table, series = build_links_table_and_series(window_s, bin_s)
-        hm = build_heatmap(metric, series)
-        return jsonify({"metric": metric, "heatmap": hm, "meta": {"window_s": window_s, "bin_s": bin_s}})
-    except Exception as e:
-        return _json_error(f"/api/heatmap failed: {e}")
-
-
-@app.route("/api/controller")
-def api_controller():
+@app.route("/api/controller_diag")
+def api_controller_diag():
     try:
         cfg = load_config()
-        sync = cfg.get("sync", {}) or {}
-        window_s = float(sync.get("ui_window_s", WINDOW_S_DEFAULT))
-        ctrl = build_controller_timeseries(window_s)
-        return jsonify({"controller": ctrl, "meta": {"window_s": window_s}})
+        sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
+        window_s = float(sync.get("ui_window_s", WINDOW_SECONDS_DEFAULT))
+        max_points = int(sync.get("ui_ctrl_max_points", MAX_NODE_POINTS_DEFAULT))
+        return jsonify(build_controller_timeseries(window_s=window_s, max_points=max_points))
     except Exception as e:
-        return _json_error(f"/api/controller failed: {e}")
+        return _json_error(f"/api/controller_diag failed: {e}", 500)
 
 
-# ------------------------------------------------------------
-# UI Template (one page)
-# ------------------------------------------------------------
+# -----------------------------
+# Template (Single Page)
+# -----------------------------
 TEMPLATE = r"""
 <!doctype html>
 <html lang="de">
@@ -855,56 +876,54 @@ TEMPLATE = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1">
 
   <style>
-    :root{
-      --bg:#0f0f10; --card:#171718; --muted:rgba(255,255,255,0.65);
-      --grid:rgba(255,255,255,0.08);
-      --ok:#2ecc71; --warn:#f1c40f; --bad:#e74c3c;
-    }
-    body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin:0; background:var(--bg); color:#eee; padding: 1.25rem; }
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin:0; padding: 1.4rem; background:#0f0f10; color:#eee; }
     h1,h2,h3 { margin:0; }
-    .sub{ margin-top:0.35rem; color:var(--muted); font-size:0.9rem; }
+    .sub { margin-top:0.35rem; opacity:0.72; font-size:0.88rem; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-    .row { display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; }
+    .small { font-size:0.85rem; opacity:0.75; }
+    .muted { opacity:0.7; }
+
+    .card { background:#171718; border-radius:14px; padding:1rem 1.2rem; box-shadow: 0 0 0 1px rgba(255,255,255,0.05); }
+    .row { display:flex; gap: 0.75rem; flex-wrap:wrap; align-items:center; }
     .sp { justify-content:space-between; }
-    .card { background:var(--card); border-radius:14px; padding:1rem 1.15rem; box-shadow: 0 0 0 1px rgba(255,255,255,0.05); }
-    .grid { display:grid; grid-template-columns: minmax(0,1.2fr) minmax(0,2fr); gap: 1rem; margin-top: 1rem; }
+
+    .pill { display:inline-block; padding:0.12rem 0.55rem; border-radius:999px; font-size:0.75rem; font-weight:750; }
+    .ok   { background: rgba(46,204,113,0.14); color:#2ecc71; }
+    .warn { background: rgba(241,196,15,0.14); color:#f1c40f; }
+    .bad  { background: rgba(231,76,60,0.14); color:#e74c3c; }
+
+    .grid { display:grid; grid-template-columns: minmax(0,1.25fr) minmax(0,2fr); gap: 1rem; align-items:start; margin-top: 1rem; }
     @media (max-width: 1200px) { .grid { grid-template-columns: minmax(0,1fr); } }
-    .pill { display:inline-block; padding:0.12rem 0.55rem; border-radius:999px; font-size:0.75rem; font-weight:700; }
-    .ok { background: rgba(46,204,113,0.14); color: var(--ok); }
-    .warn { background: rgba(241,196,15,0.14); color: var(--warn); }
-    .bad { background: rgba(231,76,60,0.14); color: var(--bad); }
 
-    .kpiGrid { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:0.75rem; margin-top: 0.75rem; }
-    @media (max-width: 1100px) { .kpiGrid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
-    @media (max-width: 700px) { .kpiGrid { grid-template-columns: minmax(0,1fr); } }
-    .kpi { background: rgba(255,255,255,0.03); border-radius: 12px; padding:0.75rem; box-shadow: 0 0 0 1px rgba(255,255,255,0.03); }
-    .kpi .big { font-size: 1.25rem; font-weight: 800; margin-top:0.15rem; }
-    .kpi .small { margin-top:0.2rem; color: var(--muted); font-size: 0.85rem; }
-    .kpi .reason { margin-top:0.35rem; color:rgba(255,255,255,0.72); font-size:0.85rem; }
+    .kpi-grid { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 0.75rem; margin-top: 0.75rem; }
+    @media (max-width: 1000px) { .kpi-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width: 650px) { .kpi-grid { grid-template-columns: minmax(0,1fr); } }
 
-    canvas { max-width:100%; }
+    .kpi { border-radius: 12px; padding: 0.75rem; background: rgba(255,255,255,0.03); box-shadow: 0 0 0 1px rgba(255,255,255,0.03); }
+    .kpi .title { font-size:0.85rem; opacity:0.75; }
+    .kpi .value { font-size:1.2rem; font-weight:800; margin-top:0.2rem; }
+    .kpi .hint { margin-top:0.25rem; font-size:0.82rem; opacity:0.68; }
+    .kpi .reason { margin-top:0.35rem; font-size:0.85rem; opacity:0.75; }
+
     .plots { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin-top:0.75rem; }
     @media (max-width: 1200px) { .plots { grid-template-columns: minmax(0,1fr); } }
 
-    table { width:100%; border-collapse: collapse; font-size:0.92rem; margin-top:0.6rem; }
+    table { width:100%; border-collapse: collapse; font-size:0.92rem; margin-top: 0.6rem; }
     th, td { padding: 0.35rem 0.5rem; text-align:left; vertical-align:top; }
-    th { border-bottom: 1px solid rgba(255,255,255,0.14); font-weight:750; }
+    th { border-bottom: 1px solid rgba(255,255,255,0.15); font-weight:750; }
     tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
 
-    #meshTopo { width:100%; height: 220px; background:#131313; border-radius: 12px; margin-top:0.6rem; }
+    canvas { max-width:100%; }
+    #meshCanvas { width:100%; height: 240px; background:#131313; border-radius:12px; margin-top:0.6rem; }
 
     .toggle { display:flex; gap:0.6rem; align-items:center; }
     .toggle input { transform: scale(1.2); }
+    .hidden { display:none !important; }
 
-    .debugOnly { display:none; }
-    body.debug .debugOnly { display:block; }
-
-    .controls { display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; }
-    select, button {
-      background:#111; color:#eee; border: 1px solid rgba(255,255,255,0.15);
+    select {
+      background:#101010; color:#eee; border: 1px solid rgba(255,255,255,0.18);
       border-radius: 10px; padding: 0.35rem 0.55rem;
     }
-    .muted{ color: var(--muted); }
   </style>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -915,215 +934,254 @@ TEMPLATE = r"""
 <body>
   <div class="row sp">
     <div>
-      <h1>MeshTime</h1>
-      <div class="sub">
-        DB: <span class="mono">{{ db_path }}</span> · X-Achse: <b>created_at (Sink)</b>
-      </div>
+      <h1>MeshTime Dashboard</h1>
+      <div class="sub">DB: <span class="mono">{{ db_path }}</span> · X-Achse: <b>created_at (Sink)</b></div>
     </div>
 
     <div class="row">
-      <div class="toggle card" style="padding:0.55rem 0.75rem;">
+      <div class="toggle card" style="padding:0.55rem 0.85rem;">
         <input id="debugToggle" type="checkbox">
-        <label for="debugToggle" class="muted">Debug</label>
+        <label for="debugToggle" class="small">Debug (Controller/Kalman)</label>
       </div>
     </div>
   </div>
 
-  <!-- 10-second header -->
+  <!-- 10-second answer header + node tiles -->
   <div class="card" style="margin-top:1rem;">
     <div class="row sp">
       <div class="row">
-        <span id="meshStatePill" class="pill warn">…</span>
+        <span id="meshPill" class="pill warn">…</span>
         <div>
-          <div style="font-weight:800; font-size:1.05rem;" id="meshHeaderLine">lade…</div>
-          <div class="sub" id="meshHeaderMeta">lade…</div>
+          <div style="font-weight:850;" id="meshLine">lade…</div>
+          <div class="sub" id="meshMeta">lade…</div>
         </div>
       </div>
-      <div class="controls">
-        <span class="muted">Heatmap:</span>
-        <select id="heatMetric">
-          <option value="sigma_ms">σ (stability)</option>
-          <option value="theta_ms">θ (offset)</option>
-          <option value="rtt_ms">RTT</option>
-          <option value="freshness_s">freshness</option>
-        </select>
+      <div class="row">
+        <span class="small muted">Controller node:</span>
+        <select id="ctrlNode"></select>
       </div>
     </div>
 
-    <div class="kpiGrid" id="nodeTiles">
-      <div class="kpi"><div class="muted">Nodes</div><div class="big">…</div></div>
+    <div class="kpi-grid" id="nodeKpis">
+      <div class="kpi"><div class="title">Nodes</div><div class="value">…</div><div class="hint">—</div></div>
     </div>
+
+    <div class="sub" style="margin-top:0.6rem;" id="offendersLine">lade…</div>
   </div>
 
   <div class="grid">
-    <!-- Left column: topology + offenders -->
     <div>
       <div class="card">
         <h2 style="font-size:1.05rem;">Topologie</h2>
-        <canvas id="meshTopo"></canvas>
-        <div class="sub">Node-Farbe = Node-Ampel. Link-Dicke/Farbe = σ (Median im Conv-Window, wenn vorhanden).</div>
+        <canvas id="meshCanvas"></canvas>
+        <div class="sub">Node-Farbe = Konvergenz-Ampel. Link-Farbe/Dicke = σ (median im Conv-Window, max beider Richtungen).</div>
       </div>
 
       <div class="card" style="margin-top:1rem;">
-        <h2 style="font-size:1.05rem;">Worst Offenders</h2>
-        <div class="sub" id="offendersLine">lade…</div>
+        <h2 style="font-size:1.05rem;">Status (optimal mesh time)</h2>
+        <div class="sub">Δ ist <b>Abweichung zur theoretisch optimalen Meshzeit</b> (Konsens = Median von t_mesh).</div>
+        <table id="statusTable">
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>State</th>
+              <th>mesh_err_now</th>
+              <th>rate</th>
+              <th>age</th>
+              <th>reason</th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="6" class="small">lade…</td></tr></tbody>
+        </table>
       </div>
 
       <div class="card debugOnly" style="margin-top:1rem;">
-        <h2 style="font-size:1.05rem;">Thresholds</h2>
+        <h2 style="font-size:1.05rem;">Konvergenz-Regeln (Debug)</h2>
         <div class="sub mono" id="thrLine">lade…</div>
       </div>
     </div>
 
-    <!-- Right column: plots + tables -->
     <div>
       <div class="card">
-        <div class="row sp">
-          <h2 style="font-size:1.05rem;">t_mesh(node) − Konsens über Zeit</h2>
-          <div class="sub">Centered (Median-Konsens pro Bin). Einheit: ms.</div>
+        <h2 style="font-size:1.05rem;">Centered Mesh-Time: t_mesh(node) − Konsens (Median) über Zeit</h2>
+        <div class="sub">Das ist ε(node,t) in ms. Konsens wird pro Bin berechnet (robust, median).</div>
+        <canvas id="meshChart" height="170"></canvas>
+
+        <div class="plots">
+          <div>
+            <h3 class="small">Pairwise Mesh-Error: ε_i − ε_j (ms)</h3>
+            <canvas id="pairChart" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">Mesh-Error Step: Δε pro Node (ms)</h3>
+            <canvas id="stepChart" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">Pair Stability (robust): σ ≈ 0.741·IQR(ε_i − ε_j) (ms)</h3>
+            <canvas id="stabilityBar" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">Heatmap: |ε_i − ε_j| (ms) (binned)</h3>
+            <canvas id="heatmapChart" height="150"></canvas>
+          </div>
         </div>
-        <canvas id="meshChart" height="190"></canvas>
       </div>
 
       <div class="card" style="margin-top:1rem;">
-        <div class="row sp">
-          <h2 style="font-size:1.05rem;">Link Metrics (Conv-Window)</h2>
-          <div class="sub muted">Directed Link-ID: A→B</div>
-        </div>
-        <table id="linksTable">
-          <thead>
-            <tr>
-              <th>Link</th>
-              <th>State</th>
-              <th>Age</th>
-              <th>θ med</th>
-              <th>RTT med</th>
-              <th>σ med</th>
-              <th>nσ</th>
-            </tr>
-          </thead>
-          <tbody><tr><td colspan="7" class="muted">lade…</td></tr></tbody>
-        </table>
-      </div>
+        <h2 style="font-size:1.05rem;">Link Quality (θ / RTT / σ)</h2>
+        <div class="sub muted">Link-ID ist <span class="mono">A-&gt;B</span> (gerichtet). θ ist signiert.</div>
 
-      <div class="card" style="margin-top:1rem;">
-        <div class="row sp">
-          <h2 style="font-size:1.05rem;">Heatmap</h2>
-          <div class="sub">Genau 1 Metrik (Dropdown oben). Fixes Layout, keine abgeschnittenen Labels.</div>
+        <div class="plots">
+          <div>
+            <h3 class="small">θ pro Link (ms)</h3>
+            <canvas id="thetaChart" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">RTT pro Link (ms)</h3>
+            <canvas id="rttChart" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">σ pro Link (latest) (ms)</h3>
+            <canvas id="sigmaBar" height="150"></canvas>
+          </div>
+          <div class="small">
+            <b>Interpretation:</b><br>
+            σ hoch → Link noisy/unstable → Konvergenz wird gelb/rot mit Grund.<br>
+            RTT spiky → Medium/Queueing. θ spiky → Asymmetrie/Peer/Bootstrap.
+          </div>
         </div>
-        <canvas id="heatmap" height="190"></canvas>
       </div>
 
       <div class="card debugOnly" style="margin-top:1rem;">
-        <div class="row sp">
-          <div>
-            <h2 style="font-size:1.05rem;">Controller (Debug)</h2>
-            <div class="sub">delta_desired/applied, dt, slew_clipped → Ursache/Wirkung</div>
-          </div>
-          <div class="controls">
-            <span class="muted">Node:</span>
-            <select id="ctrlNode"></select>
-          </div>
-        </div>
+        <h2 style="font-size:1.05rem;">Controller / Kalman Diagnose (Debug)</h2>
+        <div class="sub">delta_desired vs delta_applied, dt, slew_clipped → Ursache/Wirkung</div>
 
         <div class="plots">
-          <div><div class="sub">delta_desired_ms</div><canvas id="c_des" height="140"></canvas></div>
-          <div><div class="sub">delta_applied_ms</div><canvas id="c_app" height="140"></canvas></div>
-          <div><div class="sub">dt_s</div><canvas id="c_dt" height="140"></canvas></div>
-          <div><div class="sub">slew_clipped (0/1)</div><canvas id="c_clip" height="140"></canvas></div>
+          <div>
+            <h3 class="small">delta_desired_ms</h3>
+            <canvas id="deltaDesired" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">delta_applied_ms</h3>
+            <canvas id="deltaApplied" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">dt_s</h3>
+            <canvas id="dtChart" height="150"></canvas>
+          </div>
+          <div>
+            <h3 class="small">slew_clipped (0/1)</h3>
+            <canvas id="slewChart" height="150"></canvas>
+          </div>
         </div>
       </div>
 
+      <div class="small muted" style="margin-top:1rem;">
+        Reality check: Wenn es “stabil aussieht”, aber Ampel ist gelb/rot → schau Reason: stale? correction? stable_links? slew_clipped?
+      </div>
     </div>
   </div>
 
 <script>
-  const COLORS = ['#2ecc71','#3498db','#f1c40f','#e74c3c','#9b59b6','#1abc9c','#e67e22'];
+  const colors = ['#2ecc71','#3498db','#f1c40f','#e74c3c','#9b59b6','#1abc9c','#e67e22'];
+
+  let meshChart, pairChart, stepChart, stabilityBar, heatmapChart;
+  let thetaChart, rttChart, sigmaBar;
+  let deltaDesiredChart, deltaAppliedChart, dtLineChart, slewLineChart;
 
   function pillClass(state){
-    if(state==='GREEN') return 'pill ok';
-    if(state==='RED') return 'pill bad';
+    if(state === 'GREEN') return 'pill ok';
+    if(state === 'RED') return 'pill bad';
     return 'pill warn';
   }
 
   function setMeshHeader(state, line, meta){
-    const pill = document.getElementById('meshStatePill');
-    pill.className = pillClass(state);
-    pill.textContent = state;
-    document.getElementById('meshHeaderLine').textContent = line || '';
-    document.getElementById('meshHeaderMeta').textContent = meta || '';
+    const el = document.getElementById('meshPill');
+    el.className = pillClass(state);
+    el.textContent = state || '…';
+    document.getElementById('meshLine').textContent = line || '';
+    document.getElementById('meshMeta').textContent = meta || '';
   }
 
   async function fetchJson(url){
-    const r = await fetch(url);
-    const j = await r.json().catch(()=>({error:'invalid json'}));
-    if(!r.ok) throw new Error(j.error || 'http error');
-    return j;
+    const resp = await fetch(url);
+    let data = null;
+    try { data = await resp.json(); } catch(e) { data = { error: "invalid json" }; }
+    if(!resp.ok) throw new Error(`${url}: ${data.error || 'unknown error'}`);
+    return data;
   }
-
-  // Charts
-  let meshChart, heatChart, cDes, cApp, cDt, cClip;
 
   function mkLine(ctx, yLabel){
     return new Chart(ctx, {
       type:'line',
       data:{datasets:[]},
       options:{
-        responsive:true,
-        animation:false,
+        responsive:true, animation:false,
         scales:{
           x:{type:'time', ticks:{color:'#aaa'}, grid:{color:'rgba(255,255,255,0.06)'}},
           y:{ticks:{color:'#aaa'}, grid:{color:'rgba(255,255,255,0.06)'}, title:{display:true, text:yLabel, color:'#aaa'}}
         },
         plugins:{ legend:{labels:{color:'#eee'}} },
-        elements:{point:{radius:0}, line:{tension:0.05}}
+        elements:{ point:{radius:0}, line:{tension:0.06} }
+      }
+    });
+  }
+
+  function mkBar(ctx, label, yLabel){
+    return new Chart(ctx, {
+      type:'bar',
+      data:{labels:[], datasets:[{label:label, data:[]}]},
+      options:{
+        responsive:true, animation:false,
+        scales:{
+          x:{ticks:{color:'#aaa'}, grid:{display:false}},
+          y:{ticks:{color:'#aaa'}, grid:{color:'rgba(255,255,255,0.06)'}, title:{display:true, text:yLabel, color:'#aaa'}}
+        },
+        plugins:{ legend:{labels:{color:'#eee'}} }
       }
     });
   }
 
   function mkHeatmap(ctx){
     return new Chart(ctx, {
-      type: 'matrix',
-      data: { datasets: [{
-        label: 'Heatmap',
-        data: [],
-        borderWidth: 0,
-        backgroundColor: (context) => {
+      type:'matrix',
+      data:{datasets:[{
+        label:'Heatmap',
+        data:[],
+        borderWidth:0,
+        backgroundColor:(context)=>{
           const raw = context.raw;
           if(!raw || typeof raw.v !== 'number') return 'rgba(0,0,0,0)';
           const maxV = context.chart._maxV || 1;
           const ratio = Math.min(1, raw.v / maxV);
           const r = Math.round(255 * ratio);
           const g = Math.round(255 * (1 - ratio));
-          return `rgba(${r},${g},160,0.85)`;
+          return `rgba(${r},${g},150,0.85)`;
         },
-        width: (context) => {
+        width:(context)=>{
           const area = context.chart.chartArea || {};
-          const n = context.chart._nBins || 1;
-          const w = (area.right - area.left) / n;
+          const nBins = context.chart._nBins || 1;
+          const w = (area.right - area.left) / nBins;
           return (Number.isFinite(w) && w > 0) ? w : 10;
         },
-        height: (context) => {
+        height:(context)=>{
           const area = context.chart.chartArea || {};
-          const cats = context.chart._cats || ['x'];
+          const cats = context.chart._cats || ['pair'];
           const h = (area.bottom - area.top) / (cats.length || 1);
           return (Number.isFinite(h) && h > 0) ? h : 10;
         }
       }]},
-      options: {
-        responsive:true,
-        animation:false,
-        scales: {
-          x: { type:'time', ticks:{color:'#aaa'}, grid:{color:'rgba(255,255,255,0.06)'} },
-          y: {
+      options:{
+        responsive:true, animation:false,
+        scales:{
+          x:{type:'time', ticks:{color:'#aaa'}, grid:{color:'rgba(255,255,255,0.06)'}},
+          y:{
             type:'linear',
-            ticks:{
-              color:'#aaa',
-              callback: function(v){
-                const cats = this.chart._cats || [];
-                return cats[Math.round(v)] || '';
-              }
-            },
+            ticks:{color:'#aaa', callback:function(v){
+              const cats = this.chart._cats || [];
+              const idx = Math.round(v);
+              return cats[idx] || '';
+            }},
             grid:{color:'rgba(255,255,255,0.06)'}
           }
         },
@@ -1131,94 +1189,147 @@ TEMPLATE = r"""
           legend:{labels:{color:'#eee'}},
           tooltip:{callbacks:{label:(ctx)=>{
             const cats = ctx.chart._cats || [];
-            const lid = cats[Math.round(ctx.raw.y)] || '?';
+            const pid = cats[Math.round(ctx.raw.y)] || '?';
             const t = new Date(ctx.raw.x);
-            return `${lid} @ ${t.toLocaleTimeString()} : ${ctx.raw.v.toFixed(2)}`;
+            return `${pid} @ ${t.toLocaleTimeString()} : |Δ|=${ctx.raw.v.toFixed(2)} ms`;
           }}}
         }
       }
     });
   }
 
-  function updateMeshChart(series){
-    const ids = Object.keys(series||{}).sort();
-    meshChart.data.datasets = [];
-    ids.forEach((id, i)=>{
-      const c = COLORS[i % COLORS.length];
-      const pts = (series[id]||[]).map(p=>({x:new Date(p.t*1000), y:p.mesh_ms}));
-      meshChart.data.datasets.push({label:`Node ${id}`, data:pts, borderColor:c, borderWidth:1.6});
+  function updateLine(chart, seriesMap, field, labelPrefix=''){
+    const ids = Object.keys(seriesMap||{}).sort();
+    chart.data.datasets = [];
+    ids.forEach((id, idx)=>{
+      const c = colors[idx % colors.length];
+      const pts = (seriesMap[id]||[])
+        .filter(p => p && p[field] !== null && p[field] !== undefined && Number.isFinite(p[field]))
+        .map(p => ({x:new Date(p.t_wall*1000), y:p[field]}));
+      chart.data.datasets.push({label:`${labelPrefix}${id}`, data:pts, borderColor:c, borderWidth:1.6});
     });
-    meshChart.update();
+    chart.update();
   }
 
-  function renderLinksTable(table){
-    const tb = document.querySelector('#linksTable tbody');
-    tb.innerHTML = '';
-    if(!table || !table.length){
-      tb.innerHTML = `<tr><td colspan="7" class="muted">keine Link-Daten</td></tr>`;
+  function updatePairs(chart, pairs){
+    const ids = Object.keys(pairs||{}).sort();
+    chart.data.datasets = [];
+    ids.forEach((id, idx)=>{
+      const c = colors[idx % colors.length];
+      const pts = (pairs[id]||[]).map(p => ({x:new Date(p.t_wall*1000), y:p.delta_ms}));
+      chart.data.datasets.push({label:id, data:pts, borderColor:c, borderWidth:1.6});
+    });
+    chart.update();
+  }
+
+  function updateBarFromMap(chart, mapObj, field){
+    const ids = Object.keys(mapObj||{}).sort();
+    const labels=[], data=[];
+    ids.forEach(id=>{
+      const v = mapObj[id]?.[field];
+      if(v !== null && v !== undefined && Number.isFinite(v)){
+        labels.push(id); data.push(v);
+      }
+    });
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.update();
+  }
+
+  function updateSigmaBar(chart, latest){
+    const ids = Object.keys(latest||{}).sort();
+    const labels=[], data=[];
+    ids.forEach(id=>{
+      const v = latest[id];
+      if(v !== null && v !== undefined && Number.isFinite(v)){
+        labels.push(id); data.push(v);
+      }
+    });
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.update();
+  }
+
+  function updateHeatmap(chart, heatmap){
+    const data = (heatmap && heatmap.data) || [];
+    if(!data.length){
+      chart.data.datasets[0].data = [];
+      chart._cats = [];
+      chart._nBins = 1;
+      chart._maxV = 1;
+      chart.update();
       return;
     }
-    table.forEach(r=>{
-      const st = r.state || 'DOWN';
-      const pill = st==='UP' ? 'pill ok' : 'pill bad';
-      const age = (r.age_s==null) ? 'n/a' : `${r.age_s.toFixed(1)} s`;
-      const th = (r.theta_med_ms==null) ? '—' : `${r.theta_med_ms.toFixed(2)} ms`;
-      const rt = (r.rtt_med_ms==null) ? '—' : `${r.rtt_med_ms.toFixed(2)} ms`;
-      const sg = (r.sigma_med_ms==null) ? '—' : `${r.sigma_med_ms.toFixed(2)} ms`;
-      const ns = (r.n_sigma==null) ? '—' : r.n_sigma;
+    const cats = Array.from(new Set(data.map(d=>d.pair))).sort();
+    const idx = new Map(cats.map((c,i)=>[c,i]));
+    let maxV = 0;
+    const matrix = data.map(d=>{
+      const v = Math.abs(d.value);
+      if(v > maxV) maxV = v;
+      return {x:new Date(d.t_bin*1000), y:(idx.get(d.pair) ?? 0), v:v};
+    });
+    chart.data.datasets[0].data = matrix;
+    chart._cats = cats;
+    chart._nBins = heatmap.n_bins || 1;
+    chart._maxV = maxV || 1;
+    chart.update();
+  }
 
+  function renderNodeKpis(nodes){
+    const wrap = document.getElementById('nodeKpis');
+    wrap.innerHTML = '';
+    (nodes||[]).forEach(n=>{
+      const st = n.state || 'YELLOW';
+      const off = (n.mesh_err_now_ms==null) ? 'n/a' : `${n.mesh_err_now_ms.toFixed(2)} ms`;
+      const age = (n.age_s==null) ? 'n/a' : `${n.age_s.toFixed(1)} s`;
+      const rate = (n.mesh_rate_ms_s==null) ? '—' : `${n.mesh_rate_ms_s.toFixed(3)} ms/s`;
+      const corr = (n.med_abs_delta_applied_ms==null) ? 'n/a' : `${n.med_abs_delta_applied_ms.toFixed(2)} ms`;
+      const clip = (n.slew_clip_rate==null) ? '—' : `${(n.slew_clip_rate*100).toFixed(0)}%`;
+      const sl = `${n.stable_links ?? 0}/${n.k_stable_links ?? 1}`;
+
+      const div = document.createElement('div');
+      div.className = 'kpi';
+      div.innerHTML = `
+        <div class="row sp">
+          <div class="title">Node ${n.node_id}</div>
+          <span class="${pillClass(st)}">${st}</span>
+        </div>
+        <div class="value">${off}</div>
+        <div class="hint">rate ${rate} · age ${age}</div>
+        <div class="hint">|Δapplied|med ${corr} · clip ${clip} · stable_links ${sl}</div>
+        <div class="reason">${n.reason || ''}</div>
+      `;
+      wrap.appendChild(div);
+    });
+  }
+
+  function renderStatusTable(nodes){
+    const tb = document.querySelector('#statusTable tbody');
+    tb.innerHTML = '';
+    if(!nodes || !nodes.length){
+      tb.innerHTML = `<tr><td colspan="6" class="small">Keine Daten.</td></tr>`;
+      return;
+    }
+    nodes.forEach(n=>{
+      const st = n.state || 'YELLOW';
+      const pill = pillClass(st);
+      const err = (n.mesh_err_now_ms==null) ? 'n/a' : `${n.mesh_err_now_ms.toFixed(2)} ms`;
+      const rate = (n.mesh_rate_ms_s==null) ? '—' : `${n.mesh_rate_ms_s.toFixed(3)} ms/s`;
+      const age = (n.age_s==null) ? 'n/a' : `${n.age_s.toFixed(1)} s`;
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td class="mono">${r.link}</td>
+        <td>${n.node_id}</td>
         <td><span class="${pill}">${st}</span></td>
+        <td>${err}</td>
+        <td>${rate}</td>
         <td>${age}</td>
-        <td>${th}</td>
-        <td>${rt}</td>
-        <td>${sg}</td>
-        <td>${ns}</td>
+        <td class="small">${n.reason || ''}</td>
       `;
       tb.appendChild(tr);
     });
   }
 
-  function updateHeatmap(metric, hm){
-    const data = (hm && hm.data) ? hm.data : [];
-    if(!data.length){
-      heatChart.data.datasets[0].data = [];
-      heatChart._cats = [];
-      heatChart._nBins = 1;
-      heatChart._maxV = 1;
-      heatChart.update();
-      return;
-    }
-    const cats = Array.from(new Set(data.map(d=>d.link))).sort();
-    const idx = new Map(cats.map((c,i)=>[c,i]));
-    let maxV = 0;
-    const matrix = data.map(d=>{
-      const v = Math.abs(d.v);
-      if(v > maxV) maxV = v;
-      return {x:new Date(d.t*1000), y:(idx.get(d.link) ?? 0), v:v};
-    });
-    heatChart.data.datasets[0].data = matrix;
-    heatChart._cats = cats;
-    heatChart._nBins = hm.n_bins || 1;
-    heatChart._maxV = maxV || 1;
-    heatChart.update();
-  }
-
-  function updateController(nodeId, ctrl){
-    function one(chart, key){
-      const pts = (ctrl[nodeId]||[]).filter(p=>p[key]!=null).map(p=>({x:new Date(p.t*1000), y:p[key]}));
-      chart.data.datasets = [{label:`Node ${nodeId}`, data:pts, borderColor:'#2ecc71', borderWidth:1.6}];
-      chart.update();
-    }
-    one(cDes,'delta_desired_ms');
-    one(cApp,'delta_applied_ms');
-    one(cDt,'dt_s');
-    one(cClip,'slew_clipped');
-  }
-
-  function drawTopology(canvas, topo, nodeStates, linkSigmaMed){
+  function drawMesh(canvas, topo, nodeStates, linkSigmaMed){
     const ctx = canvas.getContext('2d');
     const w = canvas.width, h = canvas.height;
     ctx.clearRect(0,0,w,h);
@@ -1228,38 +1339,41 @@ TEMPLATE = r"""
     if(!nodes.length){
       ctx.fillStyle = '#777';
       ctx.font = '12px system-ui';
-      ctx.fillText('Keine Nodes in config/nodes.json', 10, 20);
+      ctx.fillText('Keine Nodes in config/nodes.json gefunden.', 10, 20);
       return;
     }
 
     const n = nodes.length;
-    const R = Math.min(w,h) * 0.35;
+    const radius = Math.min(w,h) * 0.35;
     const cx = w/2, cy = h/2;
 
     const pos = {};
-    nodes.forEach((nd,i)=>{
+    nodes.forEach((node, i)=>{
       const a = (2*Math.PI*i)/n - Math.PI/2;
-      pos[nd.id] = {x: cx + R*Math.cos(a), y: cy + R*Math.sin(a)};
+      pos[node.id] = {x: cx + radius*Math.cos(a), y: cy + radius*Math.sin(a)};
     });
 
-    // link drawing: use sigma median if known (directed links)
-    function linkKey(a,b){ return `${a}→${b}`; }
+    function sigForUndirected(a,b){
+      const s1 = linkSigmaMed[`${a}->${b}`];
+      const s2 = linkSigmaMed[`${b}->${a}`];
+      if(s1==null && s2==null) return null;
+      if(s1==null) return s2;
+      if(s2==null) return s1;
+      return Math.max(s1,s2);
+    }
 
-    links.forEach(L=>{
-      const a = pos[L.a], b = pos[L.b];
+    // draw links with sigma-based style
+    links.forEach(l=>{
+      const a = pos[l.source], b = pos[l.target];
       if(!a || !b) return;
 
-      // sigma: take max of both directions if available
-      const s1 = linkSigmaMed[linkKey(L.a, L.b)];
-      const s2 = linkSigmaMed[linkKey(L.b, L.a)];
-      const sigma = (s1!=null && s2!=null) ? Math.max(s1,s2) : (s1!=null? s1 : (s2!=null? s2 : null));
-
-      let stroke = 'rgba(255,255,255,0.18)';
+      const sig = sigForUndirected(l.source, l.target);
+      let stroke = 'rgba(255,255,255,0.20)';
       let lw = 1.0;
-      if(sigma!=null){
-        if(sigma <= 2.0){ stroke = 'rgba(46,204,113,0.55)'; lw = 2.4; }
-        else if(sigma <= 5.0){ stroke = 'rgba(241,196,15,0.55)'; lw = 2.0; }
-        else { stroke = 'rgba(231,76,60,0.55)'; lw = 2.0; }
+      if(sig != null){
+        if(sig <= 2.0){ stroke = 'rgba(46,204,113,0.55)'; lw = 2.6; }
+        else if(sig <= 5.0){ stroke = 'rgba(241,196,15,0.55)'; lw = 2.1; }
+        else { stroke = 'rgba(231,76,60,0.55)'; lw = 2.1; }
       }
 
       ctx.strokeStyle = stroke;
@@ -1267,16 +1381,16 @@ TEMPLATE = r"""
       ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
     });
 
-    // nodes
-    nodes.forEach(nd=>{
-      const p = pos[nd.id]; if(!p) return;
-      const st = nodeStates[nd.id] || 'YELLOW';
-      const isRoot = !!nd.is_root;
+    // draw nodes
+    nodes.forEach(node=>{
+      const p = pos[node.id]; if(!p) return;
+      const st = nodeStates[node.id] || 'YELLOW';
+      const isRoot = !!node.is_root;
       const r = isRoot ? 20 : 16;
 
-      let fill='rgba(241,196,15,0.14)', stroke='#f1c40f';
-      if(st==='GREEN'){ fill='rgba(46,204,113,0.18)'; stroke='#2ecc71'; }
-      if(st==='RED'){ fill='rgba(231,76,60,0.18)'; stroke='#e74c3c'; }
+      let fill = 'rgba(241,196,15,0.14)', stroke = '#f1c40f';
+      if(st === 'GREEN'){ fill = 'rgba(46,204,113,0.18)'; stroke = '#2ecc71'; }
+      if(st === 'RED'){ fill = 'rgba(231,76,60,0.18)'; stroke = '#e74c3c'; }
 
       ctx.beginPath(); ctx.arc(p.x,p.y,r,0,2*Math.PI);
       ctx.fillStyle = fill; ctx.fill();
@@ -1285,127 +1399,144 @@ TEMPLATE = r"""
 
       ctx.fillStyle = '#ecf0f1';
       ctx.font = '12px system-ui';
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(nd.id, p.x, p.y);
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(node.id, p.x, p.y);
     });
   }
 
-  function renderNodeTiles(nodes){
-    const wrap = document.getElementById('nodeTiles');
-    wrap.innerHTML = '';
-    (nodes||[]).forEach((n, i)=>{
-      const st = n.state || 'YELLOW';
-      const cls = pillClass(st);
-
-      const m = (n.mesh_centered_ms==null) ? 'n/a' : `${n.mesh_centered_ms.toFixed(2)} ms`;
-      const age = (n.age_s==null) ? 'n/a' : `${n.age_s.toFixed(1)} s`;
-      const da = (n.med_abs_delta_applied_ms==null) ? 'n/a' : `${n.med_abs_delta_applied_ms.toFixed(2)} ms`;
-      const sig = (n.link_sigma_med_ms==null) ? '—' : `${n.link_sigma_med_ms.toFixed(2)} ms`;
-      const clip = (n.slew_clip_rate==null) ? '—' : `${(n.slew_clip_rate*100).toFixed(0)}%`;
-      const rate = (n.mesh_rate_ms_s==null) ? '—' : `${n.mesh_rate_ms_s.toFixed(3)} ms/s`;
-
-      const div = document.createElement('div');
-      div.className = 'kpi';
-      div.innerHTML = `
-        <div class="row sp">
-          <div class="muted">Node ${n.node_id}</div>
-          <span class="${cls}">${st}</span>
-        </div>
-        <div class="big">${m}</div>
-        <div class="small">rate ${rate} · age ${age}</div>
-        <div class="small">|Δapplied|med ${da} · clip ${clip} · linkσmed ${sig}</div>
-        <div class="reason">${n.reason || ''}</div>
-      `;
-      wrap.appendChild(div);
+  function applyDebugVisibility(){
+    const on = document.getElementById('debugToggle').checked;
+    document.querySelectorAll('.debugOnly').forEach(el=>{
+      el.classList.toggle('hidden', !on);
     });
   }
 
-  function applyDebug(){
-    document.body.classList.toggle('debug', document.getElementById('debugToggle').checked);
-  }
+  function updateControllerCharts(ctrl, selectedNode){
+    const byNode = ctrl || {};
+    const pts = byNode[selectedNode] || [];
 
-  async function refreshAll(){
-    const topo = {{ topo|tojson }};
-
-    const [ov, mesh, links, ctrl, hm] = await Promise.all([
-      fetchJson('/api/overview'),
-      fetchJson('/api/mesh_timeseries'),
-      fetchJson('/api/links'),
-      fetchJson('/api/controller'),
-      fetchJson('/api/heatmap?metric=' + encodeURIComponent(document.getElementById('heatMetric').value)),
-    ]);
-
-    // header
-    const M = ov.mesh || {};
-    setMeshHeader(M.state || 'YELLOW', `${M.state||'…'}: ${M.reason||''}`, `now=${M.now_utc||'n/a'} · conv_window=${M.conv_window_s||'?'}` );
-
-    // debug thresholds line
-    const T = (M.thresholds||{});
-    document.getElementById('thrLine').textContent =
-      `fresh≤${(T.fresh_s??'?')}s  |Δapplied|med≤${(T.delta_applied_med_ms??'?')}ms  linkσmed≤${(T.link_sigma_med_ms??'?')}ms  clip≤${Math.round((T.slew_clip_rate??0)*100)}%  warmup≥${(T.min_samples_warmup??'?')} samples`;
-
-    // node tiles
-    renderNodeTiles(ov.nodes || []);
-
-    // offenders
-    const off = ov.offenders || {};
-    document.getElementById('offendersLine').textContent =
-      `worst |Δapplied|: ${off.worst_node_delta || '—'} · stalest: ${off.stalest_node || '—'} · most clipped: ${off.most_slew_clipped || '—'} · worst link σ: ${off.worst_link_sigma || '—'}`;
-
-    // topology canvas sizing
-    const c = document.getElementById('meshTopo');
-    c.width = c.clientWidth;
-    c.height = c.clientHeight;
-
-    const nodeStates = {};
-    (ov.nodes||[]).forEach(n => nodeStates[n.node_id] = n.state);
-    drawTopology(c, topo, nodeStates, ov.link_sigma_med || {});
-
-    // mesh plot
-    updateMeshChart(mesh.series || {});
-
-    // links table
-    renderLinksTable(links.table || []);
-
-    // heatmap
-    updateHeatmap(hm.metric, hm.heatmap || {data:[], n_bins:0});
-
-    // controller debug node selector
-    const ctrlMap = ctrl.controller || {};
-    const sel = document.getElementById('ctrlNode');
-    const nodes = Object.keys(ctrlMap).sort();
-    if(sel.options.length === 0){
-      nodes.forEach(n=>{
-        const o = document.createElement('option');
-        o.value = n; o.textContent = n;
-        sel.appendChild(o);
-      });
+    function mkDataset(field, label){
+      const data = pts
+        .filter(p => p && p[field] !== null && p[field] !== undefined && Number.isFinite(p[field]))
+        .map(p => ({x:new Date(p.t_wall*1000), y:p[field]}));
+      return [{label: label, data: data, borderColor: '#2ecc71', borderWidth: 1.6}];
     }
-    const chosen = sel.value || (nodes[0] || '');
-    if(chosen && ctrlMap[chosen]){
-      updateController(chosen, ctrlMap);
+
+    deltaDesiredChart.data.datasets = mkDataset('delta_desired_ms', 'selected node');
+    deltaAppliedChart.data.datasets = mkDataset('delta_applied_ms', 'selected node');
+    dtLineChart.data.datasets       = mkDataset('dt_s', 'selected node');
+    slewLineChart.data.datasets     = mkDataset('slew_clipped', 'selected node');
+
+    deltaDesiredChart.update();
+    deltaAppliedChart.update();
+    dtLineChart.update();
+    slewLineChart.update();
+  }
+
+  function initCharts(){
+    meshChart      = mkLine(document.getElementById('meshChart').getContext('2d'), 'ms');
+    pairChart      = mkLine(document.getElementById('pairChart').getContext('2d'), 'ms');
+    stepChart      = mkLine(document.getElementById('stepChart').getContext('2d'), 'ms');
+    stabilityBar   = mkBar(document.getElementById('stabilityBar').getContext('2d'), 'σ_pair', 'ms');
+    heatmapChart   = mkHeatmap(document.getElementById('heatmapChart').getContext('2d'));
+
+    thetaChart     = mkLine(document.getElementById('thetaChart').getContext('2d'), 'ms');
+    rttChart       = mkLine(document.getElementById('rttChart').getContext('2d'), 'ms');
+    sigmaBar       = mkBar(document.getElementById('sigmaBar').getContext('2d'), 'σ latest', 'ms');
+
+    deltaDesiredChart = mkLine(document.getElementById('deltaDesired').getContext('2d'), 'ms');
+    deltaAppliedChart = mkLine(document.getElementById('deltaApplied').getContext('2d'), 'ms');
+    dtLineChart       = mkLine(document.getElementById('dtChart').getContext('2d'), 's');
+    slewLineChart     = mkLine(document.getElementById('slewChart').getContext('2d'), '0/1');
+  }
+
+  async function refresh(){
+    try{
+      const topo = await fetchJson('/api/topology');
+      const [ov, mesh, link, ctrl] = await Promise.all([
+        fetchJson('/api/overview'),
+        fetchJson('/api/mesh_diag'),
+        fetchJson('/api/link_diag'),
+        fetchJson('/api/controller_diag'),
+      ]);
+
+      // header
+      const M = ov.mesh || {};
+      setMeshHeader(
+        M.state || 'YELLOW',
+        `${M.state || '…'}: ${M.reason || ''}`,
+        `now=${M.now_utc || 'n/a'} · conv_window=${M.conv_window_s || '?'}s · scale(t_mesh→ms)=${(M.t_mesh_scale_to_ms ?? '?')}`
+      );
+
+      const T = (M.thresholds || {});
+      document.getElementById('thrLine').textContent =
+        `fresh≤${T.fresh_s ?? '?'}s  |Δapplied|med≤${T.delta_applied_med_ms ?? '?'}ms  linkσmed≤${T.link_sigma_med_ms ?? '?'}ms  clip≤${Math.round((T.slew_clip_rate ?? 0)*100)}%  K_stable_links=${T.k_stable_links ?? '?'}  warmup≥${T.warmup_min_samples ?? '?'} samples`;
+
+      // offenders
+      const off = ov.offenders || {};
+      document.getElementById('offendersLine').textContent =
+        `worst correction: ${off.worst_node_correction || '—'} · stalest: ${off.stalest_node || '—'} · most clipped: ${off.most_slew_clipped || '—'} · worst link σ: ${off.worst_link_sigma || '—'}`;
+
+      // node tiles + status table
+      renderNodeKpis(ov.nodes || []);
+      renderStatusTable(ov.nodes || []);
+
+      // topology
+      const nodeStates = {};
+      (ov.nodes || []).forEach(n => { nodeStates[n.node_id] = n.state; });
+
+      const meshCanvas = document.getElementById('meshCanvas');
+      meshCanvas.width = meshCanvas.clientWidth;
+      meshCanvas.height = meshCanvas.clientHeight;
+      drawMesh(meshCanvas, topo, nodeStates, ov.link_sigma_med || {});
+
+      // plots: mesh/pairs/step/stability/heatmap
+      updateLine(meshChart, mesh.mesh_series || {}, "mesh_err_ms", "Node ");
+      updatePairs(pairChart, mesh.pairs || {});
+      updateLine(stepChart, mesh.step_series || {}, "step_ms", "Node ");
+      updateBarFromMap(stabilityBar, mesh.stability || {}, "sigma_ms");
+      updateHeatmap(heatmapChart, mesh.heatmap || {data:[], n_bins:0});
+
+      // link plots
+      const links = link.links || {};
+      updateLine(thetaChart, links, "theta_ms", "");
+      updateLine(rttChart, links, "rtt_ms", "");
+      updateSigmaBar(sigmaBar, link.latest_sigma || {});
+
+      // controller node dropdown
+      const ctrlMap = ctrl.controller || {};
+      const sel = document.getElementById('ctrlNode');
+      const nodeIds = Object.keys(ctrlMap).sort();
+
+      if(sel.options.length === 0){
+        nodeIds.forEach(n=>{
+          const o = document.createElement('option');
+          o.value = n;
+          o.textContent = n;
+          sel.appendChild(o);
+        });
+        if(nodeIds.length) sel.value = nodeIds[0];
+      }
+      const chosen = sel.value || (nodeIds[0] || '');
+      if(chosen){
+        updateControllerCharts(ctrlMap, chosen);
+      }
+
+    } catch(e){
+      console.error('refresh failed:', e);
     }
   }
 
   window.addEventListener('load', ()=>{
-    // charts init
-    meshChart = mkLine(document.getElementById('meshChart').getContext('2d'), 'ms');
-    heatChart = mkHeatmap(document.getElementById('heatmap').getContext('2d'));
-
-    cDes = mkLine(document.getElementById('c_des').getContext('2d'), 'ms');
-    cApp = mkLine(document.getElementById('c_app').getContext('2d'), 'ms');
-    cDt = mkLine(document.getElementById('c_dt').getContext('2d'), 's');
-    cClip = mkLine(document.getElementById('c_clip').getContext('2d'), '0/1');
-
-    document.getElementById('debugToggle').addEventListener('change', applyDebug);
-    document.getElementById('heatMetric').addEventListener('change', ()=>refreshAll().catch(console.error));
-    document.getElementById('ctrlNode').addEventListener('change', ()=>refreshAll().catch(console.error));
-
-    applyDebug();
-    refreshAll().catch(console.error);
-    setInterval(()=>refreshAll().catch(console.error), 2000);
+    initCharts();
+    document.getElementById('debugToggle').addEventListener('change', applyDebugVisibility);
+    document.getElementById('ctrlNode').addEventListener('change', ()=>refresh());
+    applyDebugVisibility();
+    refresh();
+    setInterval(refresh, 2000);
   });
 </script>
+
 </body>
 </html>
 """
@@ -1418,5 +1549,5 @@ def ensure_db():
 
 if __name__ == "__main__":
     ensure_db()
-    print("MeshTime Dashboard on http://0.0.0.0:5000/")
+    print("Starting MeshTime Dashboard on http://0.0.0.0:5000/")
     app.run(host="0.0.0.0", port=5000, debug=False)

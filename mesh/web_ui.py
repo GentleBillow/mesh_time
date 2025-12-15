@@ -1755,7 +1755,7 @@ TEMPLATE = r"""
     document.getElementById('ctrlNode').addEventListener('change', ()=>refresh());
     applyDebugVisibility();
     refresh();
-    setInterval(refresh, 250);
+    setInterval(refresh, 1000);
   });
 </script>
 

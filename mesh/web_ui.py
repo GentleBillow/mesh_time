@@ -394,7 +394,12 @@ def build_mesh_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
     scale_offset = scale_value_to_ms(rows, "offset") if any(row_get(r, "offset") is not None for r in rows) else 1000.0
     scale_err = scale_value_to_ms(rows, "err_mesh_vs_wall") if any(row_get(r, "err_mesh_vs_wall") is not None for r in rows) else 1000.0
 
-    ts = [t for r in rows if (t := _f(row_get(r, "created_at"))) is not None]
+    ts = []
+    for r in rows:
+        t = _f(row_get(r, "created_at"))
+        if t is not None:
+            ts.append(t)
+
     if not ts:
         return {
             "mesh_series": {},
@@ -572,7 +577,12 @@ def build_link_diagnostics(window_s: float, bin_s: float, max_points: int) -> Di
     if bin_s <= 0:
         bin_s = BIN_S_DEFAULT
 
-    ts = [t for r in rows if (t := _f(row_get(r, "created_at"))) is not None]
+    ts = []
+    for r in rows:
+        t = _f(row_get(r, "created_at"))
+        if t is not None:
+            ts.append(t)
+
     if not ts:
         return {"links": {}, "latest_sigma": {}, "meta": {"window_s": window_s, "bin_s": bin_s, "x_axis": "created_at"}}
 

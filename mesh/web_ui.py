@@ -324,171 +324,296 @@ def controller_delta_scale_to_ms(rows: List[sqlite3.Row]) -> float:
 # -----------------------------
 # Mesh diagnostics (stable, matches JS)
 # -----------------------------
-def build_mesh_diag(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
+def build_mesh_diag(window_s, bin_s, max_points):
     rows = fetch_node_rows(window_s, max_points)
-    if not rows or bin_s <= 0:
+    if not rows:
         return {
-            "mesh_series": {},
-            "step_series": {},
-            "pairs": {},
-            "stability": {},
-            "heatmap": {"data": [], "n_bins": 0},
-            "legacy": {"offset": {}, "err_mesh_vs_wall": {}},
-            "meta": {"window_s": float(window_s), "bin_s": float(bin_s), "x_axis": "created_at", "note": "no data"},
+            "meta": {"note": "no data"},
+            "mesh_series_ffill": {}, "step_series_ffill": {}, "pairs_ffill": {},
+            "mesh_series_window": {}, "step_series_window": {}, "pairs_window": {},
+            "mesh_series_event": {}, "step_series_event": {}, "pairs_event": {},
         }
+
+    if bin_s <= 0:
+        bin_s = BIN_S_DEFAULT
 
     scale = infer_tmesh_to_seconds(rows)
 
-    # bins[idx][node] -> list(mesh_offset_ms)
-    bins: Dict[int, Dict[str, List[float]]] = {}
+    # ---- config-driven TTL/W defaults (safe fallbacks) ----
+    # TTL: how long we keep last value for ffill/event before marking stale
+    # W:   sliding window half-width for nearest-sample selection
+    cfg = {}
+    try:
+        cfg = json.load(open(str(CFG_PATH))) if CFG_PATH.exists() else {}
+    except Exception:
+        cfg = {}
+    sync = cfg.get("sync", {}) if isinstance(cfg, dict) else {}
+    beacon_period_s = 0.5
+    try:
+        beacon_period_s = float(sync.get("beacon_period_s", 0.5))
+    except Exception:
+        beacon_period_s = 0.5
+
+    ttl_s = sync.get("ui_ttl_s", None)
+    if ttl_s is None:
+        ttl_s = max(2.0, 3.0 * beacon_period_s, 4.0 * float(bin_s))
+    try:
+        ttl_s = float(ttl_s)
+    except Exception:
+        ttl_s = max(2.0, 3.0 * beacon_period_s, 4.0 * float(bin_s))
+
+    win_s = sync.get("ui_win_s", None)
+    if win_s is None:
+        win_s = max(1.0 * beacon_period_s, 2.0 * float(bin_s))
+    try:
+        win_s = float(win_s)
+    except Exception:
+        win_s = max(1.0 * beacon_period_s, 2.0 * float(bin_s))
+
+    # ---- prepare samples per node: [(t, mesh_offset_ms)] ----
+    by_node = {}
+    t_min = None
+    t_max = None
+
     for r in rows:
-        nid = str(r["node_id"])
+        n = r["node_id"]
         t = _f(r["created_at"])
         tm = _f(r["t_mesh"])
-        if not nid or t is None or tm is None:
+        if not n or t is None or tm is None:
             continue
-        idx = int(math.floor(float(t) / float(bin_s)))  # ABSOLUTE bins => stable across refresh
-        mo = mesh_offset_ms(float(t), float(tm), float(scale))
-        bins.setdefault(idx, {}).setdefault(nid, []).append(float(mo))
+        mo = mesh_offset_ms(t, tm, scale)
+        by_node.setdefault(n, []).append((t, mo))
+        if t_min is None or t < t_min:
+            t_min = t
+        if t_max is None or t > t_max:
+            t_max = t
 
-    mesh_series: Dict[str, List[Dict[str, float]]] = {}
-    step_series: Dict[str, List[Dict[str, float]]] = {}
-    pairs: Dict[str, List[Dict[str, float]]] = {}
+    if not by_node or t_min is None or t_max is None:
+        return {
+            "meta": {"note": "no valid samples"},
+            "mesh_series_ffill": {}, "step_series_ffill": {}, "pairs_ffill": {},
+            "mesh_series_window": {}, "step_series_window": {}, "pairs_window": {},
+            "mesh_series_event": {}, "step_series_event": {}, "pairs_event": {},
+        }
 
-    # build centered eps per bin
-    for idx in sorted(bins.keys()):
-        bucket = bins[idx]
-        if len(bucket) < 2:
+    nodes = sorted(by_node.keys())
+    for n in nodes:
+        by_node[n].sort(key=lambda x: x[0])
+
+    # helper: compute step-series from mesh-series
+    def _make_steps(mesh_series):
+        out = {}
+        for n, pts in mesh_series.items():
+            pts_sorted = sorted(pts, key=lambda p: p["t_wall"])
+            prev = None
+            s = []
+            for p in pts_sorted:
+                cur = p["mesh_err_ms"]
+                if prev is None:
+                    d = 0.0
+                else:
+                    d = float(cur - prev)
+                s.append({"t_wall": float(p["t_wall"]), "step_ms": float(d)})
+                prev = cur
+            out[n] = s
+        return out
+
+    # helper: compute pairs from per-bin eps map
+    def _pairs_from_eps_timeseries(eps_by_time):
+        pairs = {}
+        for t_wall, eps in eps_by_time:
+            ns = sorted(eps.keys())
+            for i in range(len(ns)):
+                for j in range(i + 1, len(ns)):
+                    pid = "%s-%s" % (ns[i], ns[j])
+                    pairs.setdefault(pid, []).append({
+                        "t_wall": float(t_wall),
+                        "delta_ms": float(eps[ns[i]] - eps[ns[j]]),
+                    })
+        return pairs
+
+    # =========================================================================
+    # (A) BINNED + FORWARD-FILL (TTL)
+    # =========================================================================
+    idx0 = int(math.floor(float(t_min) / float(bin_s)))
+    idx1 = int(math.floor(float(t_max) / float(bin_s)))
+
+    # pointers per node into their sample list
+    ptr = dict((n, 0) for n in nodes)
+    last_val = {}      # node -> last mo
+    last_time = {}     # node -> last sample time
+
+    mesh_ffill = dict((n, []) for n in nodes)
+    eps_times_ffill = []  # list[(t_wall, eps_map)]
+
+    for idx in range(idx0, idx1 + 1):
+        t_center = (float(idx) + 0.5) * float(bin_s)
+
+        # advance each node pointer up to t_center (take latest <= t_center)
+        for n in nodes:
+            pts = by_node[n]
+            p = ptr[n]
+            while p < len(pts) and pts[p][0] <= t_center:
+                last_time[n] = pts[p][0]
+                last_val[n] = pts[p][1]
+                p += 1
+            ptr[n] = p
+
+        # collect fresh values within TTL
+        fresh = {}
+        for n in nodes:
+            lt = last_time.get(n)
+            lv = last_val.get(n)
+            if lt is None or lv is None:
+                continue
+            if (t_center - float(lt)) <= float(ttl_s):
+                fresh[n] = float(lv)
+
+        if len(fresh) < 2:
             continue
 
-        node_med: Dict[str, float] = {}
-        for nid, vals in bucket.items():
-            m = median([v for v in vals if v is not None])
-            if m is not None:
-                node_med[nid] = float(m)
-
-        if len(node_med) < 2:
-            continue
-
-        cons = median(list(node_med.values()))
+        cons = median(list(fresh.values()))
         if cons is None:
             continue
 
-        t_bin = (float(idx) + 0.5) * float(bin_s)  # aligns with idx definition
+        eps = {}
+        for n, v in fresh.items():
+            e = float(v - cons)
+            eps[n] = e
+            mesh_ffill[n].append({"t_wall": float(t_center), "mesh_err_ms": float(e)})
 
-        eps: Dict[str, float] = {}
-        for nid, m in node_med.items():
-            e = float(m - float(cons))
-            eps[nid] = e
-            mesh_series.setdefault(nid, []).append({"t_wall": float(t_bin), "mesh_err_ms": float(e)})
+        eps_times_ffill.append((t_center, eps))
 
-        # step per node
-        for nid, e in eps.items():
-            prev_list = step_series.setdefault(nid, [])
-            if prev_list:
-                step = float(e - float(prev_list[-1]["_prev_e"]))  # private helper
-            else:
-                step = 0.0
-            prev_list.append({"t_wall": float(t_bin), "step_ms": float(step), "_prev_e": float(e)})
+    # drop empty series
+    mesh_series_ffill = dict((n, pts) for (n, pts) in mesh_ffill.items() if pts)
+    step_series_ffill = _make_steps(mesh_series_ffill)
+    pairs_ffill = _pairs_from_eps_timeseries(eps_times_ffill)
 
-        # pairwise
-        ns = sorted(eps.keys())
-        for i in range(len(ns)):
-            for j in range(i + 1, len(ns)):
-                a, b = ns[i], ns[j]
-                pid = "%s-%s" % (a, b)
-                pairs.setdefault(pid, []).append({"t_wall": float(t_bin), "delta_ms": float(eps[a] - eps[b]), "bin": float(idx)})
+    # =========================================================================
+    # (B) BINNED + SLIDING WINDOW (nearest sample within ±win_s)
+    # =========================================================================
+    # Build fast pointers for nearest search via forward scan.
+    ptr2 = dict((n, 0) for n in nodes)
+    mesh_window = dict((n, []) for n in nodes)
+    eps_times_window = []
 
-    # cleanup hidden helper _prev_e
-    for nid in step_series.keys():
-        for p in step_series[nid]:
-            if "_prev_e" in p:
-                del p["_prev_e"]
+    for idx in range(idx0, idx1 + 1):
+        t_center = (float(idx) + 0.5) * float(bin_s)
+        eps_candidates = {}
 
-    # stability map (sigma approx from IQR)
-    stability: Dict[str, Dict[str, float]] = {}
-    for pid, pts in pairs.items():
-        deltas = [float(p["delta_ms"]) for p in pts if p.get("delta_ms") is not None]
-        if len(deltas) < 10:
-            continue
-        i = iqr(deltas)
-        sigma = 0.7413 * float(i)
-        stability[pid] = {"sigma_ms": float(sigma), "iqr_ms": float(i), "n": float(len(deltas))}
+        for n in nodes:
+            pts = by_node[n]
+            p = ptr2[n]
 
-    # heatmap (binned down to HEATMAP_MAX_BINS)
-    heatmap_data: List[Dict[str, Any]] = []
-    n_bins = 0
-    if bins and pairs:
-        idx_min = min(bins.keys())
-        idx_max = max(bins.keys())
-        total_bins = max(1, idx_max - idx_min + 1)
-        display_bins = min(int(HEATMAP_MAX_BINS), int(total_bins))
+            # move pointer while next sample time < t_center (so p is near center)
+            while p + 1 < len(pts) and pts[p + 1][0] < t_center:
+                p += 1
+            ptr2[n] = p
 
-        if display_bins == total_bins:
-            for pid, pts in pairs.items():
-                for p in pts:
-                    heatmap_data.append({"pair": pid, "t_bin": float(p["t_wall"]), "value": abs(float(p["delta_ms"]))})
-            n_bins = total_bins
-        else:
-            accum: Dict[Tuple[str, int], List[float]] = {}
-            for pid, pts in pairs.items():
-                for p in pts:
-                    bi = int(p.get("bin", idx_min))
-                    if bi < idx_min:
-                        bi = idx_min
-                    if bi > idx_max:
-                        bi = idx_max
-                    rel = float(bi - idx_min) / float(max(1, total_bins))
-                    d_idx = int(rel * float(display_bins))
-                    if d_idx >= display_bins:
-                        d_idx = display_bins - 1
-                    accum.setdefault((pid, d_idx), []).append(abs(float(p["delta_ms"])))
+            # check p and p+1 as nearest candidates
+            best = None
+            best_dt = None
+            for q in (p, p + 1):
+                if q < 0 or q >= len(pts):
+                    continue
+                dt = abs(float(pts[q][0]) - float(t_center))
+                if best_dt is None or dt < best_dt:
+                    best_dt = dt
+                    best = pts[q][1]
 
-            for (pid, d_idx), vals in accum.items():
-                idx_center = float(idx_min) + (float(d_idx) + 0.5) * (float(total_bins) / float(display_bins))
-                t_center = (idx_center + 0.5) * float(bin_s)
-                heatmap_data.append({"pair": pid, "t_bin": float(t_center), "value": float(sum(vals) / float(len(vals)))})
-            n_bins = display_bins
+            if best is None or best_dt is None:
+                continue
+            if float(best_dt) <= float(win_s):
+                eps_candidates[n] = float(best)
 
-    # legacy series passthrough if present
-    legacy_offset: Dict[str, List[Dict[str, float]]] = {}
-    legacy_err: Dict[str, List[Dict[str, float]]] = {}
-    for r in rows:
-        nid = str(r["node_id"])
-        t = _f(r["created_at"])
-        if not nid or t is None:
+        if len(eps_candidates) < 2:
             continue
 
-        if "offset" in r.keys():
-            off = _f(r["offset"])
-            if off is not None:
-                legacy_offset.setdefault(nid, []).append({"t_wall": float(t), "offset_ms": float(off)})
+        cons = median(list(eps_candidates.values()))
+        if cons is None:
+            continue
 
-        if "err_mesh_vs_wall" in r.keys():
-            emv = _f(r["err_mesh_vs_wall"])
-            if emv is not None:
-                legacy_err.setdefault(nid, []).append({"t_wall": float(t), "err_ms": float(emv)})
+        eps = {}
+        for n, v in eps_candidates.items():
+            e = float(v - cons)
+            eps[n] = e
+            mesh_window[n].append({"t_wall": float(t_center), "mesh_err_ms": float(e)})
 
-    for nid in legacy_offset.keys():
-        legacy_offset[nid].sort(key=lambda p: p["t_wall"])
-    for nid in legacy_err.keys():
-        legacy_err[nid].sort(key=lambda p: p["t_wall"])
+        eps_times_window.append((t_center, eps))
+
+    mesh_series_window = dict((n, pts) for (n, pts) in mesh_window.items() if pts)
+    step_series_window = _make_steps(mesh_series_window)
+    pairs_window = _pairs_from_eps_timeseries(eps_times_window)
+
+    # =========================================================================
+    # (C) EVENT-BASED (controller-like): every new sample updates consensus
+    # =========================================================================
+    # Flatten all events: (t, node, mo)
+    events = []
+    for n in nodes:
+        for (t, mo) in by_node[n]:
+            events.append((float(t), n, float(mo)))
+    events.sort(key=lambda x: x[0])
+
+    last_val_e = {}
+    last_time_e = {}
+    mesh_event = dict((n, []) for n in nodes)
+    eps_times_event = []
+
+    for (t, n, mo) in events:
+        last_val_e[n] = float(mo)
+        last_time_e[n] = float(t)
+
+        fresh = {}
+        for nn in nodes:
+            lt = last_time_e.get(nn)
+            lv = last_val_e.get(nn)
+            if lt is None or lv is None:
+                continue
+            if (float(t) - float(lt)) <= float(ttl_s):
+                fresh[nn] = float(lv)
+
+        if len(fresh) < 2:
+            continue
+
+        cons = median(list(fresh.values()))
+        if cons is None:
+            continue
+
+        # We only append a point for the node that produced the event (controller-style).
+        e = float(last_val_e[n] - cons)
+        mesh_event[n].append({"t_wall": float(t), "mesh_err_ms": float(e)})
+
+        # For pairs you need full eps map at this time:
+        eps_map = dict((nn, float(v - cons)) for (nn, v) in fresh.items())
+        eps_times_event.append((t, eps_map))
+
+    mesh_series_event = dict((n, pts) for (n, pts) in mesh_event.items() if pts)
+    step_series_event = _make_steps(mesh_series_event)
+    pairs_event = _pairs_from_eps_timeseries(eps_times_event)
 
     return {
-        "mesh_series": mesh_series,
-        "step_series": step_series,
-        "pairs": pairs,
-        "stability": stability,
-        "heatmap": {"data": heatmap_data, "n_bins": int(n_bins)},
-        "legacy": {"offset": legacy_offset, "err_mesh_vs_wall": legacy_err},
         "meta": {
             "window_s": float(window_s),
             "bin_s": float(bin_s),
-            "x_axis": "created_at",
+            "ttl_s": float(ttl_s),
+            "win_s": float(win_s),
             "t_mesh_to_seconds": float(scale),
-            "note": "ε uses mesh_offset_ms=(t_mesh-created_at)*1000 centered by median per bin (absolute bins).",
+            "nodes": nodes,
         },
+        "mesh_series_ffill": mesh_series_ffill,
+        "step_series_ffill": step_series_ffill,
+        "pairs_ffill": pairs_ffill,
+
+        "mesh_series_window": mesh_series_window,
+        "step_series_window": step_series_window,
+        "pairs_window": pairs_window,
+
+        "mesh_series_event": mesh_series_event,
+        "step_series_event": step_series_event,
+        "pairs_event": pairs_event,
     }
+
 
 # -----------------------------
 # Link diagnostics (stable, matches JS)
@@ -894,10 +1019,18 @@ TEMPLATE = r"""
           <div class="sub" id="meshMeta">lade…</div>
         </div>
       </div>
-      <div class="row">
-        <span class="small muted">Controller node:</span>
-        <select id="ctrlNode"></select>
-      </div>
+        <div class="row">
+          <span class="small muted">Mesh mode:</span>
+          <select id="meshMode">
+            <option value="event" selected>event (controller-like)</option>
+            <option value="ffill">ffill (bin + TTL)</option>
+            <option value="window">window (bin + nearest)</option>
+          </select>
+        
+          <span class="small muted" style="margin-left:0.5rem;">Controller node:</span>
+          <select id="ctrlNode"></select>
+        </div>
+
     </div>
 
     <div class="kpi-grid" id="nodeKpis">
@@ -949,6 +1082,16 @@ TEMPLATE = r"""
           ε basiert auf <span class="mono">mesh_offset_ms=(t_mesh - created_at)*1000</span> und ist pro Bin um den Median zentriert.
           Das ist der Plot, der "wirklich stimmt".
         </div>
+        <div class="row small muted" style="margin-bottom:0.4rem;">
+          <span>Mesh-Plot-Modus:</span>
+          <select id="meshMode">
+            <option value="strict">Strict (≥2 Nodes / Bin)</option>
+            <option value="carry">Carry-Forward (stabil)</option>
+            <option value="raw">Raw (alle Punkte)</option>
+          </select>
+        </div>
+
+        
         <canvas id="meshChart" height="170"></canvas>
 
         <div class="plots">
@@ -1151,28 +1294,99 @@ TEMPLATE = r"""
       }
     });
   }
+  
+  function carryForwardMap(seriesMap, field){
+    // seriesMap: { id: [{t:..., <field>:...}, ...] }
+    // füllt fehlende Werte pro Serie mit letztem bekannten Wert (Last-Value Hold)
+    const out = {};
+    Object.keys(seriesMap || {}).forEach(id=>{
+      const pts = seriesMap[id] || [];
+      let last = null;
+      const filled = [];
+      for(const p of pts){
+        if(!p) continue;
+        const v = p[field];
+        if(v !== null && v !== undefined && Number.isFinite(v)){
+          last = v;
+          filled.push(p);
+        } else if(last !== null){
+          const q = Object.assign({}, p);
+          q[field] = last;
+          filled.push(q);
+        }
+      }
+      out[id] = filled;
+    });
+    return out;
+  }
+
 
   function updateLine(chart, seriesMap, field, labelPrefix=''){
-    const ids = Object.keys(seriesMap||{}).sort();
+    const modeEl = document.getElementById('meshMode');
+    const mode = modeEl ? modeEl.value : 'strict';
+
+    let dataMap = seriesMap || {};
+
+    // carry-forward nur für Mesh/Step/Link Serien sinnvoll
+    if(mode === 'carry'){
+      dataMap = carryForwardMap(dataMap, field);
+    }
+
+    const ids = Object.keys(dataMap || {}).sort();
     chart.data.datasets = [];
+
     ids.forEach((id, idx)=>{
       const c = colors[idx % colors.length];
-      const pts = (seriesMap[id]||[])
+
+      const pts = (dataMap[id] || [])
         .filter(p => p && p[field] !== null && p[field] !== undefined && Number.isFinite(p[field]))
-        .map(p => ({x:new Date(p.t_wall*1000), y:p[field]}));
-      chart.data.datasets.push({label:`${labelPrefix}${id}`, data:pts, borderColor:c, borderWidth:1.6});
-    });
+        // WICHTIG: mesh_diag liefert t in SEKUNDEN (nicht t_wall!)
+        .map(p => ({ x: new Date(p.t * 1000), y: p[field] }));
+
+      chart.data.datasets.push({
+        label: `${labelPrefix}${id}`,
+        data: pts,
+        borderColor: c,
+        borderWidth: 1.6
+      });
+   });
+
     chart.update();
   }
 
+
   function updatePairs(chart, pairs){
-    const ids = Object.keys(pairs||{}).sort();
+    const modeEl = document.getElementById('meshMode');
+    const mode = modeEl ? modeEl.value : 'strict';
+
+    const ids = Object.keys(pairs || {}).sort();
     chart.data.datasets = [];
+
     ids.forEach((id, idx)=>{
       const c = colors[idx % colors.length];
-      const pts = (pairs[id]||[]).map(p => ({x:new Date(p.t_wall*1000), y:p.delta_ms}));
-      chart.data.datasets.push({label:id, data:pts, borderColor:c, borderWidth:1.6});
+
+      let pts = (pairs[id] || [])
+        .filter(p => p && p.y !== null && p.y !== undefined && Number.isFinite(p.y))
+        .map(p => ({ x: new Date(p.t * 1000), y: p.y }));
+
+      // carry-forward für pairs (optional, macht Sinn für "stabil")
+      if(mode === 'carry' && pts.length){
+        let last = null;
+          pts = pts.map(p=>{
+          if(Number.isFinite(p.y)){ last = p.y; return p; }
+          if(last !== null) return { x: p.x, y: last };
+         return null;
+        }).filter(Boolean);
+      }
+
+      chart.data.datasets.push({
+        label: id,
+        data: pts,
+        borderColor: c,
+        borderWidth: 1.6
+      });
     });
+
     chart.update();
   }
 
@@ -1404,6 +1618,15 @@ TEMPLATE = r"""
     dtLineChart       = mkLine(document.getElementById('dtChart').getContext('2d'), 's');
     slewLineChart     = mkLine(document.getElementById('slewChart').getContext('2d'), '0/1');
   }
+  
+  function pickMeshMode(mesh){
+  const mode = (document.getElementById('meshMode')?.value) || 'event';
+  const ms = mesh[`mesh_series_${mode}`] || {};
+  const ss = mesh[`step_series_${mode}`] || {};
+  const ps = mesh[`pairs_${mode}`] || {};
+  return { mode, ms, ss, ps };
+}
+
 
   async function refresh(){
     try{
@@ -1445,10 +1668,15 @@ TEMPLATE = r"""
       meshCanvas.height = meshCanvas.clientHeight;
       drawMesh(meshCanvas, topo, nodeStates, ov.link_sigma_med || {});
 
-      // plots
-      updateLine(meshChart, mesh.mesh_series || {}, "mesh_err_ms", "Node ");
-      updatePairs(pairChart, mesh.pairs || {});
-      updateLine(stepChart, mesh.step_series || {}, "step_ms", "Node ");
+      // plots (mesh mode selectable)
+      const picked = pickMeshMode(mesh);
+      updateLine(meshChart, mesh.mesh_series || {}, "y", "Node ");
+      updatePairs(pairChart, picked.ps);
+      updateLine(stepChart, mesh.step_series || {}, "y", "Node ");
+
+    
+      // optional: falls du stability/heatmap noch nicht auf die neuen Modi umgebaut hast,
+      // lass sie erstmal leer, statt "nix zeichnet" Bugs zu erzeugen.
       updateBarFromMap(stabilityBar, mesh.stability || {}, "sigma_ms");
       updateHeatmap(heatmapChart, mesh.heatmap || {data:[], n_bins:0});
 
@@ -1491,9 +1719,10 @@ TEMPLATE = r"""
     initCharts();
     document.getElementById('debugToggle').addEventListener('change', applyDebugVisibility);
     document.getElementById('ctrlNode').addEventListener('change', ()=>refresh());
+    document.getElementById('meshMode').addEventListener('change', ()=>refresh());
     applyDebugVisibility();
     refresh();
-    setInterval(refresh, 1000);
+    setInterval(refresh, 1500);
   });
 </script>
 

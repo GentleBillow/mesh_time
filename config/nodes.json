@@ -37,7 +37,7 @@
     },
 
     "ui_window_s": 600,
-    "ui_bin_s": 0.5,
+    "ui_bin_s": 3,
     "ui_max_points": 6000
   },
 

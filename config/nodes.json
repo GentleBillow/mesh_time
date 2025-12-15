@@ -25,13 +25,13 @@
       "use_bias_gauge": true,
       "r_bias_gauge": 1e-2,
 
-      "q_offset": 7.5e-9,
+      "q_offset": 10e-9,
       "q_drift": 3e-15,
-      "q_bias": 3e-13,
+      "q_bias": 3e-10,
       "r_base": 2e-7,
 
       "adaptive_r": {
-        "R_min": 1e-8,
+        "R_min": 1e-7,
         "c_rtt": 1
       }
     },

@@ -420,6 +420,122 @@ class RelayIngestLinkResource(resource.Resource):
 
         return aiocoap.Message(code=aiocoap.CHANGED)
 
+class RelayIngestMeshClockResource(resource.Resource):
+    """
+    POST /relay/ingest/mesh_clock
+    """
+
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+
+    async def render_post(self, request):
+        data = _safe_json(request.payload)
+        st = getattr(self.node, "storage", None)
+        if st is not None:
+            try:
+                node_id = str(data.get("node_id", "unknown"))
+                t_wall_s = float(data.get("t_wall_s", time.time()))
+                t_mono_s = float(data.get("t_mono_s", 0.0))
+                t_mesh_s = float(data.get("t_mesh_s", 0.0))
+                offset_s = float(data.get("offset_s", 0.0))
+                err = data.get("err_mesh_vs_wall_s", None)
+                if err is None:
+                    err = t_mesh_s - t_wall_s
+                err = float(err)
+
+                st.insert_mesh_clock(
+                    node_id=node_id,
+                    t_wall_s=t_wall_s,
+                    t_mono_s=t_mono_s,
+                    t_mesh_s=t_mesh_s,
+                    offset_s=offset_s,
+                    err_mesh_vs_wall_s=err,
+                )
+            except Exception as e:
+                print(f"[{self.node.id}] relay/ingest/mesh_clock: DB insert failed: {e}")
+        return aiocoap.Message(code=aiocoap.CHANGED)
+
+class RelayIngestDiagControllerResource(resource.Resource):
+    """
+    POST /relay/ingest/diag_controller
+    """
+
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+
+    async def render_post(self, request):
+        data = _safe_json(request.payload)
+        st = getattr(self.node, "storage", None)
+        if st is not None:
+            try:
+                node_id = str(data.get("node_id", "unknown"))
+                dt_s = data.get("dt_s", None)
+                delta_desired_ms = data.get("delta_desired_ms", None)
+                delta_applied_ms = data.get("delta_applied_ms", None)
+                slew_clipped = data.get("slew_clipped", None)
+                max_slew_ms_s = data.get("max_slew_ms_s", None)
+                eff_eta = data.get("eff_eta", None)
+
+                dt_s = float(dt_s) if dt_s is not None else None
+                delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
+                delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
+                max_slew_ms_s = float(max_slew_ms_s) if max_slew_ms_s is not None else None
+                eff_eta = float(eff_eta) if eff_eta is not None else None
+                slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
+
+                st.insert_diag_controller(
+                    node_id=node_id,
+                    dt_s=dt_s,
+                    delta_desired_ms=delta_desired_ms,
+                    delta_applied_ms=delta_applied_ms,
+                    slew_clipped=slew_clipped_b,
+                    max_slew_ms_s=max_slew_ms_s,
+                    eff_eta=eff_eta,
+                )
+            except Exception as e:
+                print(f"[{self.node.id}] relay/ingest/diag_controller: DB insert failed: {e}")
+        return aiocoap.Message(code=aiocoap.CHANGED)
+
+class RelayIngestDiagKalmanResource(resource.Resource):
+    """
+    POST /relay/ingest/diag_kalman
+    """
+
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+
+    async def render_post(self, request):
+        data = _safe_json(request.payload)
+        st = getattr(self.node, "storage", None)
+        if st is not None:
+            try:
+                node_id = str(data.get("node_id", "unknown"))
+                n_meas = int(data.get("n_meas", 0))
+
+                def f(key):
+                    v = data.get(key, None)
+                    return float(v) if v is not None else None
+
+                st.insert_diag_kalman(
+                    node_id=node_id,
+                    n_meas=n_meas,
+                    innov_med_ms=f("innov_med_ms"),
+                    innov_p95_ms=f("innov_p95_ms"),
+                    nis_med=f("nis_med"),
+                    nis_p95=f("nis_p95"),
+                    x_offset_ms=f("x_offset_ms"),
+                    x_drift_ppm=f("x_drift_ppm"),
+                    p_offset_ms2=f("p_offset_ms2"),
+                    p_drift_ppm2=f("p_drift_ppm2"),
+                    r_eff_ms2=f("r_eff_ms2"),
+                )
+            except Exception as e:
+                print(f"[{self.node.id}] relay/ingest/diag_kalman: DB insert failed: {e}")
+        return aiocoap.Message(code=aiocoap.CHANGED)
+
 
 def build_site(node) -> resource.Site:
     """
@@ -438,5 +554,10 @@ def build_site(node) -> resource.Site:
     root.add_resource(("relay", "ingest", "sensor"), RelayIngestSensorResource(node))
     root.add_resource(("relay", "ingest", "ntp"), RelayIngestNtpResource(node))
     root.add_resource(("relay", "ingest", "link"), RelayIngestLinkResource(node))  # FIX: NEU!
+
+    root.add_resource(("relay", "ingest", "mesh_clock"), RelayIngestMeshClockResource(node))
+    root.add_resource(("relay", "ingest", "diag_controller"), RelayIngestDiagControllerResource(node))
+    root.add_resource(("relay", "ingest", "diag_kalman"), RelayIngestDiagKalmanResource(node))
+
 
     return root

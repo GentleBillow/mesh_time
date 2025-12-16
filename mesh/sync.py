@@ -165,13 +165,13 @@ class SyncModule:
     """
 
     def __init__(
-            self,
-            node_id: str,
-            neighbors: List[str],
-            neighbor_ips: Dict[str, str],
-            sync_cfg: Optional[Dict[str, Any]] = None,
-            storage=None,
-            telemetry_sink_ip: Optional[str] = None,
+        self,
+        node_id: str,
+        neighbors: List[str],
+        neighbor_ips: Dict[str, str],
+        sync_cfg: Optional[Dict[str, Any]] = None,
+        storage=None,
+        telemetry_sink_ip: Optional[str] = None,
     ) -> None:
         sync_cfg = sync_cfg or {}
 
@@ -180,6 +180,13 @@ class SyncModule:
         self.neighbor_ips = dict(neighbor_ips)
         self._storage = storage
         self._telemetry_sink_ip = telemetry_sink_ip
+
+        # Telemetry runtime state (set in start())
+        self._client_ctx: Optional[aiocoap.Context] = None
+
+        # Cache last kalman diag (safe per instance)
+        self._last_kalman_diag: Dict[str, Any] = {}
+
 
         # role
         self._is_root = bool(sync_cfg.get("is_root", False))
@@ -379,7 +386,12 @@ class SyncModule:
     def _apply_global_control(self, meas: List[Measurement]) -> None:
         dt = self._compute_dt()
 
-        if self._controller.__class__.__name__ == "KalmanController":
+        # ------------------------------------------------------------
+        # 1) Controller compute (desired delta)
+        # ------------------------------------------------------------
+        is_kalman = (self._controller.__class__.__name__ == "KalmanController")
+
+        if is_kalman:
             delta_desired = self._controller.compute_delta(
                 self._offset, meas, self._weight_for_peer, dt, noise_fn=self._noise_for_peer
             )
@@ -388,88 +400,171 @@ class SyncModule:
                 self._offset, meas, self._weight_for_peer, dt
             )
 
-        if self._controller.__class__.__name__ == "KalmanController":
-            diag = {}
-            try:
-                diag = self._controller.last_diag() if hasattr(self._controller, "last_diag") else {}
-            except Exception:
-                diag = {}
-
-            if self._storage is not None and diag:
-                try:
-                    self._storage.insert_diag_kalman(
-                        node_id=self.node_id,
-                        n_meas=int(diag.get("n_meas", 0)),
-                        innov_med_ms=diag.get("innov_med_ms"),
-                        innov_p95_ms=diag.get("innov_p95_ms"),
-                        nis_med=diag.get("nis_med"),
-                        nis_p95=diag.get("nis_p95"),
-                        x_offset_ms=diag.get("x_offset_ms"),
-                        x_drift_ppm=diag.get("x_drift_ppm"),
-                        p_offset_ms2=diag.get("p_offset_ms2"),
-                        p_drift_ppm2=diag.get("p_drift_ppm2"),
-                        r_eff_ms2=diag.get("r_eff_ms2"),
-                    )
-                except Exception as e:
-                    log.debug("[%s] diag_kalman insert failed: %s", self.node_id, e)
-
+        # Slew-limit
         delta_applied = self._global_slew_clip(delta_desired, dt)
 
-        # --- controller debug (wanted vs applied) ---
+        # Debug scalars
         delta_desired_ms = float(delta_desired * 1000.0)
         delta_applied_ms = float(delta_applied * 1000.0)
         slew_clipped = (abs(delta_applied - delta_desired) > 1e-12)
 
+        # Eff eta (how much of desired we could apply)
+        den = abs(delta_desired_ms) + 1e-9
+        eta = abs(delta_applied_ms) / den
+
+        # Store last controller debug (used by link logging / ntp monitor)
         self._last_control_debug = {
             "dt_s": float(dt),
-            "delta_desired_ms": delta_desired_ms,
-            "delta_applied_ms": delta_applied_ms,
+            "delta_desired_ms": float(delta_desired_ms),
+            "delta_applied_ms": float(delta_applied_ms),
             "slew_clipped": bool(slew_clipped),
             "t_wall": float(time.time()),
         }
 
-        if self._storage is not None:
-            try:
-                eta = None
-                if delta_desired_ms is not None and delta_applied_ms is not None:
-                    den = abs(delta_desired_ms) + 1e-9
-                    eta = abs(delta_applied_ms) / den
+        # ------------------------------------------------------------
+        # 2) Apply state update
+        # ------------------------------------------------------------
+        self._offset += delta_applied
 
+        # CRITICAL: align controller internal offset state to slew-limited reality
+        if hasattr(self._controller, "commit_applied_offset"):
+            try:
+                self._controller.commit_applied_offset(self._offset)
+            except Exception:
+                pass
+
+        # One clean timestamp bundle for BOTH DB + telemetry
+        t_wall = time.time()
+        t_mono = time.monotonic()
+        t_mesh = self.mesh_time()
+        err_mesh_vs_wall_s = float(t_mesh - t_wall)
+
+        # ------------------------------------------------------------
+        # 3) Optional Kalman diag snapshot (once, reused)
+        # ------------------------------------------------------------
+        kalman_diag = {}
+        if is_kalman:
+            try:
+                kalman_diag = self._controller.last_diag() if hasattr(self._controller, "last_diag") else {}
+            except Exception:
+                kalman_diag = {}
+
+        # ------------------------------------------------------------
+        # 4) Local DB logging (C)
+        # ------------------------------------------------------------
+        if self._storage is not None:
+            # diag_kalman
+            if is_kalman and kalman_diag:
+                try:
+                    self._storage.insert_diag_kalman(
+                        node_id=self.node_id,
+                        n_meas=int(kalman_diag.get("n_meas", 0) or 0),
+                        innov_med_ms=kalman_diag.get("innov_med_ms"),
+                        innov_p95_ms=kalman_diag.get("innov_p95_ms"),
+                        nis_med=kalman_diag.get("nis_med"),
+                        nis_p95=kalman_diag.get("nis_p95"),
+                        x_offset_ms=kalman_diag.get("x_offset_ms"),
+                        x_drift_ppm=kalman_diag.get("x_drift_ppm"),
+                        p_offset_ms2=kalman_diag.get("p_offset_ms2"),
+                        p_drift_ppm2=kalman_diag.get("p_drift_ppm2"),
+                        r_eff_ms2=kalman_diag.get("r_eff_ms2"),
+                    )
+                except Exception as e:
+                    log.debug("[%s] diag_kalman insert failed: %s", self.node_id, e)
+
+            # diag_controller
+            try:
                 self._storage.insert_diag_controller(
                     node_id=self.node_id,
                     dt_s=float(dt),
-                    delta_desired_ms=delta_desired_ms,
-                    delta_applied_ms=delta_applied_ms,
+                    delta_desired_ms=float(delta_desired_ms),
+                    delta_applied_ms=float(delta_applied_ms),
                     slew_clipped=bool(slew_clipped),
                     max_slew_ms_s=float(self._max_slew_per_second_ms),
-                    eff_eta=eta
+                    eff_eta=float(eta) if eta is not None else None,
                 )
             except Exception as e:
                 log.debug("[%s] diag_controller insert failed: %s", self.node_id, e)
 
-        self._offset += delta_applied
-
-        #CRITICAL: tell controller what actually happened
-        if hasattr(self._controller, "commit_applied_offset"):
-            self._controller.commit_applied_offset(self._offset)
-
-        # --- mesh_clock sample (one per control tick) ---
-        if self._storage is not None:
+            # mesh_clock (per control tick)
             try:
-                t_wall = time.time()
-                t_mono = time.monotonic()
-                t_mesh = self.mesh_time()
                 self._storage.insert_mesh_clock(
                     node_id=self.node_id,
-                    t_wall_s=t_wall,
-                    t_mono_s=t_mono,
-                    t_mesh_s=t_mesh,
-                    offset_s=self._offset,
-                    err_mesh_vs_wall_s=(t_mesh - t_wall),
+                    t_wall_s=float(t_wall),
+                    t_mono_s=float(t_mono),
+                    t_mesh_s=float(t_mesh),
+                    offset_s=float(self._offset),
+                    err_mesh_vs_wall_s=err_mesh_vs_wall_s,
                 )
             except Exception as e:
                 log.debug("[%s] mesh_clock insert failed: %s", self.node_id, e)
 
+        # ------------------------------------------------------------
+        # 5) Telemetry to sink (A/B -> C) when we have NO local storage
+        # ------------------------------------------------------------
+        if (
+                self._storage is None
+                and self._telemetry_sink_ip is not None
+                and getattr(self, "_client_ctx", None) is not None
+        ):
+            async def _send_diag() -> None:
+                try:
+                    ctx = self._client_ctx
+
+                    # mesh_clock
+                    mc = {
+                        "node_id": self.node_id,
+                        "t_wall_s": float(t_wall),
+                        "t_mono_s": float(t_mono),
+                        "t_mesh_s": float(t_mesh),
+                        "offset_s": float(self._offset),
+                        "err_mesh_vs_wall_s": float(err_mesh_vs_wall_s),
+                    }
+                    req = aiocoap.Message(
+                        code=aiocoap.POST,
+                        uri=f"coap://{self._telemetry_sink_ip}/relay/ingest/mesh_clock",
+                        payload=json.dumps(mc).encode("utf-8"),
+                    )
+                    await asyncio.wait_for(ctx.request(req).response, timeout=self._coap_timeout)
+
+                    # diag_controller
+                    dc = {
+                        "node_id": self.node_id,
+                        "dt_s": float(dt),
+                        "delta_desired_ms": float(delta_desired_ms),
+                        "delta_applied_ms": float(delta_applied_ms),
+                        "slew_clipped": bool(slew_clipped),
+                        "max_slew_ms_s": float(self._max_slew_per_second_ms),
+                        "eff_eta": float(eta) if eta is not None else None,
+                    }
+                    req = aiocoap.Message(
+                        code=aiocoap.POST,
+                        uri=f"coap://{self._telemetry_sink_ip}/relay/ingest/diag_controller",
+                        payload=json.dumps(dc).encode("utf-8"),
+                    )
+                    await asyncio.wait_for(ctx.request(req).response, timeout=self._coap_timeout)
+
+                    # diag_kalman (optional)
+                    if is_kalman and kalman_diag:
+                        dk = dict(kalman_diag)
+                        dk["node_id"] = self.node_id
+                        req = aiocoap.Message(
+                            code=aiocoap.POST,
+                            uri=f"coap://{self._telemetry_sink_ip}/relay/ingest/diag_kalman",
+                            payload=json.dumps(dk).encode("utf-8"),
+                        )
+                        await asyncio.wait_for(ctx.request(req).response, timeout=self._coap_timeout)
+
+                except asyncio.TimeoutError:
+                    log.debug("[%s] telemetry diag timeout", self.node_id)
+                except Exception as e:
+                    log.debug("[%s] telemetry diag failed: %s", self.node_id, type(e).__name__)
+
+            spawn_task(_send_diag(), f"{self.node_id}:telemetry:diag")
+
+        # ------------------------------------------------------------
+        # 6) Optional drift damping
+        # ------------------------------------------------------------
         if self._drift_damping > 0.0:
             self._offset *= max(0.0, 1.0 - self._drift_damping * dt)
 
@@ -748,18 +843,28 @@ class SyncModule:
 
     async def start(self, client_ctx: aiocoap.Context) -> None:
         """
-        Startet alle Peer-Worker und Control-Loop.
-        ROBUST: Separate Tasks, kein Blocking.
-        """
-        if IS_WINDOWS or self._is_root:
-            log.info("[%s] Skipping beacon workers (Windows or Root)", self.node_id)
-            return
+        Startet Worker + (optional) Control Loop.
 
-        # ---- FIX (Py3.7): create asyncio primitives in the running loop ----
+        Root/Windows:
+          - keine Beacon Worker
+          - (optional) auch keine Control Loop
+        """
+        self._client_ctx = client_ctx
+
+        # Create asyncio primitives in running loop (Py3.7-safe)
         self._loop = asyncio.get_running_loop()
         if self._measurement_queue is None:
-            self._measurement_queue = asyncio.Queue()
-        # -------------------------------------------------------------------
+            self._measurement_queue = asyncio.Queue()  # or Queue(maxsize=200)
+
+        # On Windows we typically don't run timing workers
+        if IS_WINDOWS:
+            log.info("[%s] Windows: skipping workers", self.node_id)
+            return
+
+        # Root: don't send beacons (but keep module alive)
+        if self._is_root:
+            log.info("[%s] Root: skipping beacon/control workers", self.node_id)
+            return
 
         # Start control loop
         self._worker_tasks.append(
@@ -776,7 +881,7 @@ class SyncModule:
             self._worker_tasks.append(
                 spawn_task(
                     self._peer_worker(peer_id, peer_ip, client_ctx),
-                    f"{self.node_id}:peer:{peer_id}"
+                    f"{self.node_id}:peer:{peer_id}",
                 )
             )
 
@@ -793,3 +898,5 @@ class SyncModule:
         self._worker_tasks.clear()
         self._measurement_queue = None
         self._loop = None
+        self._client_ctx = None
+        self._last_kalman_diag = {}

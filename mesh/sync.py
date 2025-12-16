@@ -477,13 +477,16 @@ class SyncModule:
     # ROBUST: Link Metrics Logging (mit Timeout)
     # -----------------------------------------------------------------
 
-    async def _log_link_metrics(
-            self,
-            peer_id: str,
-            rtt_s: float,
-            theta_s: float,
-            client_ctx: aiocoap.Context
-    ) -> None:
+    async def _log_link_metrics(self,
+                                peer_id,
+                                rtt_s,
+                                theta_s,
+                                client_ctx,
+                                t1_s=None,
+                                t2_s=None,
+                                t3_s=None,
+                                t4_s=None) -> None:
+
         """Loggt Link-Metriken mit TIMEOUT."""
         st = self._peer.get(peer_id)
         if st is None or st.good_samples < self._min_samples_before_log:
@@ -562,6 +565,15 @@ class SyncModule:
                     "dt_s": dbg.get("dt_s"),
                     "slew_clipped": dbg.get("slew_clipped"),
                 })
+
+                payload.update({
+                    "t1_s": t1_s,
+                    "t2_s": t2_s,
+                    "t3_s": t3_s,
+                    "t4_s": t4_s,
+                    "weight": self._weight_for_peer(peer_id),
+                })
+
 
 
                 req = aiocoap.Message(
@@ -663,7 +675,7 @@ class SyncModule:
                         await q.put((peer_id, rtt, theta, peer_offset))
 
                 # Log metrics
-                await self._log_link_metrics(peer_id, rtt, theta, client_ctx)
+                await self._log_link_metrics(peer_id, rtt, theta, client_ctx, t1_s=t1, t2_s=t2, t3_s=t3, t4_s=t4)
 
                 # Reset backoff
                 backoff = self._base_interval

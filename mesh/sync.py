@@ -792,6 +792,65 @@ class SyncModule:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self._max_backoff)
 
+    async def _clock_tick_loop(self) -> None:
+        """
+        Writes mesh_clock periodically regardless of whether control updates happen.
+        This guarantees dashboard-root has fresh t_mesh samples even in sparse phases.
+        """
+        log.info("[%s] Starting clock tick loop", self.node_id)
+
+        while True:
+            try:
+                t_wall = time.time()
+                t_mono = time.monotonic()
+                t_mesh = self.mesh_time()
+                err = float(t_mesh - t_wall)
+
+                # local DB (C)
+                if self._storage is not None:
+                    try:
+                        self._storage.insert_mesh_clock(
+                            node_id=self.node_id,
+                            t_wall_s=float(t_wall),
+                            t_mono_s=float(t_mono),
+                            t_mesh_s=float(t_mesh),
+                            offset_s=float(self._offset),
+                            err_mesh_vs_wall_s=float(err),
+                        )
+                    except Exception as e:
+                        log.debug("[%s] mesh_clock tick insert failed: %s", self.node_id, e)
+
+                # telemetry (A/B -> C) if no local storage
+                elif self._telemetry_sink_ip is not None and self._client_ctx is not None:
+                    try:
+                        mc = {
+                            "node_id": self.node_id,
+                            "t_wall_s": float(t_wall),
+                            "t_mono_s": float(t_mono),
+                            "t_mesh_s": float(t_mesh),
+                            "offset_s": float(self._offset),
+                            "err_mesh_vs_wall_s": float(err),
+                        }
+                        req = aiocoap.Message(
+                            code=aiocoap.POST,
+                            uri=f"coap://{self._telemetry_sink_ip}/relay/ingest/mesh_clock",
+                            payload=json.dumps(mc).encode("utf-8"),
+                        )
+                        await asyncio.wait_for(self._client_ctx.request(req).response, timeout=self._coap_timeout)
+                    except asyncio.TimeoutError:
+                        log.debug("[%s] mesh_clock tick telemetry timeout", self.node_id)
+                    except Exception as e:
+                        log.debug("[%s] mesh_clock tick telemetry failed: %s", self.node_id, type(e).__name__)
+
+                await asyncio.sleep(self._base_interval)
+
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                log.info("[%s] clock tick loop cancelled", self.node_id)
+                return
+            except Exception:
+                log.exception("[%s] clock tick loop crashed", self.node_id)
+                await asyncio.sleep(1.0)
+
     # -----------------------------------------------------------------
     # ROBUST: Control Loop (verarbeitet Measurements)
     # -----------------------------------------------------------------
@@ -842,47 +901,30 @@ class SyncModule:
     # -----------------------------------------------------------------
 
     async def start(self, client_ctx: aiocoap.Context) -> None:
-        """
-        Startet Worker + (optional) Control Loop.
-
-        Root/Windows:
-          - keine Beacon Worker
-          - (optional) auch keine Control Loop
-        """
         self._client_ctx = client_ctx
 
-        # Create asyncio primitives in running loop (Py3.7-safe)
         self._loop = asyncio.get_running_loop()
         if self._measurement_queue is None:
-            self._measurement_queue = asyncio.Queue()  # or Queue(maxsize=200)
+            self._measurement_queue = asyncio.Queue()
 
-        # On Windows we typically don't run timing workers
         if IS_WINDOWS:
-            log.info("[%s] Windows: skipping workers", self.node_id)
+            log.info("[%s] Skipping workers (Windows)", self.node_id)
             return
 
-        # Root: don't send beacons (but keep module alive)
-        if self._is_root:
-            log.info("[%s] Root: skipping beacon/control workers", self.node_id)
-            return
+        # ALWAYS: clock tick (so root=C im Dashboard nie leer ist)
+        self._worker_tasks.append(spawn_task(self._clock_tick_loop(), f"{self.node_id}:clock_tick"))
 
-        # Start control loop
-        self._worker_tasks.append(
-            spawn_task(self._control_loop(), f"{self.node_id}:control")
-        )
+        # Control loop (only meaningful if measurements arrive)
+        self._worker_tasks.append(spawn_task(self._control_loop(), f"{self.node_id}:control"))
 
-        # Start peer workers
+        # Peer workers
         for peer_id in self.neighbors:
             peer_ip = self.neighbor_ips.get(peer_id)
             if not peer_ip:
                 log.warning("[%s] No IP for peer %s", self.node_id, peer_id)
                 continue
-
             self._worker_tasks.append(
-                spawn_task(
-                    self._peer_worker(peer_id, peer_ip, client_ctx),
-                    f"{self.node_id}:peer:{peer_id}",
-                )
+                spawn_task(self._peer_worker(peer_id, peer_ip, client_ctx), f"{self.node_id}:peer:{peer_id}")
             )
 
         log.info("[%s] Started %d workers", self.node_id, len(self._worker_tasks))

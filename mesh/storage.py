@@ -45,8 +45,10 @@ class Storage:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
+        if not hasattr(self, "_cols_cache") or self._cols_cache is None:
+            self._cols_cache = {}
         self._ensure_schema()
-        self._cols_cache = {}
+
 
     # ------------------------------------------------------------------
     # INTERNAL: Connection Helper

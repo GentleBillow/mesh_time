@@ -5,6 +5,9 @@ Usage:
   python3 tools/db_inspect.py cols ntp_reference
   python3 tools/db_inspect.py tail ntp_reference 20
   python3 tools/db_inspect.py latest_deltas 20
+  python3 tools/db_inspect.py counts
+  python3 tools/db_inspect.py timecols
+
 """
 
 import sqlite3
@@ -89,6 +92,36 @@ def latest_deltas(conn, n):
             r[i] = f"{r[i]} ({utc(r[i])})"
     print_table(rows, cols_)
 
+def counts(conn):
+    # Count rows for the tables we care about (v1 + v2)
+    tables = ["ntp_reference", "sensor_readings", "obs_link", "diag_controller", "diag_kalman", "mesh_clock"]
+    out = []
+    for t in tables:
+        try:
+            rows, _ = q(conn, "SELECT COUNT(*) AS n FROM %s;" % t)
+            n = rows[0][0] if rows else 0
+            out.append((t, n))
+        except Exception:
+            out.append((t, "MISSING"))
+    print_table(out, ["table", "rows"])
+
+
+def timecols(conn):
+    # Show which timestamp column exists in each table: created_at vs created_at_s
+    tables = ["ntp_reference", "sensor_readings", "obs_link", "diag_controller", "diag_kalman", "mesh_clock"]
+    out = []
+    for t in tables:
+        try:
+            info, _ = q(conn, "PRAGMA table_info(%s);" % t)
+            colset = {r[1] for r in info}
+            has_created_at = "created_at" in colset
+            has_created_at_s = "created_at_s" in colset
+            out.append((t, int(has_created_at), int(has_created_at_s)))
+        except Exception:
+            out.append((t, "", ""))
+    print_table(out, ["table", "created_at", "created_at_s"])
+
+
 
 def main():
     if not DB_PATH.exists():
@@ -101,6 +134,10 @@ def main():
     try:
         if cmd == "schema":
             schema(conn)
+        elif cmd == "counts":
+            counts(conn)
+        elif cmd == "timecols":
+            timecols(conn)
         elif cmd == "cols":
             table = sys.argv[2] if len(sys.argv) > 2 else "ntp_reference"
             cols(conn, table)

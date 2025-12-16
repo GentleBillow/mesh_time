@@ -11,6 +11,22 @@ WeightFn = Callable[[str], float]
 NoiseFn = Callable[[str, float], float]
 
 
+def _median(xs: List[float]) -> Optional[float]:
+    if not xs:
+        return None
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if (n % 2 == 1) else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+
+
+def _p95(xs: List[float]) -> Optional[float]:
+    if not xs:
+        return None
+    xs = sorted(xs)
+    if len(xs) == 1:
+        return xs[0]
+    k = int(round(0.95 * (len(xs) - 1)))
+    return xs[max(0, min(len(xs) - 1, k))]
 
 class KalmanController:
     """
@@ -48,13 +64,18 @@ class KalmanController:
         self._P = None           # covariance
         self._peer_index = {}    # peer_id -> bias index
 
+        self._last_diag = None
+
     # ------------------------------------------------------------
 
     def on_bootstrap(self) -> None:
-        # Full reset on bootstrap
         self._x = None
         self._P = None
         self._peer_index = {}
+        self._last_diag = None
+
+    def last_diag(self) -> Dict[str, Any]:
+        return dict(self._last_diag or {})
 
     # ------------------------------------------------------------
 
@@ -115,6 +136,11 @@ class KalmanController:
         if not measurements:
             return 0.0
 
+        innov_ms_list: List[float] = []
+        nis_list: List[float] = []
+        r_list_ms2: List[float] = []
+        n_meas = 0
+
         peers = [m[0] for m in measurements]
         self._ensure_state(peers)
 
@@ -152,6 +178,18 @@ class KalmanController:
                 w = float(weight_fn(peer_id))
                 R = float(self.r_base / max(w, 1e-9))
 
+            # --- DIAG BEFORE UPDATE ---
+            # innovation y = z - Hx
+            y = float(z) - float((H @ x)[0, 0])
+            S = float((H @ P @ H.T)[0, 0] + R)
+            if S > 0:
+                nis = (y * y) / S
+                nis_list.append(float(nis))
+
+            innov_ms_list.append(float(y * 1000.0))
+            r_list_ms2.append(float(R * 1e6))  # sec^2 -> ms^2  ( (s*1000)^2 = s^2*1e6 )
+            n_meas += 1
+
             x, P = self._kf_update(x, P, H, z=float(z), R=R)
 
         # ==========================================================
@@ -171,6 +209,21 @@ class KalmanController:
                 H = np.zeros((1, dim))
                 H[0, idx] = 1.0
                 x, P = self._kf_update(x, P, H, z=0.0, R=float(self.r_bias_gauge))
+
+        self._last_diag = {
+            "n_meas": int(n_meas),
+            "innov_med_ms": _median(innov_ms_list),
+            "innov_p95_ms": _p95(innov_ms_list),
+            "nis_med": _median(nis_list),
+            "nis_p95": _p95(nis_list),
+            "r_eff_ms2": _median(r_list_ms2),
+
+            "x_offset_ms": float(x[0, 0] * 1000.0),
+            "x_drift_ppm": float(x[1, 0] * 1e6),
+
+            "p_offset_ms2": float(P[0, 0] * 1e6),  # s^2 -> ms^2
+            "p_drift_ppm2": float(P[1, 1] * 1e12),  # (1e6)^2
+        }
 
         # ---------------- Output ----------------
         old_offset = float(offset_s)

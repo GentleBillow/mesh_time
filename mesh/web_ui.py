@@ -324,30 +324,34 @@ def controller_delta_scale_to_ms(rows: List[sqlite3.Row]) -> float:
 # -----------------------------
 # Mesh diagnostics (stable, matches JS)
 # -----------------------------
-def build_mesh_diag(window_s, bin_s, max_points):
+def build_mesh_diag(window_s: float, bin_s: float, max_points: int) -> Dict[str, Any]:
+    """
+    RAW (event-based) Mesh diag:
+      - jedes neue Sample triggert einen Konsens (Median über "fresh" Nodes via TTL)
+      - pro Event wird nur der Node geplottet, der das Event erzeugt (controller-like)
+      - zusätzlich optional: EWMA-Smoothing (kernel-ish) im Backend
+
+    Output-Schema:
+      mesh_raw[node]    = [{t_wall, mesh_err_ms}, ...]
+      mesh_smooth[node] = [{t_wall, mesh_err_ms}, ...]
+      step_raw[node]    = [{t_wall, step_ms}, ...]
+      step_smooth[node] = [{t_wall, step_ms}, ...]
+      pairs_raw[A-B]    = [{t_wall, delta_ms}, ...]   (nur wenn >=2 fresh)
+    """
     rows = fetch_node_rows(window_s, max_points)
     if not rows:
         return {
             "meta": {"note": "no data"},
-            "mesh_series_ffill": {}, "step_series_ffill": {}, "pairs_ffill": {},
-            "mesh_series_window": {}, "step_series_window": {}, "pairs_window": {},
-            "mesh_series_event": {}, "step_series_event": {}, "pairs_event": {},
+            "mesh_raw": {}, "mesh_smooth": {},
+            "step_raw": {}, "step_smooth": {},
+            "pairs_raw": {},
         }
-
-    if bin_s <= 0:
-        bin_s = BIN_S_DEFAULT
 
     scale = infer_tmesh_to_seconds(rows)
 
-    # ---- config-driven TTL/W defaults (safe fallbacks) ----
-    # TTL: how long we keep last value for ffill/event before marking stale
-    # W:   sliding window half-width for nearest-sample selection
-    cfg = {}
-    try:
-        cfg = json.load(open(str(CFG_PATH))) if CFG_PATH.exists() else {}
-    except Exception:
-        cfg = {}
-    sync = cfg.get("sync", {}) if isinstance(cfg, dict) else {}
+    # ---- TTL aus config (oder fallback) ----
+    cfg = load_config()
+    sync = (cfg.get("sync", {}) or {}) if isinstance(cfg, dict) else {}
     beacon_period_s = 0.5
     try:
         beacon_period_s = float(sync.get("beacon_period_s", 0.5))
@@ -356,81 +360,154 @@ def build_mesh_diag(window_s, bin_s, max_points):
 
     ttl_s = sync.get("ui_ttl_s", None)
     if ttl_s is None:
-        ttl_s = max(2.0, 3.0 * beacon_period_s, 4.0 * float(bin_s))
+        ttl_s = max(2.0, 3.0 * beacon_period_s)
     try:
         ttl_s = float(ttl_s)
     except Exception:
-        ttl_s = max(2.0, 3.0 * beacon_period_s, 4.0 * float(bin_s))
+        ttl_s = max(2.0, 3.0 * beacon_period_s)
 
-    win_s = sync.get("ui_win_s", None)
-    if win_s is None:
-        win_s = max(1.0 * beacon_period_s, 2.0 * float(bin_s))
+    # ---- smoothing knob (EWMA time-constant) ----
+    tau_s = sync.get("ui_smooth_tau_s", None)
+    if tau_s is None:
+        tau_s = max(1.0, 2.0 * beacon_period_s)  # sinnvoller default
     try:
-        win_s = float(win_s)
+        tau_s = float(tau_s)
     except Exception:
-        win_s = max(1.0 * beacon_period_s, 2.0 * float(bin_s))
+        tau_s = max(1.0, 2.0 * beacon_period_s)
 
-    # ---- prepare samples per node: [(t, mesh_offset_ms)] ----
-    by_node = {}
-    t_min = None
-    t_max = None
-
+    # ---- samples pro node ----
+    by_node: Dict[str, List[Tuple[float, float]]] = {}
     for r in rows:
-        n = r["node_id"]
+        nid = str(r["node_id"])
         t = _f(r["created_at"])
         tm = _f(r["t_mesh"])
-        if not n or t is None or tm is None:
+        if (not nid) or t is None or tm is None:
             continue
-        mo = mesh_offset_ms(t, tm, scale)
-        by_node.setdefault(n, []).append((t, mo))
-        if t_min is None or t < t_min:
-            t_min = t
-        if t_max is None or t > t_max:
-            t_max = t
-
-    if not by_node or t_min is None or t_max is None:
-        return {
-            "meta": {"note": "no valid samples"},
-            "mesh_series_ffill": {}, "step_series_ffill": {}, "pairs_ffill": {},
-            "mesh_series_window": {}, "step_series_window": {}, "pairs_window": {},
-            "mesh_series_event": {}, "step_series_event": {}, "pairs_event": {},
-        }
+        mo = mesh_offset_ms(float(t), float(tm), float(scale))
+        by_node.setdefault(nid, []).append((float(t), float(mo)))
 
     nodes = sorted(by_node.keys())
+    if not nodes:
+        return {
+            "meta": {"note": "no valid samples"},
+            "mesh_raw": {}, "mesh_smooth": {},
+            "step_raw": {}, "step_smooth": {},
+            "pairs_raw": {},
+        }
+
     for n in nodes:
         by_node[n].sort(key=lambda x: x[0])
 
-    # helper: compute step-series from mesh-series
-    def _make_steps(mesh_series):
+    # ---- Events flatten ----
+    events: List[Tuple[float, str, float]] = []
+    for n in nodes:
+        for (t, mo) in by_node[n]:
+            events.append((float(t), n, float(mo)))
+    events.sort(key=lambda x: x[0])
+
+    # ---- RAW event series (controller-like) ----
+    last_val: Dict[str, float] = {}
+    last_time: Dict[str, float] = {}
+
+    mesh_raw: Dict[str, List[Dict[str, float]]] = {n: [] for n in nodes}
+    pairs_raw: Dict[str, List[Dict[str, float]]] = {}
+
+    for (t, n, mo) in events:
+        last_val[n] = mo
+        last_time[n] = t
+
+        # fresh values within TTL
+        fresh: Dict[str, float] = {}
+        for nn in nodes:
+            lt = last_time.get(nn)
+            lv = last_val.get(nn)
+            if lt is None or lv is None:
+                continue
+            if (t - lt) <= ttl_s:
+                fresh[nn] = lv
+
+        if len(fresh) < 2:
+            continue
+
+        cons = median(list(fresh.values()))
+        if cons is None:
+            continue
+
+        e_n = float(last_val[n] - float(cons))
+        mesh_raw[n].append({"t_wall": float(t), "mesh_err_ms": float(e_n)})
+
+        # pairs: nur wenn >=2 fresh
+        ns = sorted(fresh.keys())
+        eps_map = {nn: float(fresh[nn] - float(cons)) for nn in ns}
+        for i in range(len(ns)):
+            for j in range(i + 1, len(ns)):
+                pid = "%s-%s" % (ns[i], ns[j])
+                pairs_raw.setdefault(pid, []).append({
+                    "t_wall": float(t),
+                    "delta_ms": float(eps_map[ns[i]] - eps_map[ns[j]]),
+                })
+
+    mesh_raw = {n: pts for (n, pts) in mesh_raw.items() if pts}
+
+    # ---- EWMA smoothing per node (time-aware) ----
+    def ewma_time_smooth(series: List[Dict[str, float]], tau: float) -> List[Dict[str, float]]:
+        if not series:
+            return []
+        y = None
+        t_prev = None
+        out = []
+        for p in series:
+            t = float(p["t_wall"])
+            x = float(p["mesh_err_ms"])
+            if y is None:
+                y = x
+                t_prev = t
+            else:
+                dt = max(0.0, t - float(t_prev))
+                # alpha aus Zeitkonstante (kernel-ish lowpass)
+                a = 1.0 - math.exp(-dt / max(1e-6, tau))
+                y = (1.0 - a) * float(y) + a * x
+                t_prev = t
+            out.append({"t_wall": float(t), "mesh_err_ms": float(y)})
+        return out
+
+    mesh_smooth: Dict[str, List[Dict[str, float]]] = {}
+    for n, pts in mesh_raw.items():
+        mesh_smooth[n] = ewma_time_smooth(pts, tau_s)
+
+    # ---- steps ----
+    def steps_from_mesh(mesh_series: Dict[str, List[Dict[str, float]]]) -> Dict[str, List[Dict[str, float]]]:
         out = {}
         for n, pts in mesh_series.items():
-            pts_sorted = sorted(pts, key=lambda p: p["t_wall"])
             prev = None
             s = []
-            for p in pts_sorted:
-                cur = p["mesh_err_ms"]
-                if prev is None:
-                    d = 0.0
-                else:
-                    d = float(cur - prev)
+            for p in pts:
+                cur = float(p["mesh_err_ms"])
+                d = 0.0 if prev is None else (cur - float(prev))
                 s.append({"t_wall": float(p["t_wall"]), "step_ms": float(d)})
                 prev = cur
             out[n] = s
         return out
 
-    # helper: compute pairs from per-bin eps map
-    def _pairs_from_eps_timeseries(eps_by_time):
-        pairs = {}
-        for t_wall, eps in eps_by_time:
-            ns = sorted(eps.keys())
-            for i in range(len(ns)):
-                for j in range(i + 1, len(ns)):
-                    pid = "%s-%s" % (ns[i], ns[j])
-                    pairs.setdefault(pid, []).append({
-                        "t_wall": float(t_wall),
-                        "delta_ms": float(eps[ns[i]] - eps[ns[j]]),
-                    })
-        return pairs
+    step_raw = steps_from_mesh(mesh_raw)
+    step_smooth = steps_from_mesh(mesh_smooth)
+
+    return {
+        "meta": {
+            "window_s": float(window_s),
+            "ttl_s": float(ttl_s),
+            "smooth_tau_s": float(tau_s),
+            "t_mesh_to_seconds": float(scale),
+            "nodes": nodes,
+            "x_axis": "created_at",
+            "mode": "event_raw_plus_smooth",
+        },
+        "mesh_raw": mesh_raw,
+        "mesh_smooth": mesh_smooth,
+        "step_raw": step_raw,
+        "step_smooth": step_smooth,
+        "pairs_raw": pairs_raw,
+    }
 
     # =========================================================================
     # (A) BINNED + FORWARD-FILL (TTL)
@@ -1082,16 +1159,15 @@ TEMPLATE = r"""
           ε basiert auf <span class="mono">mesh_offset_ms=(t_mesh - created_at)*1000</span> und ist pro Bin um den Median zentriert.
           Das ist der Plot, der "wirklich stimmt".
         </div>
+        
         <div class="row small muted" style="margin-bottom:0.4rem;">
-          <span>Mesh-Plot-Modus:</span>
-          <select id="meshMode">
-            <option value="strict">Strict (≥2 Nodes / Bin)</option>
-            <option value="carry">Carry-Forward (stabil)</option>
-            <option value="raw">Raw (alle Punkte)</option>
+          <span>Mesh-Plot-Style:</span>
+          <select id="meshStyle">
+            <option value="raw" selected>raw</option>
+            <option value="smooth">smooth</option>
           </select>
         </div>
 
-        
         <canvas id="meshChart" height="170"></canvas>
 
         <div class="plots">
@@ -1322,26 +1398,14 @@ TEMPLATE = r"""
 
 
   function updateLine(chart, seriesMap, field, labelPrefix=''){
-    const modeEl = document.getElementById('meshMode');
-    const mode = modeEl ? modeEl.value : 'strict';
-
-    let dataMap = seriesMap || {};
-
-    // carry-forward nur für Mesh/Step/Link Serien sinnvoll
-    if(mode === 'carry'){
-      dataMap = carryForwardMap(dataMap, field);
-    }
-
-    const ids = Object.keys(dataMap || {}).sort();
+    const ids = Object.keys(seriesMap || {}).sort();
     chart.data.datasets = [];
 
     ids.forEach((id, idx)=>{
       const c = colors[idx % colors.length];
-
-      const pts = (dataMap[id] || [])
-        .filter(p => p && p[field] !== null && p[field] !== undefined && Number.isFinite(p[field]))
-        // WICHTIG: mesh_diag liefert t in SEKUNDEN (nicht t_wall!)
-        .map(p => ({ x: new Date(p.t * 1000), y: p[field] }));
+      const pts = (seriesMap[id] || [])
+        .filter(p => p && p.t_wall != null && p[field] != null && Number.isFinite(p[field]))
+        .map(p => ({ x: new Date(p.t_wall * 1000), y: p[field] }));
 
       chart.data.datasets.push({
         label: `${labelPrefix}${id}`,
@@ -1349,35 +1413,22 @@ TEMPLATE = r"""
         borderColor: c,
         borderWidth: 1.6
       });
-   });
+    });
 
     chart.update();
   }
 
 
-  function updatePairs(chart, pairs){
-    const modeEl = document.getElementById('meshMode');
-    const mode = modeEl ? modeEl.value : 'strict';
 
+  function updatePairs(chart, pairs){
     const ids = Object.keys(pairs || {}).sort();
     chart.data.datasets = [];
-
+  
     ids.forEach((id, idx)=>{
       const c = colors[idx % colors.length];
-
-      let pts = (pairs[id] || [])
-        .filter(p => p && p.y !== null && p.y !== undefined && Number.isFinite(p.y))
-        .map(p => ({ x: new Date(p.t * 1000), y: p.y }));
-
-      // carry-forward für pairs (optional, macht Sinn für "stabil")
-      if(mode === 'carry' && pts.length){
-        let last = null;
-          pts = pts.map(p=>{
-          if(Number.isFinite(p.y)){ last = p.y; return p; }
-          if(last !== null) return { x: p.x, y: last };
-         return null;
-        }).filter(Boolean);
-      }
+      const pts = (pairs[id] || [])
+        .filter(p => p && p.t_wall != null && p.delta_ms != null && Number.isFinite(p.delta_ms))
+        .map(p => ({ x: new Date(p.t_wall * 1000), y: p.delta_ms }));
 
       chart.data.datasets.push({
         label: id,
@@ -1389,6 +1440,7 @@ TEMPLATE = r"""
 
     chart.update();
   }
+
 
   function updateBarFromMap(chart, mapObj, field){
     const ids = Object.keys(mapObj||{}).sort();
@@ -1669,10 +1721,16 @@ TEMPLATE = r"""
       drawMesh(meshCanvas, topo, nodeStates, ov.link_sigma_med || {});
 
       // plots (mesh mode selectable)
-      const picked = pickMeshMode(mesh);
-      updateLine(meshChart, mesh.mesh_series || {}, "y", "Node ");
-      updatePairs(pairChart, picked.ps);
-      updateLine(stepChart, mesh.step_series || {}, "y", "Node ");
+      const mode = (document.getElementById('meshMode')?.value) || 'raw';
+
+      const meshSeries = (mode === 'smooth') ? (mesh.mesh_smooth || {}) : (mesh.mesh_raw || {});
+      const stepSeries = (mode === 'smooth') ? (mesh.step_smooth || {}) : (mesh.step_raw || {});
+      const pairSeries = mesh.pairs_raw || {}; // pairs nur raw (reicht)
+
+      updateLine(meshChart, meshSeries, "mesh_err_ms", "Node ");
+      updateLine(stepChart, stepSeries, "step_ms", "Node ");
+      updatePairs(pairChart, pairSeries);
+
 
     
       // optional: falls du stability/heatmap noch nicht auf die neuen Modi umgebaut hast,

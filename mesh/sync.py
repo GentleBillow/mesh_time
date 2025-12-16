@@ -388,6 +388,30 @@ class SyncModule:
                 self._offset, meas, self._weight_for_peer, dt
             )
 
+        if self._controller.__class__.__name__ == "KalmanController":
+            diag = {}
+            try:
+                diag = self._controller.last_diag() if hasattr(self._controller, "last_diag") else {}
+            except Exception:
+                diag = {}
+
+            if self._storage is not None and diag:
+                try:
+                    self._storage.insert_diag_kalman(
+                        node_id=self.node_id,
+                        n_meas=int(diag.get("n_meas", 0)),
+                        innov_med_ms=diag.get("innov_med_ms"),
+                        innov_p95_ms=diag.get("innov_p95_ms"),
+                        nis_med=diag.get("nis_med"),
+                        nis_p95=diag.get("nis_p95"),
+                        x_offset_ms=diag.get("x_offset_ms"),
+                        x_drift_ppm=diag.get("x_drift_ppm"),
+                        p_offset_ms2=diag.get("p_offset_ms2"),
+                        p_drift_ppm2=diag.get("p_drift_ppm2"),
+                        r_eff_ms2=diag.get("r_eff_ms2"),
+                    )
+                except Exception as e:
+                    log.debug("[%s] diag_kalman insert failed: %s", self.node_id, e)
 
         delta_applied = self._global_slew_clip(delta_desired, dt)
 
@@ -404,11 +428,47 @@ class SyncModule:
             "t_wall": float(time.time()),
         }
 
+        if self._storage is not None:
+            try:
+                eta = None
+                if delta_desired_ms is not None and delta_applied_ms is not None:
+                    den = abs(delta_desired_ms) + 1e-9
+                    eta = abs(delta_applied_ms) / den
+
+                self._storage.insert_diag_controller(
+                    node_id=self.node_id,
+                    dt_s=float(dt),
+                    delta_desired_ms=delta_desired_ms,
+                    delta_applied_ms=delta_applied_ms,
+                    slew_clipped=bool(slew_clipped),
+                    max_slew_ms_s=float(self._max_slew_per_second_ms),
+                    eff_eta=eta
+                )
+            except Exception as e:
+                log.debug("[%s] diag_controller insert failed: %s", self.node_id, e)
+
         self._offset += delta_applied
 
         #CRITICAL: tell controller what actually happened
         if hasattr(self._controller, "commit_applied_offset"):
             self._controller.commit_applied_offset(self._offset)
+
+        # --- mesh_clock sample (one per control tick) ---
+        if self._storage is not None:
+            try:
+                t_wall = time.time()
+                t_mono = time.monotonic()
+                t_mesh = self.mesh_time()
+                self._storage.insert_mesh_clock(
+                    node_id=self.node_id,
+                    t_wall_s=t_wall,
+                    t_mono_s=t_mono,
+                    t_mesh_s=t_mesh,
+                    offset_s=self._offset,
+                    err_mesh_vs_wall_s=(t_mesh - t_wall),
+                )
+            except Exception as e:
+                log.debug("[%s] mesh_clock insert failed: %s", self.node_id, e)
 
         if self._drift_damping > 0.0:
             self._offset *= max(0.0, 1.0 - self._drift_damping * dt)
@@ -461,6 +521,22 @@ class SyncModule:
 
             except Exception as e:
                 log.error("[%s] DB logging failed for %s: %s", self.node_id, peer_id, e)
+
+            # raw link event for v2
+            try:
+                self._storage.insert_obs_link(
+                    node_id=self.node_id,
+                    peer_id=peer_id,
+                    theta_ms=theta_ms,
+                    rtt_ms=rtt_ms,
+                    sigma_ms=sigma_ms,
+                    accepted=True,
+                    weight=self._weight_for_peer(peer_id),
+                    reject_reason=None
+                )
+            except Exception as e:
+                log.debug("[%s] obs_link insert failed: %s", self.node_id, e)
+
 
         # Option 2: Telemetrie (MIT TIMEOUT!)
         elif self._telemetry_sink_ip is not None:

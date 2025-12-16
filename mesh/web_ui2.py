@@ -177,19 +177,21 @@ def get_topology() -> Dict[str, Any]:
 # -----------------------------
 # Data source selection
 # -----------------------------
-def _pick_sources(conn: sqlite3.Connection) -> Dict[str, str]:
-    """
-    Decide which tables to use.
-    - mesh: prefer mesh_clock, else ntp_reference
-    - link: prefer obs_link, else ntp_reference
-    - ctrl: prefer diag_controller, else ntp_reference
-    """
+def _table_has_rows(conn, table: str) -> bool:
+    try:
+        r = conn.execute("SELECT 1 FROM %s LIMIT 1" % table).fetchone()
+        return bool(r)
+    except Exception:
+        return False
+
+def _pick_sources(conn):
     return {
-        "mesh": "mesh_clock" if _table_exists(conn, "mesh_clock") else "ntp_reference",
-        "link": "obs_link" if _table_exists(conn, "obs_link") else "ntp_reference",
-        "ctrl": "diag_controller" if _table_exists(conn, "diag_controller") else "ntp_reference",
-        "kalman": "diag_kalman" if _table_exists(conn, "diag_kalman") else "",
+        "mesh": "mesh_clock" if (_table_exists(conn,"mesh_clock") and _table_has_rows(conn,"mesh_clock")) else "ntp_reference",
+        "link": "obs_link" if (_table_exists(conn,"obs_link") and _table_has_rows(conn,"obs_link")) else "ntp_reference",
+        "ctrl": "diag_controller" if (_table_exists(conn,"diag_controller") and _table_has_rows(conn,"diag_controller")) else "ntp_reference",
+        "kalman": "diag_kalman" if (_table_exists(conn,"diag_kalman") and _table_has_rows(conn,"diag_kalman")) else "",
     }
+
 
 
 # -----------------------------
@@ -219,7 +221,9 @@ def fetch_ntp_node_rows(conn: sqlite3.Connection, window_s: float, limit: int) -
     cutoff = time.time() - float(window_s)
 
     # node rows: peer_id NULL if column exists
-    peer_filter = "AND peer_id IS NULL" if "peer_id" in cols else ""
+    peer_filter = ""
+    if "peer_id" in cols:
+        peer_filter = "AND (peer_id IS NULL OR peer_id='')"
 
     sel = ["node_id", "created_at", "t_mesh"]
     if "offset" in cols:
@@ -262,7 +266,7 @@ def fetch_obs_link_rows(conn: sqlite3.Connection, window_s: float, limit: int) -
     return conn.execute(q, (cutoff, int(limit))).fetchall()
 
 
-def fetch_ntp_link_rows(conn: sqlite3.Connection, window_s: float, limit: int) -> List[sqlite3.Row]:
+def fetch_ntp_link_rows(conn, window_s, limit):
     cols = _table_cols(conn, "ntp_reference")
     need = {"node_id", "peer_id", "created_at"}
     if not need.issubset(cols):
@@ -279,6 +283,7 @@ def fetch_ntp_link_rows(conn: sqlite3.Connection, window_s: float, limit: int) -
         FROM ntp_reference
         WHERE created_at >= ?
           AND peer_id IS NOT NULL
+          AND peer_id != ''
         ORDER BY created_at ASC
         LIMIT ?
     """.format(sel=", ".join(sel))
@@ -308,7 +313,7 @@ def fetch_diag_controller_rows(conn: sqlite3.Connection, window_s: float, limit:
     return conn.execute(q, (cutoff, int(limit))).fetchall()
 
 
-def fetch_ntp_ctrl_rows(conn: sqlite3.Connection, window_s: float, limit: int) -> List[sqlite3.Row]:
+def fetch_ntp_ctrl_rows(conn, window_s, limit):
     cols = _table_cols(conn, "ntp_reference")
     if not {"node_id", "created_at"}.issubset(cols):
         return []
@@ -321,16 +326,23 @@ def fetch_ntp_ctrl_rows(conn: sqlite3.Connection, window_s: float, limit: int) -
     nonnull = " OR ".join(["%s IS NOT NULL" % c for c in ctrl_cols])
 
     sel = ["node_id", "created_at"] + ctrl_cols
+
+    peer_guard = ""
+    if "peer_id" in cols:
+        peer_guard = "AND (peer_id IS NOT NULL AND peer_id != '')"
+
     q = """
         SELECT {sel}
         FROM ntp_reference
         WHERE created_at >= ?
+          {peer_guard}
           AND ({nonnull})
         ORDER BY created_at ASC
         LIMIT ?
-    """.format(sel=", ".join(sel), nonnull=nonnull)
+    """.format(sel=", ".join(sel), peer_guard=peer_guard, nonnull=nonnull)
 
     return conn.execute(q, (cutoff, int(limit))).fetchall()
+
 
 
 def fetch_diag_kalman_rows(conn: sqlite3.Connection, window_s: float, limit: int) -> List[sqlite3.Row]:

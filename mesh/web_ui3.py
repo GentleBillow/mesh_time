@@ -170,7 +170,26 @@ def interpolate_to_common_timeline(
             for nid in NODE_IDS:
                 deviations[nid].append(None)
 
-    return timestamps, deviations
+    # Filter out timestamps where all nodes are None
+    filtered_timestamps = []
+    filtered_deviations = {nid: [] for nid in NODE_IDS}
+
+    for i, t in enumerate(timestamps):
+        has_data = any(deviations[nid][i] is not None for nid in NODE_IDS)
+        if has_data:
+            filtered_timestamps.append(t)
+            for nid in NODE_IDS:
+                filtered_deviations[nid].append(deviations[nid][i])
+
+    # Reduce data points if too many (keep every Nth point)
+    MAX_POINTS = 500
+    if len(filtered_timestamps) > MAX_POINTS:
+        step = len(filtered_timestamps) // MAX_POINTS
+        reduced_timestamps = filtered_timestamps[::step]
+        reduced_deviations = {nid: filtered_deviations[nid][::step] for nid in NODE_IDS}
+        return reduced_timestamps, reduced_deviations
+
+    return filtered_timestamps, filtered_deviations
 
 
 # ============================================================================

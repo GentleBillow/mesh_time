@@ -24,6 +24,12 @@ NODE_COLORS = {
     'C': {'line': 'rgb(0, 0, 255)', 'fill': 'rgba(0, 0, 255, 0.6)'},  # Blue
 }
 
+LINK_COLORS = {
+    'A-B': {'line': 'rgb(255, 255, 0)', 'fill': 'rgba(255, 255, 0, 0.6)'},  # Yellow (Red + Green)
+    'A-C': {'line': 'rgb(255, 0, 255)', 'fill': 'rgba(255, 0, 255, 0.6)'},  # Magenta (Red + Blue)
+    'B-C': {'line': 'rgb(0, 255, 255)', 'fill': 'rgba(0, 255, 255, 0.6)'},  # Cyan (Green + Blue)
+}
+
 
 # ============================================================================
 # Database Loading
@@ -243,6 +249,128 @@ def compute_histogram(
 
 
 # ============================================================================
+# Link Quality Data
+# ============================================================================
+
+def load_link_data_from_db(db_path: str, window_s: float) -> Dict[str, List[Tuple[float, float, float, float]]]:
+    """
+    Load link quality metrics from obs_link table.
+
+    Returns:
+        {'A-B': [(t, rtt_ms, theta_ms, sigma_ms), ...], 'A-C': [...], 'B-C': [...]}
+    """
+    cutoff = time.time() - window_s
+
+    # All possible links in sorted order
+    links = ['A-B', 'A-C', 'B-C']
+    link_data = {link: [] for link in links}
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        query = """
+            SELECT created_at_s, node_id, peer_id, rtt_ms, theta_ms, sigma_ms,
+                   t1_s, t2_s, t3_s, t4_s, accepted
+            FROM obs_link
+            WHERE created_at_s > ? AND accepted = 1
+            ORDER BY created_at_s ASC
+        """
+
+        cursor.execute(query, (cutoff,))
+        rows = cursor.fetchall()
+
+        for row in rows:
+            t, node_id, peer_id, rtt_ms, theta_ms, sigma_ms, t1, t2, t3, t4, _ = row
+
+            # Normalize link identifier (always alphabetical)
+            link_pair = tuple(sorted([node_id, peer_id]))
+            link_id = f"{link_pair[0]}-{link_pair[1]}"
+
+            if link_id in link_data:
+                # Calculate asymmetry: (t3-t2) - (t4-t1)
+                asymmetry_ms = None
+                if all(x is not None for x in [t1, t2, t3, t4]):
+                    forward = (t3 - t2) * 1000  # ms
+                    backward = (t4 - t1) * 1000  # ms
+                    asymmetry_ms = forward - backward
+
+                link_data[link_id].append((
+                    float(t),
+                    float(rtt_ms) if rtt_ms is not None else None,
+                    float(asymmetry_ms) if asymmetry_ms is not None else None,
+                    float(sigma_ms) if sigma_ms is not None else None
+                ))
+
+        conn.close()
+
+    except Exception as e:
+        print(f"[web_ui3] Link data load error: {e}")
+        return {link: [] for link in links}
+
+    return link_data
+
+
+def compute_link_metrics(link_data: Dict[str, List[Tuple[float, float, float, float]]]) -> Dict:
+    """
+    Compute aggregate link quality metrics.
+
+    Returns:
+        {
+            'timeseries': {'A-B': {timestamps: [...], rtt: [...], asymmetry: [...], sigma: [...]}, ...},
+            'jitter': {'A-B': {timestamps: [...], jitter: [...]}, ...},
+            'acceptance': {'A-B': 0.95, 'A-C': 0.98, ...}
+        }
+    """
+    timeseries = {}
+    jitter = {}
+
+    for link_id, data in link_data.items():
+        if not data:
+            timeseries[link_id] = {'timestamps': [], 'rtt': [], 'asymmetry': [], 'sigma': []}
+            jitter[link_id] = {'timestamps': [], 'jitter': []}
+            continue
+
+        timestamps = [d[0] for d in data]
+        rtt_values = [d[1] for d in data]
+        asym_values = [d[2] for d in data]
+        sigma_values = [d[3] for d in data]
+
+        # Compute rolling jitter (std dev of RTT over window)
+        jitter_timestamps = []
+        jitter_values = []
+        window_size = 20  # samples
+
+        for i in range(len(rtt_values)):
+            if i >= window_size - 1:
+                window_rtt = [r for r in rtt_values[i - window_size + 1:i + 1] if r is not None]
+                if len(window_rtt) >= 5:
+                    jitter_val = float(np.std(window_rtt))
+                    jitter_timestamps.append(timestamps[i])
+                    jitter_values.append(jitter_val)
+
+        timeseries[link_id] = {
+            'timestamps': timestamps,
+            'rtt': rtt_values,
+            'asymmetry': asym_values,
+            'sigma': sigma_values
+        }
+
+        jitter[link_id] = {
+            'timestamps': jitter_timestamps,
+            'jitter': jitter_values
+        }
+
+    # Note: acceptance rate would need rejected measurements too, skip for now
+    # We can add it later by querying both accepted=1 and accepted=0
+
+    return {
+        'timeseries': timeseries,
+        'jitter': jitter
+    }
+
+
+# ============================================================================
 # Statistics
 # ============================================================================
 
@@ -294,9 +422,9 @@ def index():
 
 @app.route('/api/convergence')
 def api_convergence():
-    """Main API endpoint for convergence data."""
+    """Main API endpoint for convergence and link quality data."""
 
-    # Load from DB
+    # Load convergence data
     node_data = load_timeseries_from_db(DB_PATH, DEFAULT_WINDOW_S)
 
     # Check if we have data
@@ -307,7 +435,9 @@ def api_convergence():
             "timeseries": {"timestamps": [], "deviations": {nid: [] for nid in NODE_IDS}},
             "histogram": {"bin_edges": [0, 1], "counts": {nid: [0] for nid in NODE_IDS}},
             "stats": {"n_samples": 0, "std_dev_ms": 0, "max_abs_ms": 0, "nodes": {}},
-            "colors": NODE_COLORS
+            "colors": NODE_COLORS,
+            "link_colors": LINK_COLORS,
+            "links": {"timeseries": {}, "jitter": {}}
         })
 
     # Interpolate to common timeline
@@ -318,6 +448,10 @@ def api_convergence():
 
     # Compute stats
     stats = compute_stats(deviations, node_data)
+
+    # Load link quality data
+    link_data = load_link_data_from_db(DB_PATH, DEFAULT_WINDOW_S)
+    link_metrics = compute_link_metrics(link_data)
 
     # Return JSON
     return jsonify({
@@ -331,6 +465,8 @@ def api_convergence():
         },
         "stats": stats,
         "colors": NODE_COLORS,
+        "link_colors": LINK_COLORS,
+        "links": link_metrics,
         "window_s": DEFAULT_WINDOW_S
     })
 

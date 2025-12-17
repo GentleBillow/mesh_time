@@ -14,6 +14,7 @@ import aiocoap
 
 from .coap_endpoints import build_site
 from .led import DummyLED, GrovePiLED
+from .button import DummyButton, GrovePiButton
 from .sensor import DummySensor
 from .storage import Storage
 from .sync import SyncModule
@@ -46,6 +47,9 @@ class MeshNode:
 
         # --- LED ---
         self.led = self._init_led()
+
+        # --- Button ---
+        self.button = self._init_button()
 
         # --- Optional Storage ---
         self.storage = self._init_storage()
@@ -97,6 +101,21 @@ class MeshNode:
         except Exception as e:
             log.warning("[%s] GrovePiLED failed (%s) → falling back to DummyLED", self.id, e)
             return DummyLED(pin=led_pin)
+
+    def _init_button(self):
+        button_pin = self.cfg.get("button_pin", None)
+        if button_pin is None:
+            log.info("[%s] No button_pin configured → Button disabled", self.id)
+            return None
+
+        if IS_WINDOWS:
+            return DummyButton(pin=button_pin)
+
+        try:
+            return GrovePiButton(pin=button_pin)
+        except Exception as e:
+            log.warning("[%s] GrovePiButton failed (%s) → falling back to DummyButton", self.id, e)
+            return DummyButton(pin=button_pin)
 
     def _init_storage(self) -> Optional[Storage]:
         db_path = self.cfg.get("db_path")
@@ -189,6 +208,21 @@ class MeshNode:
             if self.led is not None:
                 self.led.update(self.sync.mesh_time())
             await asyncio.sleep(0.01)
+
+    async def button_loop(self) -> None:
+        assert self._stop is not None
+        log.info("[%s] button_loop started", self.id)
+
+        # Configurable disturbance amount
+        disturbance_ms = float(self.cfg.get("disturbance_ms", 500.0))
+        disturbance_s = disturbance_ms / 1000.0
+
+        while not self._stop.is_set():
+            if self.button is not None:
+                if self.button.read():
+                    log.warning("[%s] Button pressed! Injecting disturbance: %.3fs", self.id, disturbance_s)
+                    self.sync.inject_disturbance(disturbance_s)
+            await asyncio.sleep(0.05)  # 50ms poll rate
 
     async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
         """Periodic telemetry + optional local DB logging."""
@@ -361,6 +395,7 @@ class MeshNode:
             (self.sync_loop(), f"{self.id}:sync"),
             (self.sensor_loop(), f"{self.id}:sensor"),
             (self.led_loop(), f"{self.id}:led"),
+            (self.button_loop(), f"{self.id}:button"),
             (self.ntp_monitor_loop(), f"{self.id}:ntp"),
         ]:
             t = asyncio.create_task(coro)

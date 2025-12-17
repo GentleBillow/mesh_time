@@ -271,6 +271,16 @@ class SyncModule:
     def get_offset(self) -> float:
         return self._offset
 
+    def inject_disturbance(self, delta_s: float) -> None:
+        """
+        Inject a time disturbance (for testing sync recovery).
+        Shifts the offset by delta_s seconds.
+        """
+        old_offset = self._offset
+        self._offset += float(delta_s)
+        log.warning("[%s] DISTURBANCE injected: delta=%.3fs, offset: %.3fs -> %.3fs",
+                    self.node_id, float(delta_s), old_offset, self._offset)
+
     def last_control_debug(self) -> Dict[str, Any]:
         return dict(self._last_control_debug or {})
 

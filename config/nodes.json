@@ -32,7 +32,7 @@
       "r_base": 5e-3,
 
       "adaptive_r": {
-        "R_min": 1e-6,
+        "R_min": 1e-5,
         "c_rtt": 1
       }
     },
@@ -47,8 +47,9 @@
     "parent": "C",
     "telemetry_sink": "C",
     "neighbors": ["C", "B"],
-    "sensor_type": "potentiometer",
-    "led_pin": 5
+    "led_pin": 5,
+    "button_pin": 4,
+    "disturbance_ms": 500.0
   },
 
   "C": {
@@ -56,8 +57,9 @@
     "parent": null,
     "telemetry_sink": "C",
     "neighbors": ["A", "B"],
-    "sensor_type": "potentiometer",
     "led_pin": 5,
+    "button_pin": 4,
+    "disturbance_ms": 500.0,
     "db_path": "/home/pi/mesh_time/mesh_data.sqlite",
     "sync": { "is_root": false }
   },
@@ -67,8 +69,8 @@
     "parent": "C",
     "telemetry_sink": "C",
     "neighbors": ["A", "C"],
-    "sensor_type": "potentiometer",
     "led_pin": 5,
-    "button_pin": 23
+    "button_pin": 4,
+    "disturbance_ms": 500.0
   }
 }

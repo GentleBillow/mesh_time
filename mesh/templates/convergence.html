@@ -1,534 +1,101 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MeshTime Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<meta charset="utf-8">
+<title>MeshTime – Split Charts</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body { font-family: sans-serif; margin: 20px; }
+.card { display:inline-block; margin:10px; padding:10px; border:1px solid #ccc; }
+canvas { max-width: 900px; }
+</style>
 </head>
-<body class="bg-gray-900 text-gray-100">
 
-    <div class="container mx-auto p-6 max-w-7xl">
+<body>
 
-        <!-- Header -->
-        <div class="mb-8">
-            <h1 class="text-4xl font-bold mb-2">MeshTime Dashboard</h1>
-            <p class="text-gray-400">Real-time synchronization and link quality analysis</p>
-        </div>
+<h2>MeshTime – Split API Dashboard</h2>
 
-        <!-- Status Cards -->
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <!-- Overall Sync Quality -->
-            <div class="bg-gray-800 rounded-lg p-4">
-                <div class="text-sm text-gray-400 mb-1">Sync Quality</div>
-                <div id="stat-quality" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">max deviation (ms)</div>
-            </div>
+<div class="card" id="status">loading…</div>
 
-            <!-- Node A -->
-            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-red-500">
-                <div class="text-sm text-gray-400 mb-1">Node A</div>
-                <div id="stat-a" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">current deviation (ms)</div>
-            </div>
+<canvas id="conv"></canvas>
+<canvas id="hist"></canvas>
+<canvas id="rtt"></canvas>
 
-            <!-- Node B -->
-            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-green-500">
-                <div class="text-sm text-gray-400 mb-1">Node B</div>
-                <div id="stat-b" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">current deviation (ms)</div>
-            </div>
+<script>
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  return await r.json();
+}
 
-            <!-- Node C -->
-            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-blue-500">
-                <div class="text-sm text-gray-400 mb-1">Node C</div>
-                <div id="stat-c" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">current deviation (ms)</div>
-            </div>
-        </div>
+// ---------------- STATUS ----------------
+async function updateStatus() {
+  const s = await fetchJSON("/api/status");
+  document.getElementById("status").innerText =
+    `samples=${s.samples} | window=${s.window_s}s | max|θ|=${s.max_abs_ms.toFixed(3)} ms`;
+}
 
-        <!-- CATEGORY 1: Synchronization Quality -->
-        <div class="bg-gray-800 rounded-lg p-6 mb-8">
-            <h2 class="text-2xl font-bold mb-6 flex items-center">
-                <span class="text-3xl mr-3">📊</span>
-                Synchronization Quality
-            </h2>
+// ---------------- CONVERGENCE ----------------
+const convChart = new Chart(
+  document.getElementById("conv"),
+  { type: "line", data: { datasets: [] } }
+);
 
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <!-- Convergence Timeline -->
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Convergence Timeline</h3>
-                    <canvas id="convergence-chart"></canvas>
-                </div>
+async function updateConv() {
+  const data = await fetchJSON("/api/chart/convergence");
+  convChart.data.datasets = data.map(d => ({
+    label: d.id,
+    data: d.t.map((t,i)=>({x:t, y:d.theta[i]})),
+    borderWidth: 1,
+    fill: false
+  }));
+  convChart.update();
+}
 
-                <!-- Deviation Distribution -->
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Deviation Distribution</h3>
-                    <canvas id="histogram-chart"></canvas>
-                </div>
-            </div>
-        </div>
+// ---------------- HISTOGRAM ----------------
+const histChart = new Chart(
+  document.getElementById("hist"),
+  { type: "bar", data: { labels: [], datasets: [] } }
+);
 
-        <!-- CATEGORY 2: Link Quality Metrics -->
-        <div class="bg-gray-800 rounded-lg p-6 mb-8">
-            <h2 class="text-2xl font-bold mb-6 flex items-center">
-                <span class="text-3xl mr-3">🔗</span>
-                Link Quality Metrics
-            </h2>
+async function updateHist() {
+  const h = await fetchJSON("/api/chart/histogram");
+  histChart.data.labels = h.values.map((_,i)=>i);
+  histChart.data.datasets = [{
+    label: "θ samples",
+    data: h.values
+  }];
+  histChart.update();
+}
 
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <!-- RTT Timeline -->
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">RTT Timeline</h3>
-                    <canvas id="rtt-chart"></canvas>
-                </div>
+// ---------------- RTT ----------------
+const rttChart = new Chart(
+  document.getElementById("rtt"),
+  { type: "line", data: { datasets: [] } }
+);
 
-                <!-- Link Asymmetry -->
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Link Asymmetry</h3>
-                    <canvas id="asymmetry-chart"></canvas>
-                </div>
+async function updateRTT() {
+  const data = await fetchJSON("/api/chart/rtt");
+  rttChart.data.datasets = data.map(d => ({
+    label: d.id,
+    data: d.t.map((t,i)=>({x:t, y:d.rtt[i]})),
+    borderWidth: 1
+  }));
+  rttChart.update();
+}
 
-                <!-- Jitter -->
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Jitter (Rolling Std)</h3>
-                    <canvas id="jitter-chart"></canvas>
-                </div>
+// ---------------- LOOP ----------------
+async function loop() {
+  await Promise.all([
+    updateStatus(),
+    updateConv(),
+    updateHist(),
+    updateRTT()
+  ]);
+}
 
-                <!-- Link Statistics -->
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Link Statistics</h3>
-                    <canvas id="stats-chart"></canvas>
-                </div>
-            </div>
-        </div>
-
-        <!-- Footer Info -->
-        <div class="text-center text-sm text-gray-500">
-            <span id="update-info">Updating...</span> |
-            Window: <span id="window-info">--</span>s |
-            Samples: <span id="samples-info">--</span>
-        </div>
-
-    </div>
-
-    <script>
-        // Chart instances
-        let convergenceChart, histogramChart, rttChart, asymmetryChart, jitterChart, statsChart;
-
-        // Color schemes from backend
-        const colors = {
-            'A': {line: 'rgb(255, 0, 0)', fill: 'rgba(255, 0, 0, 0.6)'},
-            'B': {line: 'rgb(0, 255, 0)', fill: 'rgba(0, 255, 0, 0.6)'},
-            'C': {line: 'rgb(0, 0, 255)', fill: 'rgba(0, 0, 255, 0.6)'}
-        };
-
-        const linkColors = {
-            'A-B': {line: 'rgb(255, 255, 0)', fill: 'rgba(255, 255, 0, 0.6)'},
-            'A-C': {line: 'rgb(255, 0, 255)', fill: 'rgba(255, 0, 255, 0.6)'},
-            'B-C': {line: 'rgb(0, 255, 255)', fill: 'rgba(0, 255, 255, 0.6)'}
-        };
-
-        // Initialize all charts
-        function initCharts() {
-            // Convergence Timeline
-            convergenceChart = new Chart(document.getElementById('convergence-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    aspectRatio: 2,
-                    scales: {
-                        x: {
-                            type: 'linear',
-                            ticks: {
-                                color: '#9ca3af',
-                                callback: function(value) {
-                                    const date = new Date(value * 1000);
-                                    return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
-                                }
-                            },
-                            grid: { color: '#374151' }
-                        },
-                        y: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' },
-                            title: { display: true, text: 'Deviation (ms)', color: '#9ca3af' }
-                        }
-                    },
-                    plugins: {
-                        legend: { labels: { color: '#9ca3af' } },
-                        tooltip: {
-                            callbacks: {
-                                title: function(items) {
-                                    if (items.length > 0) {
-                                        const timestamp = items[0].parsed.x;
-                                        const date = new Date(timestamp * 1000);
-                                        return date.toLocaleString('de-DE');
-                                    }
-                                    return '';
-                                },
-                                label: function(context) {
-                                    let label = context.dataset.label || '';
-                                    if (label) label += ': ';
-                                    if (context.parsed.y !== null) {
-                                        label += context.parsed.y.toFixed(3) + ' ms';
-                                    }
-                                    return label;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Histogram
-            histogramChart = new Chart(document.getElementById('histogram-chart'), {
-                type: 'bar',
-                data: {labels: [], datasets: []},
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    aspectRatio: 2,
-                    scales: {
-                        x: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' },
-                            title: { display: true, text: 'Deviation (ms)', color: '#9ca3af' }
-                        },
-                        y: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' },
-                            title: { display: true, text: 'Count', color: '#9ca3af' }
-                        }
-                    },
-                    plugins: {
-                        legend: { labels: { color: '#9ca3af' } }
-                    }
-                }
-            });
-
-            // RTT Timeline
-            rttChart = new Chart(document.getElementById('rtt-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    aspectRatio: 2,
-                    scales: {
-                        x: {
-                            type: 'linear',
-                            ticks: {
-                                color: '#9ca3af',
-                                callback: function(value) {
-                                    const date = new Date(value * 1000);
-                                    return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
-                                }
-                            },
-                            grid: { color: '#374151' }
-                        },
-                        y: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' },
-                            title: { display: true, text: 'RTT (ms)', color: '#9ca3af' }
-                        }
-                    },
-                    plugins: {
-                        legend: { labels: { color: '#9ca3af' } }
-                    }
-                }
-            });
-
-            // Asymmetry
-            asymmetryChart = new Chart(document.getElementById('asymmetry-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    aspectRatio: 2,
-                    scales: {
-                        x: {
-                            type: 'linear',
-                            ticks: {
-                                color: '#9ca3af',
-                                callback: function(value) {
-                                    const date = new Date(value * 1000);
-                                    return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
-                                }
-                            },
-                            grid: { color: '#374151' }
-                        },
-                        y: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' },
-                            title: { display: true, text: 'Asymmetry (ms)', color: '#9ca3af' }
-                        }
-                    },
-                    plugins: {
-                        legend: { labels: { color: '#9ca3af' } }
-                    }
-                }
-            });
-
-            // Jitter
-            jitterChart = new Chart(document.getElementById('jitter-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    aspectRatio: 2,
-                    scales: {
-                        x: {
-                            type: 'linear',
-                            ticks: {
-                                color: '#9ca3af',
-                                callback: function(value) {
-                                    const date = new Date(value * 1000);
-                                    return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
-                                }
-                            },
-                            grid: { color: '#374151' }
-                        },
-                        y: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' },
-                            title: { display: true, text: 'Jitter (ms)', color: '#9ca3af' }
-                        }
-                    },
-                    plugins: {
-                        legend: { labels: { color: '#9ca3af' } }
-                    }
-                }
-            });
-
-            // Stats (bar chart for link statistics)
-            statsChart = new Chart(document.getElementById('stats-chart'), {
-                type: 'bar',
-                data: {labels: ['A-B', 'A-C', 'B-C'], datasets: []},
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    aspectRatio: 2,
-                    scales: {
-                        x: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' }
-                        },
-                        y: {
-                            ticks: { color: '#9ca3af' },
-                            grid: { color: '#374151' },
-                            title: { display: true, text: 'Avg RTT (ms)', color: '#9ca3af' }
-                        }
-                    },
-                    plugins: {
-                        legend: { display: false }
-                    }
-                }
-            });
-        }
-
-        // Update all charts with new data
-        function updateCharts(data) {
-            // Update stats cards
-            document.getElementById('stat-quality').textContent =
-                data.stats.max_abs_ms ? data.stats.max_abs_ms.toFixed(3) : '--';
-
-            ['A', 'B', 'C'].forEach(nid => {
-                const elem = document.getElementById(`stat-${nid.toLowerCase()}`);
-                if (data.stats.nodes[nid] && data.stats.nodes[nid].current_ms !== null) {
-                    elem.textContent = data.stats.nodes[nid].current_ms.toFixed(3);
-                } else {
-                    elem.textContent = '--';
-                }
-            });
-
-            // Update convergence timeline
-            const timeDatasets = ['A', 'B', 'C'].map(nid => ({
-                label: `Node ${nid}`,
-                data: data.timeseries.timestamps.map((t, i) => ({
-                    x: t,
-                    y: data.timeseries.deviations[nid][i]
-                })),
-                borderColor: colors[nid].line,
-                backgroundColor: colors[nid].fill,
-                borderWidth: 2,
-                pointRadius: 0,
-                spanGaps: false
-            }));
-
-            convergenceChart.data.datasets = timeDatasets;
-            convergenceChart.update('none');
-
-            // Update histogram
-            const binCenters = data.histogram.bin_edges.slice(0, -1).map((edge, i) =>
-                ((edge + data.histogram.bin_edges[i + 1]) / 2).toFixed(2)
-            );
-
-            const histDatasets = ['A', 'B', 'C'].map(nid => ({
-                label: `Node ${nid}`,
-                data: data.histogram.counts[nid],
-                backgroundColor: colors[nid].fill,
-                borderColor: colors[nid].line,
-                borderWidth: 1
-            }));
-
-            histogramChart.data.labels = binCenters;
-            histogramChart.data.datasets = histDatasets;
-            histogramChart.update('none');
-
-            // Update RTT chart
-            const rttDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
-                const linkData = data.links.timeseries[linkId];
-                if (!linkData || linkData.timestamps.length === 0) {
-                    return {
-                        label: linkId,
-                        data: [],
-                        borderColor: linkColors[linkId].line,
-                        backgroundColor: linkColors[linkId].fill,
-                        borderWidth: 2,
-                        pointRadius: 0
-                    };
-                }
-
-                return {
-                    label: linkId,
-                    data: linkData.timestamps.map((t, i) => ({
-                        x: t,
-                        y: linkData.rtt[i]
-                    })),
-                    borderColor: linkColors[linkId].line,
-                    backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    spanGaps: false
-                };
-            });
-
-            rttChart.data.datasets = rttDatasets;
-            rttChart.update('none');
-
-            // Update Asymmetry chart
-            const asymDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
-                const linkData = data.links.timeseries[linkId];
-                if (!linkData || linkData.timestamps.length === 0) {
-                    return {
-                        label: linkId,
-                        data: [],
-                        borderColor: linkColors[linkId].line,
-                        backgroundColor: linkColors[linkId].fill,
-                        borderWidth: 2,
-                        pointRadius: 0
-                    };
-                }
-
-                return {
-                    label: linkId,
-                    data: linkData.timestamps.map((t, i) => ({
-                        x: t,
-                        y: linkData.asymmetry[i]
-                    })),
-                    borderColor: linkColors[linkId].line,
-                    backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    spanGaps: false
-                };
-            });
-
-            asymmetryChart.data.datasets = asymDatasets;
-            asymmetryChart.update('none');
-
-            // Update Jitter chart
-            const jitterDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
-                const jitterData = data.links.jitter[linkId];
-                if (!jitterData || jitterData.timestamps.length === 0) {
-                    return {
-                        label: linkId,
-                        data: [],
-                        borderColor: linkColors[linkId].line,
-                        backgroundColor: linkColors[linkId].fill,
-                        borderWidth: 2,
-                        pointRadius: 0
-                    };
-                }
-
-                return {
-                    label: linkId,
-                    data: jitterData.timestamps.map((t, i) => ({
-                        x: t,
-                        y: jitterData.jitter[i]
-                    })),
-                    borderColor: linkColors[linkId].line,
-                    backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    spanGaps: false
-                };
-            });
-
-            jitterChart.data.datasets = jitterDatasets;
-            jitterChart.update('none');
-
-            // Update Stats chart (avg RTT per link)
-            const avgRtts = ['A-B', 'A-C', 'B-C'].map(linkId => {
-                const linkData = data.links.timeseries[linkId];
-                if (!linkData || linkData.rtt.length === 0) return 0;
-
-                const validRtts = linkData.rtt.filter(r => r !== null);
-                if (validRtts.length === 0) return 0;
-
-                return validRtts.reduce((a, b) => a + b, 0) / validRtts.length;
-            });
-
-            statsChart.data.datasets = [{
-                label: 'Avg RTT',
-                data: avgRtts,
-                backgroundColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].fill),
-                borderColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].line),
-                borderWidth: 2
-            }];
-            statsChart.update('none');
-
-            // Update footer
-            document.getElementById('window-info').textContent = data.window_s || '--';
-            document.getElementById('samples-info').textContent = data.stats.n_samples || '--';
-        }
-
-        // Fetch data from API
-        async function fetchData() {
-            try {
-                const response = await fetch('/api/convergence');
-                const data = await response.json();
-
-                if (data.error) {
-                    console.error('API error:', data.error);
-                    document.getElementById('update-info').textContent = 'No data available';
-                    return;
-                }
-
-                updateCharts(data);
-
-                const now = new Date().toLocaleTimeString('de-DE');
-                document.getElementById('update-info').textContent = `Last update: ${now}`;
-
-            } catch (error) {
-                console.error('Fetch error:', error);
-                document.getElementById('update-info').textContent = 'Update failed';
-            }
-        }
-
-        // Initialize and start polling
-        window.addEventListener('load', () => {
-            initCharts();
-            fetchData();
-            setInterval(fetchData, 3000); // Update every 3 seconds
-        });
-    </script>
+setInterval(loop, 1000);
+loop();
+</script>
 
 </body>
-</html>
+</html> 

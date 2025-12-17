@@ -164,7 +164,6 @@ def _get_window_s() -> float:
 def load_snapshot(window_s: float) -> Snapshot:
     now = time.time()
 
-
     with _snapshot_lock:
         cached = _snapshot_cache["data"]
         if (

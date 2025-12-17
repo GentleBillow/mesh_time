@@ -58,8 +58,8 @@
 /* -----------------------
    Helpers
 ------------------------ */
-async function fetchJSON(url) {
-  const r = await fetch(url, { cache: "no-store" });
+async function fetchJSON(url, signal=null) {
+  const r = await fetch(url, { cache: "no-store", signal });
   if (!r.ok) throw new Error(`HTTP ${r.status} @ ${url}`);
   return await r.json();
 }
@@ -252,8 +252,8 @@ function urlWithWindow(path) {
   return u.toString();
 }
 
-async function loadMeta() {
-  META = await fetchJSON(urlWithWindow("/api/meta"));
+async function loadMeta(signal=null) {
+  META = await fetchJSON(urlWithWindow("/api/meta"), signal);
   const statusEl = document.getElementById("status");
   statusEl.textContent = `nodes=${META.nodes.length} | window=${META.window_s}s`;
 }
@@ -262,8 +262,8 @@ function colorOf(node) {
   return (META && META.colors && META.colors[node]) ? META.colors[node] : "#888888";
 }
 
-async function updateKalmanState() {
-  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/state"));
+async function updateKalmanState(signal=null) {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/state"), signal);
   const ds = [];
   for (const r of rows) {
     const c = colorOf(r.node);
@@ -274,8 +274,8 @@ async function updateKalmanState() {
   charts.state.update();
 }
 
-async function updateKalmanCov() {
-  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/cov"));
+async function updateKalmanCov(signal=null) {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/cov"), signal);
   const ds = [];
   for (const r of rows) {
     const c = colorOf(r.node);
@@ -286,8 +286,8 @@ async function updateKalmanCov() {
   charts.cov.update();
 }
 
-async function updateKalmanInnov() {
-  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/innov"));
+async function updateKalmanInnov(signal=null) {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/innov"), signal);
   const ds = [];
   for (const r of rows) {
     const c = colorOf(r.node);
@@ -298,8 +298,8 @@ async function updateKalmanInnov() {
   charts.innov.update();
 }
 
-async function updateKalmanNIS() {
-  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/nis"));
+async function updateKalmanNIS(signal=null) {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/nis"), signal);
   const ds = [];
   for (const r of rows) {
     const c = colorOf(r.node);
@@ -310,8 +310,8 @@ async function updateKalmanNIS() {
   charts.nis.update();
 }
 
-async function updateKalmanR() {
-  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/r"));
+async function updateKalmanR(signal=null) {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/r"), signal);
   const ds = [];
   for (const r of rows) {
     const c = colorOf(r.node);
@@ -321,8 +321,8 @@ async function updateKalmanR() {
   charts.r.update();
 }
 
-async function updateControllerSlew() {
-  const rows = await fetchJSON(urlWithWindow("/api/chart/controller/slew"));
+async function updateControllerSlew(signal=null) {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/controller/slew"), signal);
   const ds = [];
   for (const r of rows) {
     const c = colorOf(r.node);
@@ -377,8 +377,42 @@ document.getElementById("apply").addEventListener("click", async () => {
   await tick();
 });
 
-setInterval(tick, 1000);
-tick();
+let busy = false;
+let aborter = null;
+
+async function tickGuarded() {
+  if (busy) return;
+  busy = true;
+
+  // abort any previous in-flight fetches (safety)
+  if (aborter) aborter.abort();
+  aborter = new AbortController();
+
+  try {
+    if (!META) await loadMeta(aborter.signal);
+    await Promise.all([
+      updateKalmanState(aborter.signal),
+      updateKalmanCov(aborter.signal),
+      updateKalmanInnov(aborter.signal),
+      updateKalmanNIS(aborter.signal),
+      updateKalmanR(aborter.signal),
+      updateControllerSlew(aborter.signal)
+    ]);
+    document.getElementById("status").textContent =
+      `nodes=${META.nodes.length} | window=${META.window_s}s | updated=${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    // Ignore abort errors (normal when new tick starts)
+    if (!(e && (e.name === "AbortError"))) {
+      document.getElementById("status").textContent = `ERROR: ${e}`;
+    }
+  } finally {
+    busy = false;
+  }
+}
+
+// Poll every 1s, but only if last tick finished
+setInterval(tickGuarded, 1000);
+tickGuarded();
 </script>
 
 </body>

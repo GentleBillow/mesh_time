@@ -911,27 +911,21 @@ class SyncModule:
     # ROBUST: Start/Stop
     # -----------------------------------------------------------------
 
-    async def start(self) -> None:
-
+    async def start(self, client_ctx: Optional[aiocoap.Context] = None) -> None:
         self._loop = asyncio.get_running_loop()
         if self._measurement_queue is None:
             self._measurement_queue = asyncio.Queue()
+
+        # <<< WICHTIG: Context für Telemetrie merken >>>
+        self._client_ctx = client_ctx
 
         if IS_WINDOWS:
             log.info("[%s] Skipping workers (Windows)", self.node_id)
             return
 
-        # only create telemetry ctx if we need it
-        if self._storage is None and self._telemetry_sink_ip is not None:
-            self._telemetry_ctx = await aiocoap.Context.create_client_context()
-
-        # ALWAYS: clock tick (so root=C im Dashboard nie leer ist)
         self._worker_tasks.append(spawn_task(self._clock_tick_loop(), f"{self.node_id}:clock_tick"))
-
-        # Control loop (only meaningful if measurements arrive)
         self._worker_tasks.append(spawn_task(self._control_loop(), f"{self.node_id}:control"))
 
-        # Peer workers
         for peer_id in self.neighbors:
             peer_ip = self.neighbor_ips.get(peer_id)
             if not peer_ip:

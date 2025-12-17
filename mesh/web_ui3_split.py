@@ -23,9 +23,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "mesh_data.sqlite"
-CFG_PATH = BASE_DIR / "config" / "nodes.json"
+from pathlib import Path
+
+# project root = /home/pi/mesh_time
+ROOT_DIR = Path(__file__).resolve().parent
+if (ROOT_DIR / "mesh_data.sqlite").exists() and (ROOT_DIR / "config" / "nodes.json").exists():
+    pass
+else:
+    # if file sits in /home/pi/mesh_time/mesh/, jump one up
+    if (ROOT_DIR.parent / "mesh_data.sqlite").exists() and (ROOT_DIR.parent / "config" / "nodes.json").exists():
+        ROOT_DIR = ROOT_DIR.parent
+
+DB_PATH  = ROOT_DIR / "mesh_data.sqlite"
+CFG_PATH = ROOT_DIR / "config" / "nodes.json"
+
 
 WINDOW_S_DEFAULT = 10 * 60.0
 SNAPSHOT_TTL_S = 1.0

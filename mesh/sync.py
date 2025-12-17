@@ -165,13 +165,13 @@ class SyncModule:
     """
 
     def __init__(
-        self,
-        node_id: str,
-        neighbors: List[str],
-        neighbor_ips: Dict[str, str],
-        sync_cfg: Optional[Dict[str, Any]] = None,
-        storage=None,
-        telemetry_sink_ip: Optional[str] = None,
+            self,
+            node_id: str,
+            neighbors: List[str],
+            neighbor_ips: Dict[str, str],
+            sync_cfg: Optional[Dict[str, Any]] = None,
+            storage=None,
+            telemetry_sink_ip: Optional[str] = None,
     ) -> None:
         sync_cfg = sync_cfg or {}
 
@@ -183,10 +183,11 @@ class SyncModule:
 
         # Telemetry runtime state (set in start())
         self._telemetry_ctx: Optional[aiocoap.Context] = None
+        self._telemetry_fail_count: int = 0
+        self._telemetry_ctx_lock: Optional[asyncio.Lock] = None
 
         # Cache last kalman diag (safe per instance)
         self._last_kalman_diag: Dict[str, Any] = {}
-
 
         # role
         self._is_root = bool(sync_cfg.get("is_root", False))
@@ -217,7 +218,7 @@ class SyncModule:
 
         # Adaptive R (Kalman measurement noise) config
         ar = (sync_cfg.get("kalman", {}) or {}).get("adaptive_r", {}) or {}
-        self._R_min = float(ar.get("R_min", 2.5e-9))          # seconds^2
+        self._R_min = float(ar.get("R_min", 2.5e-9))  # seconds^2
         self._c_rtt = float(ar.get("c_rtt", 0.5))
 
         # limits / timing
@@ -273,7 +274,6 @@ class SyncModule:
     def last_control_debug(self) -> Dict[str, Any]:
         return dict(self._last_control_debug or {})
 
-
     def is_warmed_up(self) -> bool:
         return self._is_root or self._beacon_count >= self._min_beacons_for_warmup
 
@@ -299,6 +299,49 @@ class SyncModule:
         xs = sorted(xs)
         return self._quantile_sorted(xs, 0.75) - self._quantile_sorted(xs, 0.25)
 
+    # -----------------------------------------------------------------
+    # ROBUST: Telemetry Context Management (mit Self-Healing)
+    # -----------------------------------------------------------------
+
+    async def _ensure_telemetry_ctx(self) -> Optional[aiocoap.Context]:
+        """
+        Ensures telemetry context exists and is healthy.
+        Recreates context after repeated failures (self-healing).
+        Similar to per-peer context management.
+        """
+        if self._telemetry_ctx is None:
+            if self._telemetry_ctx_lock is None:
+                self._telemetry_ctx_lock = asyncio.Lock()
+
+            async with self._telemetry_ctx_lock:
+                if self._telemetry_ctx is None:
+                    try:
+                        self._telemetry_ctx = await aiocoap.Context.create_client_context()
+                        self._telemetry_fail_count = 0
+                        log.info("[%s] Created telemetry context", self.node_id)
+                    except Exception as e:
+                        log.error("[%s] Failed to create telemetry context: %s", self.node_id, e)
+                        return None
+
+        return self._telemetry_ctx
+
+    async def _reset_telemetry_ctx(self) -> None:
+        """Reset telemetry context after repeated failures."""
+        if self._telemetry_ctx_lock is None:
+            self._telemetry_ctx_lock = asyncio.Lock()
+
+        async with self._telemetry_ctx_lock:
+            if self._telemetry_ctx is not None:
+                try:
+                    await self._telemetry_ctx.shutdown()
+                    log.info("[%s] Shutdown telemetry context for reset", self.node_id)
+                except Exception:
+                    pass
+                self._telemetry_ctx = None
+                self._telemetry_fail_count = 0
+
+    # -----------------------------------------------------------------
+
     def _update_link_jitter(self, peer_id: str, rtt_s: float) -> None:
         st = self._peer.setdefault(peer_id, PeerStats())
         st.rtt_samples.append(rtt_s)
@@ -314,7 +357,6 @@ class SyncModule:
             # Robust baseline RTT (median of window)
             xs_sorted = sorted(st.rtt_samples)
             st.rtt_baseline = self._quantile_sorted(xs_sorted, 0.50)
-
 
     def _weight_for_peer(self, peer_id: str) -> float:
         st = self._peer.get(peer_id)
@@ -505,11 +547,12 @@ class SyncModule:
         if (
                 self._storage is None
                 and self._telemetry_sink_ip is not None
-                and self._telemetry_ctx is not None
         ):
             async def _send_diag() -> None:
                 try:
-                    ctx = self._telemetry_ctx
+                    ctx = await self._ensure_telemetry_ctx()
+                    if ctx is None:
+                        return
 
                     # mesh_clock
                     mc = {
@@ -555,10 +598,24 @@ class SyncModule:
                         )
                         await asyncio.wait_for(ctx.request(req).response, timeout=self._coap_timeout)
 
+                    # Success: reset fail counter
+                    self._telemetry_fail_count = 0
+
                 except asyncio.TimeoutError:
-                    log.debug("[%s] telemetry diag timeout", self.node_id)
+                    self._telemetry_fail_count += 1
+                    log.debug("[%s] telemetry diag timeout (fail_count=%d)", self.node_id, self._telemetry_fail_count)
+                    if self._telemetry_fail_count >= 5:
+                        log.warning("[%s] telemetry context reset after %d failures", self.node_id,
+                                    self._telemetry_fail_count)
+                        await self._reset_telemetry_ctx()
                 except Exception as e:
-                    log.debug("[%s] telemetry diag failed: %s", self.node_id, type(e).__name__)
+                    self._telemetry_fail_count += 1
+                    log.debug("[%s] telemetry diag failed: %s (fail_count=%d)", self.node_id, type(e).__name__,
+                              self._telemetry_fail_count)
+                    if self._telemetry_fail_count >= 5:
+                        log.warning("[%s] telemetry context reset after %d failures", self.node_id,
+                                    self._telemetry_fail_count)
+                        await self._reset_telemetry_ctx()
 
             spawn_task(_send_diag(), f"{self.node_id}:telemetry:diag")
 
@@ -668,8 +725,6 @@ class SyncModule:
                     "t4_s": t4_s,
                     "weight": self._weight_for_peer(peer_id),
                 })
-
-
 
                 req = aiocoap.Message(
                     code=aiocoap.POST,
@@ -832,26 +887,41 @@ class SyncModule:
                         log.debug("[%s] mesh_clock tick insert failed: %s", self.node_id, e)
 
                 # telemetry (A/B -> C) if no local storage
-                elif self._telemetry_sink_ip is not None and self._telemetry_ctx is not None:
+                elif self._telemetry_sink_ip is not None:
                     try:
-                        mc = {
-                            "node_id": self.node_id,
-                            "t_wall_s": float(t_wall),
-                            "t_mono_s": float(t_mono),
-                            "t_mesh_s": float(t_mesh),
-                            "offset_s": float(self._offset),
-                            "err_mesh_vs_wall_s": float(err),
-                        }
-                        req = aiocoap.Message(
-                            code=aiocoap.POST,
-                            uri=f"coap://{self._telemetry_sink_ip}/relay/ingest/mesh_clock",
-                            payload=json.dumps(mc).encode("utf-8"),
-                        )
-                        await asyncio.wait_for(self._telemetry_ctx.request(req).response, timeout=self._coap_timeout)
+                        ctx = await self._ensure_telemetry_ctx()
+                        if ctx is not None:
+                            mc = {
+                                "node_id": self.node_id,
+                                "t_wall_s": float(t_wall),
+                                "t_mono_s": float(t_mono),
+                                "t_mesh_s": float(t_mesh),
+                                "offset_s": float(self._offset),
+                                "err_mesh_vs_wall_s": float(err),
+                            }
+                            req = aiocoap.Message(
+                                code=aiocoap.POST,
+                                uri=f"coap://{self._telemetry_sink_ip}/relay/ingest/mesh_clock",
+                                payload=json.dumps(mc).encode("utf-8"),
+                            )
+                            await asyncio.wait_for(ctx.request(req).response, timeout=self._coap_timeout)
+                            self._telemetry_fail_count = 0
                     except asyncio.TimeoutError:
-                        log.debug("[%s] mesh_clock tick telemetry timeout", self.node_id)
+                        self._telemetry_fail_count += 1
+                        log.debug("[%s] mesh_clock tick telemetry timeout (fail_count=%d)", self.node_id,
+                                  self._telemetry_fail_count)
+                        if self._telemetry_fail_count >= 5:
+                            log.warning("[%s] clock tick: telemetry context reset after %d failures", self.node_id,
+                                        self._telemetry_fail_count)
+                            await self._reset_telemetry_ctx()
                     except Exception as e:
-                        log.debug("[%s] mesh_clock tick telemetry failed: %s", self.node_id, type(e).__name__)
+                        self._telemetry_fail_count += 1
+                        log.debug("[%s] mesh_clock tick telemetry failed: %s (fail_count=%d)", self.node_id,
+                                  type(e).__name__, self._telemetry_fail_count)
+                        if self._telemetry_fail_count >= 5:
+                            log.warning("[%s] clock tick: telemetry context reset after %d failures", self.node_id,
+                                        self._telemetry_fail_count)
+                            await self._reset_telemetry_ctx()
 
                 await asyncio.sleep(self._base_interval)
 
@@ -907,6 +977,7 @@ class SyncModule:
             except Exception as e:
                 log.exception("[%s] Control loop error: %s", self.node_id, e)
                 await asyncio.sleep(1.0)
+
     # -----------------------------------------------------------------
     # ROBUST: Start/Stop
     # -----------------------------------------------------------------
@@ -916,8 +987,14 @@ class SyncModule:
         if self._measurement_queue is None:
             self._measurement_queue = asyncio.Queue()
 
-        # <-- DAS ist der wichtige Draht:
-        self._telemetry_ctx = telemetry_ctx
+        # Initialize lock for telemetry context
+        if self._telemetry_ctx_lock is None:
+            self._telemetry_ctx_lock = asyncio.Lock()
+
+        # DEPRECATED: External telemetry context is ignored
+        # We now manage our own context with self-healing
+        if telemetry_ctx is not None:
+            log.warning("[%s] External telemetry_ctx is deprecated and will be ignored", self.node_id)
 
         if IS_WINDOWS:
             log.info("[%s] Skipping workers (Windows)", self.node_id)
@@ -948,5 +1025,14 @@ class SyncModule:
         self._worker_tasks.clear()
         self._measurement_queue = None
         self._loop = None
+
+        # Properly shutdown telemetry context
+        if self._telemetry_ctx is not None:
+            try:
+                await self._telemetry_ctx.shutdown()
+                log.info("[%s] Shutdown telemetry context", self.node_id)
+            except Exception:
+                pass
         self._telemetry_ctx = None
+        self._telemetry_fail_count = 0
         self._last_kalman_diag = {}

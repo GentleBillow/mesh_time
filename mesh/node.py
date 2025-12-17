@@ -164,12 +164,9 @@ class MeshNode:
             await self._stop.wait()
             return
 
-        ctx = await self._ensure_client_ctx()
-        if ctx is None:
-            return
-
         try:
-            await self.sync.start(ctx)
+            # Sync module manages its own CoAP contexts (per-peer + telemetry)
+            await self.sync.start()
             await self._stop.wait()
         finally:
             await self.sync.stop()

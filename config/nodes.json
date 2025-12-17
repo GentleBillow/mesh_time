@@ -37,9 +37,9 @@
       }
     },
 
-    "ui_window_s": 300,
-    "ui_bin_s": 2,
-    "ui_max_points": 3000
+    "ui_window_s": 600,
+    "ui_bin_s": 1.5,
+    "ui_max_points": 6000
   },
 
   "A": {

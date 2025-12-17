@@ -108,6 +108,14 @@
                         },
                         tooltip: {
                             callbacks: {
+                                title: function(items) {
+                                    if (items.length > 0) {
+                                        const timestamp = items[0].parsed.x;
+                                        const date = new Date(timestamp * 1000);
+                                        return date.toLocaleString('de-DE');
+                                    }
+                                    return '';
+                                },
                                 label: function(context) {
                                     let label = context.dataset.label || '';
                                     if (label) label += ': ';
@@ -121,14 +129,14 @@
                     },
                     scales: {
                         x: {
-                            type: 'time',
-                            time: {
-                                unit: 'minute',
-                                displayFormats: {
-                                    minute: 'HH:mm'
+                            type: 'linear',
+                            ticks: {
+                                color: '#9ca3af',
+                                callback: function(value) {
+                                    const date = new Date(value * 1000);
+                                    return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
                                 }
                             },
-                            ticks: { color: '#9ca3af' },
                             grid: { color: '#374151' }
                         },
                         y: {
@@ -234,11 +242,14 @@
             document.getElementById('samples-info').textContent = stats.n_samples;
 
             // Update timeline chart
-            const timeLabels = timeseries.timestamps.map(t => new Date(t * 1000));
+            const timeLabels = timeseries.timestamps; // Use Unix timestamps directly
 
             const timeDatasets = ['A', 'B', 'C'].map(nid => ({
                 label: `Node ${nid}`,
-                data: timeseries.deviations[nid],
+                data: timeseries.timestamps.map((t, i) => ({
+                    x: t,
+                    y: timeseries.deviations[nid][i]
+                })),
                 borderColor: colors[nid].line,
                 backgroundColor: colors[nid].fill,
                 borderWidth: 2,
@@ -246,7 +257,6 @@
                 spanGaps: false
             }));
 
-            timelineChart.data.labels = timeLabels;
             timelineChart.data.datasets = timeDatasets;
             timelineChart.update('none');
 

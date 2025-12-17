@@ -42,11 +42,14 @@ DB_PATH  = ROOT_DIR / "mesh_data.sqlite"
 CFG_PATH = ROOT_DIR / "config" / "nodes.json"
 
 
+
+
 WINDOW_S_DEFAULT = 10 * 60.0
 SNAPSHOT_TTL_S = 1.0
 UI_MAX_POINTS_DEFAULT = 6000
 
-app = Flask(__name__)
+# In web_ui3_split.py ganz oben:
+app = Flask(__name__, template_folder='mesh/templates')  # ← anpassen!
 
 
 # ------------------------------------------------------------

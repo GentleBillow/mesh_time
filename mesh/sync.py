@@ -752,7 +752,7 @@ class SyncModule:
                 log.info("[%s] %s rtt=%.3fms theta=%.3fms", self.node_id, peer_id, rtt * 1000.0, theta * 1000.0)
 
                 # SUCCESS!
-                if st.state != "UP":
+                if st.state is not "UP":
                     log.info("[%s] Peer %s is UP", self.node_id, peer_id)
                     st.state = "UP"
 
@@ -780,17 +780,18 @@ class SyncModule:
 
             except asyncio.TimeoutError:
                 # EXPECTED wenn Peer down
-                if st.state != "DOWN":
-                    log.warning("[%s] Peer %s timeout", self.node_id, peer_id)
-                    st.state = "DOWN"
+                # FIX: Always log first failure (don't check st.state)
+                log.warning("[%s] Peer %s timeout (backoff=%.1fs)", self.node_id, peer_id, backoff)
+                st.state = "DOWN"
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self._max_backoff)
 
             except Exception as e:
                 # Network error, parse error, etc.
-                if st.state != "DOWN":
-                    log.warning("[%s] Peer %s error: %s", self.node_id, peer_id, type(e).__name__)
-                    st.state = "DOWN"
+                # FIX: Always log errors (including Connection Refused)
+                log.warning("[%s] Peer %s error: %s (backoff=%.1fs)",
+                            self.node_id, peer_id, type(e).__name__, backoff)
+                st.state = "DOWN"
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self._max_backoff)
 

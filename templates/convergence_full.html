@@ -114,6 +114,46 @@
             </div>
         </div>
         
+        <!-- CATEGORY 4: Kalman Filter Internals -->
+        <div class="bg-gray-800 rounded-lg p-6 mb-8">
+            <h2 class="text-2xl font-bold mb-6 flex items-center">
+                <span class="text-3xl mr-3">🔬</span>
+                Kalman Filter Internals
+            </h2>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">1) Kalman State (Offset, Drift)</h3>
+                    <canvas id="kalman-state-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">2) Kalman Covariance (P)</h3>
+                    <canvas id="kalman-cov-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">3) Innovation (Residuals)</h3>
+                    <canvas id="kalman-innov-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">4) NIS (Normalized Innovation Squared)</h3>
+                    <canvas id="kalman-nis-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">5) Effective Measurement Noise (R)</h3>
+                    <canvas id="kalman-r-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">6) Controller Slew Detail</h3>
+                    <canvas id="kalman-slew-chart"></canvas>
+                </div>
+            </div>
+        </div>
+        
         <!-- Footer Info -->
         <div class="text-center text-sm text-gray-500">
             <span id="update-info">Updating...</span> | 
@@ -215,6 +255,43 @@
                 type: 'bar',
                 data: {labels: ['A', 'B', 'C'], datasets: []},
                 options: {...baseOptions, scales: {...baseOptions.scales, x: {ticks: {color: '#9ca3af'}, grid: {color: '#374151'}}, y: {...baseOptions.scales.y, title: {display: true, text: 'Clip Rate (%)', color: '#9ca3af'}}}, plugins: {legend: {display: false}}}
+            });
+            
+            // Kalman Filter Internals charts
+            charts.kalmanState = new Chart(document.getElementById('kalman-state-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'x_offset (ms)', color: '#9ca3af'}}, y2: {type: 'linear', position: 'right', grid: {drawOnChartArea: false}, ticks: {color: '#9ca3af'}, title: {display: true, text: 'x_drift (ppm)', color: '#9ca3af'}}}}
+            });
+            
+            charts.kalmanCov = new Chart(document.getElementById('kalman-cov-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {type: 'logarithmic', ticks: {color: '#9ca3af'}, grid: {color: '#374151'}, title: {display: true, text: 'p_offset (ms²)', color: '#9ca3af'}}, y2: {type: 'logarithmic', position: 'right', grid: {drawOnChartArea: false}, ticks: {color: '#9ca3af'}, title: {display: true, text: 'p_drift (ppm²)', color: '#9ca3af'}}}}
+            });
+            
+            charts.kalmanInnov = new Chart(document.getElementById('kalman-innov-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Innovation (ms)', color: '#9ca3af'}}}}
+            });
+            
+            charts.kalmanNIS = new Chart(document.getElementById('kalman-nis-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'NIS', color: '#9ca3af'}}}}
+            });
+            
+            charts.kalmanR = new Chart(document.getElementById('kalman-r-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {type: 'logarithmic', ticks: {color: '#9ca3af'}, grid: {color: '#374151'}, title: {display: true, text: 'r_eff (ms²)', color: '#9ca3af'}}}}
+            });
+            
+            charts.kalmanSlew = new Chart(document.getElementById('kalman-slew-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Δ (ms)', color: '#9ca3af'}}}}
             });
         }
         
@@ -385,13 +462,204 @@
             charts.controllerClip.update('none');
         }
         
+        // Update Kalman Filter Internals charts
+        async function updateKalman() {
+            // Chart 1: State (offset, drift)
+            const stateData = await fetch('/api/kalman/state').then(r => r.json());
+            const stateDatasets = [];
+            ['A', 'B', 'C'].forEach(nid => {
+                const nodeData = stateData.data[nid];
+                stateDatasets.push({
+                    label: `${nid} x_offset`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.x_offset_ms[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    yAxisID: 'y',
+                    spanGaps: false
+                });
+                stateDatasets.push({
+                    label: `${nid} x_drift`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.x_drift_ppm[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    borderDash: [5, 5],
+                    yAxisID: 'y2',
+                    spanGaps: false
+                });
+            });
+            charts.kalmanState.data.datasets = stateDatasets;
+            charts.kalmanState.update('none');
+            
+            // Chart 2: Covariance (P)
+            const covData = await fetch('/api/kalman/covariance').then(r => r.json());
+            const covDatasets = [];
+            ['A', 'B', 'C'].forEach(nid => {
+                const nodeData = covData.data[nid];
+                covDatasets.push({
+                    label: `${nid} p_offset`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.p_offset_ms2[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    yAxisID: 'y',
+                    spanGaps: false
+                });
+                covDatasets.push({
+                    label: `${nid} p_drift`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.p_drift_ppm2[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    borderDash: [5, 5],
+                    yAxisID: 'y2',
+                    spanGaps: false
+                });
+            });
+            charts.kalmanCov.data.datasets = covDatasets;
+            charts.kalmanCov.update('none');
+            
+            // Chart 3: Innovation
+            const innovData = await fetch('/api/kalman/innovation').then(r => r.json());
+            const innovDatasets = [];
+            ['A', 'B', 'C'].forEach(nid => {
+                const nodeData = innovData.data[nid];
+                innovDatasets.push({
+                    label: `${nid} innov_med`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.innov_med_ms[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                });
+                innovDatasets.push({
+                    label: `${nid} innov_p95`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.innov_p95_ms[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    borderDash: [5, 5],
+                    spanGaps: false
+                });
+            });
+            charts.kalmanInnov.data.datasets = innovDatasets;
+            charts.kalmanInnov.update('none');
+            
+            // Chart 4: NIS
+            const nisData = await fetch('/api/kalman/nis').then(r => r.json());
+            const nisDatasets = [];
+            ['A', 'B', 'C'].forEach(nid => {
+                const nodeData = nisData.data[nid];
+                nisDatasets.push({
+                    label: `${nid} nis_med`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.nis_med[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                });
+                nisDatasets.push({
+                    label: `${nid} nis_p95`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.nis_p95[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    borderDash: [5, 5],
+                    spanGaps: false
+                });
+            });
+            charts.kalmanNIS.data.datasets = nisDatasets;
+            charts.kalmanNIS.update('none');
+            
+            // Chart 5: Effective R
+            const rData = await fetch('/api/kalman/r_eff').then(r => r.json());
+            const rDatasets = [];
+            ['A', 'B', 'C'].forEach(nid => {
+                const nodeData = rData.data[nid];
+                rDatasets.push({
+                    label: `${nid} r_eff`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.r_eff_ms2[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                });
+            });
+            charts.kalmanR.data.datasets = rDatasets;
+            charts.kalmanR.update('none');
+            
+            // Chart 6: Slew detail (reuse controller data)
+            const ctrlData = await fetch('/api/controller').then(r => r.json());
+            const slewDatasets = [];
+            ['A', 'B', 'C'].forEach(nid => {
+                const nodeData = ctrlData.timeseries[nid];
+                
+                // Desired (dashed)
+                slewDatasets.push({
+                    label: `${nid} desired`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.desired[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    borderDash: [5, 5],
+                    spanGaps: false
+                });
+                
+                // Applied (solid)
+                slewDatasets.push({
+                    label: `${nid} applied`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.applied[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                });
+                
+                // Clipped markers (scatter)
+                const clippedPoints = [];
+                nodeData.timestamps.forEach((t, i) => {
+                    if (nodeData.clipped[i] === 1) {
+                        const y = nodeData.applied[i] !== null ? nodeData.applied[i] : nodeData.desired[i];
+                        if (y !== null) clippedPoints.push({x: t, y: y});
+                    }
+                });
+                
+                if (clippedPoints.length > 0) {
+                    slewDatasets.push({
+                        label: `${nid} clipped`,
+                        data: clippedPoints,
+                        type: 'scatter',
+                        borderColor: colors[nid].line,
+                        backgroundColor: colors[nid].line,
+                        pointRadius: 4,
+                        pointHoverRadius: 6
+                    });
+                }
+            });
+            charts.kalmanSlew.data.datasets = slewDatasets;
+            charts.kalmanSlew.update('none');
+        }
+        
         // Main refresh function
         async function refresh() {
             try {
                 await Promise.all([
                     updateSync(),
                     updateLinks(),
-                    updateController()
+                    updateController(),
+                    updateKalman()
                 ]);
                 
                 const now = new Date().toLocaleTimeString('de-DE');

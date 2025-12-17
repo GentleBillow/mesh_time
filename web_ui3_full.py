@@ -439,6 +439,143 @@ def api_controller():
 
 
 # ============================================================================
+# Category 4: Kalman Filter Internals (Detailed Diagnostics)
+# ============================================================================
+
+def load_kalman_diagnostics(db_path: str, window_s: float) -> Dict:
+    """Load detailed Kalman filter diagnostic data."""
+    cutoff = time.time() - window_s
+    node_data = {nid: [] for nid in NODE_IDS}
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT created_at_s, node_id,
+                   x_offset_ms, x_drift_ppm,
+                   p_offset_ms2, p_drift_ppm2,
+                   innov_med_ms, innov_p95_ms,
+                   nis_med, nis_p95,
+                   r_eff_ms2
+            FROM diag_kalman
+            WHERE created_at_s > ?
+            ORDER BY created_at_s ASC
+        """
+        
+        cursor.execute(query, (cutoff,))
+        rows = cursor.fetchall()
+        
+        for row in rows:
+            t, node_id, x_offset, x_drift, p_offset, p_drift, \
+                innov_med, innov_p95, nis_med, nis_p95, r_eff = row
+            
+            if node_id in node_data:
+                node_data[node_id].append({
+                    't': float(t),
+                    'x_offset_ms': float(x_offset) if x_offset is not None else None,
+                    'x_drift_ppm': float(x_drift) if x_drift is not None else None,
+                    'p_offset_ms2': float(p_offset) if p_offset is not None else None,
+                    'p_drift_ppm2': float(p_drift) if p_drift is not None else None,
+                    'innov_med_ms': float(innov_med) if innov_med is not None else None,
+                    'innov_p95_ms': float(innov_p95) if innov_p95 is not None else None,
+                    'nis_med': float(nis_med) if nis_med is not None else None,
+                    'nis_p95': float(nis_p95) if nis_p95 is not None else None,
+                    'r_eff_ms2': float(r_eff) if r_eff is not None else None
+                })
+        
+        conn.close()
+    except Exception as e:
+        print(f"[kalman_diagnostics] Error: {e}")
+    
+    return node_data
+
+
+@app.route('/api/kalman/state')
+def api_kalman_state():
+    """Kalman state: x_offset, x_drift."""
+    node_data = load_kalman_diagnostics(str(DB_PATH), DEFAULT_WINDOW_S)
+    
+    result = {}
+    for nid in NODE_IDS:
+        data = node_data[nid]
+        result[nid] = {
+            'timestamps': [d['t'] for d in data],
+            'x_offset_ms': [d['x_offset_ms'] for d in data],
+            'x_drift_ppm': [d['x_drift_ppm'] for d in data]
+        }
+    
+    return jsonify({'data': result, 'colors': NODE_COLORS})
+
+
+@app.route('/api/kalman/covariance')
+def api_kalman_covariance():
+    """Kalman covariance: P_offset, P_drift."""
+    node_data = load_kalman_diagnostics(str(DB_PATH), DEFAULT_WINDOW_S)
+    
+    result = {}
+    for nid in NODE_IDS:
+        data = node_data[nid]
+        result[nid] = {
+            'timestamps': [d['t'] for d in data],
+            'p_offset_ms2': [d['p_offset_ms2'] for d in data],
+            'p_drift_ppm2': [d['p_drift_ppm2'] for d in data]
+        }
+    
+    return jsonify({'data': result, 'colors': NODE_COLORS})
+
+
+@app.route('/api/kalman/innovation')
+def api_kalman_innovation():
+    """Innovation: median and p95."""
+    node_data = load_kalman_diagnostics(str(DB_PATH), DEFAULT_WINDOW_S)
+    
+    result = {}
+    for nid in NODE_IDS:
+        data = node_data[nid]
+        result[nid] = {
+            'timestamps': [d['t'] for d in data],
+            'innov_med_ms': [d['innov_med_ms'] for d in data],
+            'innov_p95_ms': [d['innov_p95_ms'] for d in data]
+        }
+    
+    return jsonify({'data': result, 'colors': NODE_COLORS})
+
+
+@app.route('/api/kalman/nis')
+def api_kalman_nis():
+    """NIS (Normalized Innovation Squared): median and p95."""
+    node_data = load_kalman_diagnostics(str(DB_PATH), DEFAULT_WINDOW_S)
+    
+    result = {}
+    for nid in NODE_IDS:
+        data = node_data[nid]
+        result[nid] = {
+            'timestamps': [d['t'] for d in data],
+            'nis_med': [d['nis_med'] for d in data],
+            'nis_p95': [d['nis_p95'] for d in data]
+        }
+    
+    return jsonify({'data': result, 'colors': NODE_COLORS})
+
+
+@app.route('/api/kalman/r_eff')
+def api_kalman_r_eff():
+    """Effective measurement noise R."""
+    node_data = load_kalman_diagnostics(str(DB_PATH), DEFAULT_WINDOW_S)
+    
+    result = {}
+    for nid in NODE_IDS:
+        data = node_data[nid]
+        result[nid] = {
+            'timestamps': [d['t'] for d in data],
+            'r_eff_ms2': [d['r_eff_ms2'] for d in data]
+        }
+    
+    return jsonify({'data': result, 'colors': NODE_COLORS})
+
+
+# ============================================================================
 # Routes
 # ============================================================================
 

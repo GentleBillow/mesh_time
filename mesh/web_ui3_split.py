@@ -14,6 +14,10 @@
 
 from __future__ import annotations
 
+import threading
+_snapshot_lock = threading.Lock()
+
+
 import json
 import sqlite3
 import time
@@ -40,6 +44,7 @@ CFG_PATH = ROOT_DIR / "config" / "nodes.json"
 
 WINDOW_S_DEFAULT = 10 * 60.0
 SNAPSHOT_TTL_S = 1.0
+UI_MAX_POINTS_DEFAULT = 6000
 
 app = Flask(__name__)
 
@@ -159,13 +164,15 @@ def _get_window_s() -> float:
 def load_snapshot(window_s: float) -> Snapshot:
     now = time.time()
 
-    cached = _snapshot_cache["data"]
-    if (
-        cached is not None
-        and _snapshot_cache["window_s"] == window_s
-        and (now - _snapshot_cache["ts"] < SNAPSHOT_TTL_S)
-    ):
-        return cached
+
+    with _snapshot_lock:
+        cached = _snapshot_cache["data"]
+        if (
+            cached is not None
+            and _snapshot_cache["window_s"] == window_s
+            and (now - _snapshot_cache["ts"] < SNAPSHOT_TTL_S)
+        ):
+            return cached
 
     t_min = now - window_s
 
@@ -188,6 +195,8 @@ def load_snapshot(window_s: float) -> Snapshot:
             has_c = table_exists(conn, "diag_controller")
 
             if has_k:
+                max_points = UI_MAX_POINTS_DEFAULT
+
                 k_rows = conn.execute(
                     """
                     SELECT created_at_s AS created_at, node_id,
@@ -198,17 +207,19 @@ def load_snapshot(window_s: float) -> Snapshot:
                            r_eff_ms2
                     FROM diag_kalman
                     WHERE created_at_s >= ?
-                    ORDER BY created_at_s ASC
-
+                    ORDER BY created_at_s DESC
+                    LIMIT ?
                     """,
-                    (t_min,),
-                ).fetchall()
+                    (t_min, max_points),
+                ).fetchall()[::-1]  # reverse back to ascending
 
                 for r in k_rows:
                     nid = str(r["node_id"])
                     kalman_rows_by_node.setdefault(nid, []).append(r)
 
             if has_c:
+                max_points = UI_MAX_POINTS_DEFAULT
+
                 c_rows = conn.execute(
                     """
                     SELECT created_at_s AS created_at, node_id,
@@ -216,10 +227,11 @@ def load_snapshot(window_s: float) -> Snapshot:
                            slew_clipped
                     FROM diag_controller
                     WHERE created_at_s >= ?
-                    ORDER BY created_at_s ASC
+                    ORDER BY created_at_s DESC
+                    LIMIT ?
                     """,
-                    (t_min,),
-                ).fetchall()
+                    (t_min, max_points),
+                ).fetchall()[::-1]
 
                 for r in c_rows:
                     nid = str(r["node_id"])
@@ -418,4 +430,4 @@ def api_controller_slew():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)

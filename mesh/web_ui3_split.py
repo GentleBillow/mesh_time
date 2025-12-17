@@ -49,7 +49,7 @@ SNAPSHOT_TTL_S = 1.0
 UI_MAX_POINTS_DEFAULT = 6000
 
 # In web_ui3_split.py ganz oben:
-app = Flask(__name__, template_folder='mesh/templates')  # ← anpassen!
+app = Flask(__name__, template_folder=str(ROOT_DIR / "templates"))
 
 
 # ------------------------------------------------------------

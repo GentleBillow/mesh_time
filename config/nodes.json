@@ -11,27 +11,28 @@
 
     "min_beacons_for_warmup": 25,
     "min_samples_before_log": 10,
-
     "log_before_warmup": true,
 
     "jitter_window": 60,
     "min_samples_for_jitter": 25,
-    "max_weight": 30000.0,
+
+    "max_weight": 5000.0,
 
     "kalman": {
       "use_offset_gauge": true,
-      "r_offset_gauge": 25,
+      "r_offset_gauge": 4,
 
-      "use_bias_gauge": true,
+      "use_bias_gauge": false,
       "r_bias_gauge": 1e-2,
 
-      "q_offset": 10e-9,
-      "q_drift": 3e-15,
-      "q_bias": 3e-8,
-      "r_base": 2e-4,
+      "q_offset": 1e-7,
+      "q_drift": 1e-13,
+      "q_bias": 3e-9,
+
+      "r_base": 5e-3,
 
       "adaptive_r": {
-        "R_min": 1e-5,
+        "R_min": 1e-6,
         "c_rtt": 1
       }
     },

@@ -505,7 +505,7 @@ class SyncModule:
         if (
                 self._storage is None
                 and self._telemetry_sink_ip is not None
-                and getattr(self, "_client_ctx", None) is not None
+                and self._telemetry_ctx is not None
         ):
             async def _send_diag() -> None:
                 try:

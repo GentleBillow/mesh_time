@@ -54,7 +54,7 @@
   "C": {
     "ip": "192.168.178.49",
     "parent": null,
-    "telemetry_sink": null,
+    "telemetry_sink": "C",
     "neighbors": ["A", "B"],
     "sensor_type": "potentiometer",
     "led_pin": 5,

@@ -133,13 +133,26 @@ class KalmanController:
         noise_fn: Optional[NoiseFn] = None,
     ) -> float:
 
-        if not measurements:
-            return 0.0
-
         innov_ms_list: List[float] = []
         nis_list: List[float] = []
         r_list_ms2: List[float] = []
         n_meas = 0
+
+        if not measurements:
+            # Setze _last_diag mit leeren/None Werten
+            self._last_diag = {
+                "n_meas": 0,
+                "innov_med_ms": None,
+                "innov_p95_ms": None,
+                "nis_med": None,
+                "nis_p95": None,
+                "r_eff_ms2": None,
+                "x_offset_ms": float(self._x[0, 0] * 1000.0) if self._x is not None else None,
+                "x_drift_ppm": float(self._x[1, 0] * 1e6) if self._x is not None else None,
+                "p_offset_ms2": float(self._P[0, 0] * 1e6) if self._P is not None else None,
+                "p_drift_ppm2": float(self._P[1, 1] * 1e12) if self._P is not None else None,
+            }
+            return 0.0
 
         peers = [m[0] for m in measurements]
         self._ensure_state(peers)

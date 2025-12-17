@@ -321,7 +321,7 @@
                 })),
                 borderColor: colors[nid].line,
                 backgroundColor: colors[nid].fill,
-                borderWidth: 2,
+                borderWidth: 1,
                 pointRadius: 0,
                 spanGaps: false
             }));
@@ -359,7 +359,7 @@
                     data: linkData.timestamps.map((t, i) => ({x: t, y: linkData.rtt[i]})),
                     borderColor: linkColors[linkId].line,
                     backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 };
@@ -376,7 +376,7 @@
                     data: linkData.timestamps.map((t, i) => ({x: t, y: linkData.asymmetry[i]})),
                     borderColor: linkColors[linkId].line,
                     backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 };
@@ -393,7 +393,7 @@
                     data: jitterData.timestamps.map((t, i) => ({x: t, y: jitterData.jitter[i]})),
                     borderColor: linkColors[linkId].line,
                     backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 };
@@ -410,7 +410,7 @@
                 data: avgRtts,
                 backgroundColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].fill),
                 borderColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].line),
-                borderWidth: 2
+                borderWidth: 1
             }];
             charts.stats.update('none');
         }
@@ -429,7 +429,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.desired[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     borderDash: [5, 5],
                     spanGaps: false
@@ -440,7 +440,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.applied[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 });
@@ -457,7 +457,7 @@
                 data: clipRates,
                 backgroundColor: ['A', 'B', 'C'].map(nid => colors[nid].fill),
                 borderColor: ['A', 'B', 'C'].map(nid => colors[nid].line),
-                borderWidth: 2
+                borderWidth: 1
             }];
             charts.controllerClip.update('none');
         }
@@ -474,7 +474,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.x_offset_ms[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     yAxisID: 'y',
                     spanGaps: false
@@ -504,7 +504,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.p_offset_ms2[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     yAxisID: 'y',
                     spanGaps: false
@@ -534,7 +534,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.innov_med_ms[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 });
@@ -562,7 +562,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.nis_med[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 });
@@ -590,7 +590,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.r_eff_ms2[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 });
@@ -622,7 +622,7 @@
                     data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.applied[i]})),
                     borderColor: colors[nid].line,
                     backgroundColor: colors[nid].fill,
-                    borderWidth: 2,
+                    borderWidth: 1,
                     pointRadius: 0,
                     spanGaps: false
                 });

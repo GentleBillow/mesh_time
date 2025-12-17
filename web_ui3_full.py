@@ -25,15 +25,15 @@ DEFAULT_WINDOW_S = 600.0
 NODE_IDS = ['A', 'B', 'C']
 
 NODE_COLORS = {
-    'A': {'line': 'rgb(255, 0, 0)', 'fill': 'rgba(255, 0, 0, 0.6)'},
-    'B': {'line': 'rgb(0, 255, 0)', 'fill': 'rgba(0, 255, 0, 0.6)'},
-    'C': {'line': 'rgb(0, 0, 255)', 'fill': 'rgba(0, 0, 255, 0.6)'},
+    'A': {'line': 'rgb(200, 50, 50)', 'fill': 'rgba(200, 50, 50, 0.3)'},
+    'B': {'line': 'rgb(50, 180, 50)', 'fill': 'rgba(50, 180, 50, 0.3)'},
+    'C': {'line': 'rgb(50, 100, 200)', 'fill': 'rgba(50, 100, 200, 0.3)'},
 }
 
 LINK_COLORS = {
-    'A-B': {'line': 'rgb(255, 255, 0)', 'fill': 'rgba(255, 255, 0, 0.6)'},
-    'A-C': {'line': 'rgb(255, 0, 255)', 'fill': 'rgba(255, 0, 255, 0.6)'},
-    'B-C': {'line': 'rgb(0, 255, 255)', 'fill': 'rgba(0, 255, 255, 0.6)'},
+    'A-B': {'line': 'rgb(200, 180, 0)', 'fill': 'rgba(200, 180, 0, 0.3)'},
+    'A-C': {'line': 'rgb(180, 50, 180)', 'fill': 'rgba(180, 50, 180, 0.3)'},
+    'B-C': {'line': 'rgb(0, 160, 160)', 'fill': 'rgba(0, 160, 160, 0.3)'},
 }
 
 app = Flask(__name__, template_folder=str(ROOT_DIR / "templates"))

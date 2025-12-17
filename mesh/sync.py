@@ -911,13 +911,13 @@ class SyncModule:
     # ROBUST: Start/Stop
     # -----------------------------------------------------------------
 
-    async def start(self, client_ctx: Optional[aiocoap.Context] = None) -> None:
+    async def start(self, telemetry_ctx: Optional[aiocoap.Context] = None) -> None:
         self._loop = asyncio.get_running_loop()
         if self._measurement_queue is None:
             self._measurement_queue = asyncio.Queue()
 
-        # <<< WICHTIG: Context für Telemetrie merken >>>
-        self._client_ctx = client_ctx
+        # <-- DAS ist der wichtige Draht:
+        self._telemetry_ctx = telemetry_ctx
 
         if IS_WINDOWS:
             log.info("[%s] Skipping workers (Windows)", self.node_id)

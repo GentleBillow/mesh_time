@@ -749,6 +749,8 @@ class SyncModule:
                 rtt = (t4 - t1) - (t3 - t2)
                 theta = ((t2 - t1) + (t3 - t4)) / 2.0
 
+                log.info("[%s] %s rtt=%.3fms theta=%.3fms", self.node_id, peer_id, rtt * 1000.0, theta * 1000.0)
+
                 # SUCCESS!
                 if st.state != "UP":
                     log.info("[%s] Peer %s is UP", self.node_id, peer_id)

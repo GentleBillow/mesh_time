@@ -700,7 +700,10 @@ HTML = r"""
     .kpi .k { font-size: 11px; color:#9fb0c0; }
     .kpi .v { font-size: 16px; font-weight: 700; margin-top: 2px; }
     .kpi .s { font-size: 11px; color:#9fb0c0; margin-top: 2px; }
-    canvas { width: 100% !important; height: 240px !important; }
+    canvas { display:block; width:100%; height:100%; }
+    .chartBox { height: 240px; }
+    .chartBox.small { height: 190px; }
+    .chartBox.tiny  { height: 160px; }
     .small canvas { height: 190px !important; }
     .tiny canvas { height: 160px !important; }
     .row { display:flex; gap:12px; }

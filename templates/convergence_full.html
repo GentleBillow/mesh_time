@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MeshTime Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body class="bg-gray-900 text-gray-100">
+    
+    <div class="container mx-auto p-6 max-w-7xl">
+        
+        <!-- Header -->
+        <div class="mb-8">
+            <h1 class="text-4xl font-bold mb-2">MeshTime Dashboard</h1>
+            <p class="text-gray-400">Real-time synchronization, link quality, and controller analysis</p>
+        </div>
+        
+        <!-- Status Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+            <div class="bg-gray-800 rounded-lg p-4">
+                <div class="text-sm text-gray-400 mb-1">Sync Quality</div>
+                <div id="stat-quality" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">max deviation (ms)</div>
+            </div>
+            
+            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-red-500">
+                <div class="text-sm text-gray-400 mb-1">Node A</div>
+                <div id="stat-a" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">current deviation (ms)</div>
+            </div>
+            
+            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-green-500">
+                <div class="text-sm text-gray-400 mb-1">Node B</div>
+                <div id="stat-b" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">current deviation (ms)</div>
+            </div>
+            
+            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-blue-500">
+                <div class="text-sm text-gray-400 mb-1">Node C</div>
+                <div id="stat-c" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">current deviation (ms)</div>
+            </div>
+        </div>
+        
+        <!-- CATEGORY 1: Synchronization Quality -->
+        <div class="bg-gray-800 rounded-lg p-6 mb-8">
+            <h2 class="text-2xl font-bold mb-6 flex items-center">
+                <span class="text-3xl mr-3">📊</span>
+                Synchronization Quality
+            </h2>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">Convergence Timeline</h3>
+                    <canvas id="convergence-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">Deviation Distribution</h3>
+                    <canvas id="histogram-chart"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <!-- CATEGORY 2: Link Quality Metrics -->
+        <div class="bg-gray-800 rounded-lg p-6 mb-8">
+            <h2 class="text-2xl font-bold mb-6 flex items-center">
+                <span class="text-3xl mr-3">🔗</span>
+                Link Quality Metrics
+            </h2>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">RTT Timeline</h3>
+                    <canvas id="rtt-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">Link Asymmetry</h3>
+                    <canvas id="asymmetry-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">Jitter (Rolling Std)</h3>
+                    <canvas id="jitter-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">Link Statistics</h3>
+                    <canvas id="stats-chart"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <!-- CATEGORY 3: Controller Diagnostics -->
+        <div class="bg-gray-800 rounded-lg p-6 mb-8">
+            <h2 class="text-2xl font-bold mb-6 flex items-center">
+                <span class="text-3xl mr-3">⚙️</span>
+                Controller Diagnostics
+            </h2>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">Desired vs Applied Δ</h3>
+                    <canvas id="controller-delta-chart"></canvas>
+                </div>
+                
+                <div>
+                    <h3 class="text-lg font-semibold mb-3">Slew Clipping Rate</h3>
+                    <canvas id="controller-clip-chart"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Footer Info -->
+        <div class="text-center text-sm text-gray-500">
+            <span id="update-info">Updating...</span> | 
+            Window: 600s | 
+            Last update: <span id="time-info">--</span>
+        </div>
+        
+    </div>
+    
+    <script>
+        let charts = {};
+        
+        // Color schemes
+        const colors = {
+            'A': {line: 'rgb(255, 0, 0)', fill: 'rgba(255, 0, 0, 0.6)'},
+            'B': {line: 'rgb(0, 255, 0)', fill: 'rgba(0, 255, 0, 0.6)'},
+            'C': {line: 'rgb(0, 0, 255)', fill: 'rgba(0, 0, 255, 0.6)'}
+        };
+        
+        const linkColors = {
+            'A-B': {line: 'rgb(255, 255, 0)', fill: 'rgba(255, 255, 0, 0.6)'},
+            'A-C': {line: 'rgb(255, 0, 255)', fill: 'rgba(255, 0, 255, 0.6)'},
+            'B-C': {line: 'rgb(0, 255, 255)', fill: 'rgba(0, 255, 255, 0.6)'}
+        };
+        
+        // Chart.js base config
+        const baseOptions = {
+            responsive: true,
+            maintainAspectRatio: true,
+            aspectRatio: 2,
+            animation: false,
+            scales: {
+                x: {
+                    type: 'linear',
+                    ticks: { 
+                        color: '#9ca3af',
+                        callback: function(value) {
+                            const date = new Date(value * 1000);
+                            return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
+                        }
+                    },
+                    grid: { color: '#374151' }
+                },
+                y: {
+                    ticks: { color: '#9ca3af' },
+                    grid: { color: '#374151' }
+                }
+            },
+            plugins: {
+                legend: { labels: { color: '#9ca3af' } }
+            }
+        };
+        
+        // Initialize all charts
+        function initCharts() {
+            charts.convergence = new Chart(document.getElementById('convergence-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Deviation (ms)', color: '#9ca3af'}}}}
+            });
+            
+            charts.histogram = new Chart(document.getElementById('histogram-chart'), {
+                type: 'bar',
+                data: {labels: [], datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, x: {ticks: {color: '#9ca3af'}, grid: {color: '#374151'}, title: {display: true, text: 'Deviation (ms)', color: '#9ca3af'}}, y: {...baseOptions.scales.y, title: {display: true, text: 'Count', color: '#9ca3af'}}}}
+            });
+            
+            charts.rtt = new Chart(document.getElementById('rtt-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'RTT (ms)', color: '#9ca3af'}}}}
+            });
+            
+            charts.asymmetry = new Chart(document.getElementById('asymmetry-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Asymmetry (ms)', color: '#9ca3af'}}}}
+            });
+            
+            charts.jitter = new Chart(document.getElementById('jitter-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Jitter (ms)', color: '#9ca3af'}}}}
+            });
+            
+            charts.stats = new Chart(document.getElementById('stats-chart'), {
+                type: 'bar',
+                data: {labels: ['A-B', 'A-C', 'B-C'], datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, x: {ticks: {color: '#9ca3af'}, grid: {color: '#374151'}}, y: {...baseOptions.scales.y, title: {display: true, text: 'Avg RTT (ms)', color: '#9ca3af'}}}, plugins: {legend: {display: false}}}
+            });
+            
+            charts.controllerDelta = new Chart(document.getElementById('controller-delta-chart'), {
+                type: 'line',
+                data: {datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Δ (ms)', color: '#9ca3af'}}}}
+            });
+            
+            charts.controllerClip = new Chart(document.getElementById('controller-clip-chart'), {
+                type: 'bar',
+                data: {labels: ['A', 'B', 'C'], datasets: []},
+                options: {...baseOptions, scales: {...baseOptions.scales, x: {ticks: {color: '#9ca3af'}, grid: {color: '#374151'}}, y: {...baseOptions.scales.y, title: {display: true, text: 'Clip Rate (%)', color: '#9ca3af'}}}, plugins: {legend: {display: false}}}
+            });
+        }
+        
+        // Update sync quality charts
+        async function updateSync() {
+            const data = await fetch('/api/sync').then(r => r.json());
+            
+            // Update stats cards
+            document.getElementById('stat-quality').textContent = 
+                data.stats.max_abs_ms ? data.stats.max_abs_ms.toFixed(3) : '--';
+            
+            ['A', 'B', 'C'].forEach(nid => {
+                const elem = document.getElementById(`stat-${nid.toLowerCase()}`);
+                if (data.stats.nodes[nid] && data.stats.nodes[nid].current_ms !== null) {
+                    elem.textContent = data.stats.nodes[nid].current_ms.toFixed(3);
+                } else {
+                    elem.textContent = '--';
+                }
+            });
+            
+            // Convergence timeline
+            const timeDatasets = ['A', 'B', 'C'].map(nid => ({
+                label: `Node ${nid}`,
+                data: data.timeseries.timestamps.map((t, i) => ({
+                    x: t,
+                    y: data.timeseries.deviations[nid][i]
+                })),
+                borderColor: colors[nid].line,
+                backgroundColor: colors[nid].fill,
+                borderWidth: 2,
+                pointRadius: 0,
+                spanGaps: false
+            }));
+            
+            charts.convergence.data.datasets = timeDatasets;
+            charts.convergence.update('none');
+            
+            // Histogram
+            const binCenters = data.histogram.bin_edges.slice(0, -1).map((edge, i) => 
+                ((edge + data.histogram.bin_edges[i + 1]) / 2).toFixed(2)
+            );
+            
+            const histDatasets = ['A', 'B', 'C'].map(nid => ({
+                label: `Node ${nid}`,
+                data: data.histogram.counts[nid],
+                backgroundColor: colors[nid].fill,
+                borderColor: colors[nid].line,
+                borderWidth: 1
+            }));
+            
+            charts.histogram.data.labels = binCenters;
+            charts.histogram.data.datasets = histDatasets;
+            charts.histogram.update('none');
+        }
+        
+        // Update link quality charts
+        async function updateLinks() {
+            const data = await fetch('/api/links').then(r => r.json());
+            
+            // RTT chart
+            const rttDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
+                const linkData = data.timeseries[linkId];
+                return {
+                    label: linkId,
+                    data: linkData.timestamps.map((t, i) => ({x: t, y: linkData.rtt[i]})),
+                    borderColor: linkColors[linkId].line,
+                    backgroundColor: linkColors[linkId].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                };
+            });
+            
+            charts.rtt.data.datasets = rttDatasets;
+            charts.rtt.update('none');
+            
+            // Asymmetry chart
+            const asymDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
+                const linkData = data.timeseries[linkId];
+                return {
+                    label: linkId,
+                    data: linkData.timestamps.map((t, i) => ({x: t, y: linkData.asymmetry[i]})),
+                    borderColor: linkColors[linkId].line,
+                    backgroundColor: linkColors[linkId].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                };
+            });
+            
+            charts.asymmetry.data.datasets = asymDatasets;
+            charts.asymmetry.update('none');
+            
+            // Jitter chart
+            const jitterDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
+                const jitterData = data.jitter[linkId];
+                return {
+                    label: linkId,
+                    data: jitterData.timestamps.map((t, i) => ({x: t, y: jitterData.jitter[i]})),
+                    borderColor: linkColors[linkId].line,
+                    backgroundColor: linkColors[linkId].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                };
+            });
+            
+            charts.jitter.data.datasets = jitterDatasets;
+            charts.jitter.update('none');
+            
+            // Stats chart
+            const avgRtts = ['A-B', 'A-C', 'B-C'].map(linkId => data.stats[linkId].avg_rtt);
+            
+            charts.stats.data.datasets = [{
+                label: 'Avg RTT',
+                data: avgRtts,
+                backgroundColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].fill),
+                borderColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].line),
+                borderWidth: 2
+            }];
+            charts.stats.update('none');
+        }
+        
+        // Update controller diagnostics charts
+        async function updateController() {
+            const data = await fetch('/api/controller').then(r => r.json());
+            
+            // Delta chart (desired vs applied)
+            const deltaDatasets = [];
+            ['A', 'B', 'C'].forEach(nid => {
+                const nodeData = data.timeseries[nid];
+                
+                deltaDatasets.push({
+                    label: `${nid} desired`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.desired[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    borderDash: [5, 5],
+                    spanGaps: false
+                });
+                
+                deltaDatasets.push({
+                    label: `${nid} applied`,
+                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.applied[i]})),
+                    borderColor: colors[nid].line,
+                    backgroundColor: colors[nid].fill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    spanGaps: false
+                });
+            });
+            
+            charts.controllerDelta.data.datasets = deltaDatasets;
+            charts.controllerDelta.update('none');
+            
+            // Clip rate chart
+            const clipRates = ['A', 'B', 'C'].map(nid => data.stats[nid].clip_rate * 100);
+            
+            charts.controllerClip.data.datasets = [{
+                label: 'Clip Rate',
+                data: clipRates,
+                backgroundColor: ['A', 'B', 'C'].map(nid => colors[nid].fill),
+                borderColor: ['A', 'B', 'C'].map(nid => colors[nid].line),
+                borderWidth: 2
+            }];
+            charts.controllerClip.update('none');
+        }
+        
+        // Main refresh function
+        async function refresh() {
+            try {
+                await Promise.all([
+                    updateSync(),
+                    updateLinks(),
+                    updateController()
+                ]);
+                
+                const now = new Date().toLocaleTimeString('de-DE');
+                document.getElementById('update-info').textContent = 'Live';
+                document.getElementById('time-info').textContent = now;
+            } catch (error) {
+                console.error('Refresh error:', error);
+                document.getElementById('update-info').textContent = 'Error';
+            }
+        }
+        
+        // Initialize and start
+        window.addEventListener('load', () => {
+            initCharts();
+            refresh();
+            setInterval(refresh, 3000);
+        });
+    </script>
+    
+</body>
+</html>

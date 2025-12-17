@@ -224,9 +224,9 @@ class SyncModule:
         self._max_slew_per_second_ms = float(sync_cfg.get("max_slew_per_second_ms", 10.0))
 
         # ROBUST: Timeout config (aus Forum)
-        self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 1.0))
+        self._coap_timeout = float(sync_cfg.get("coap_timeout_s", 1.5))
         self._base_interval = float(sync_cfg.get("beacon_period_s", 0.5))
-        self._max_backoff = float(sync_cfg.get("max_backoff_s", 8.0))
+        self._max_backoff = float(sync_cfg.get("max_backoff_s", 4.0))
 
         # jitter / weighting
         self._jitter_window = int(sync_cfg.get("jitter_window", 30))
@@ -692,108 +692,116 @@ class SyncModule:
     # ROBUST: Per-Peer Worker (aus Forum)
     # -----------------------------------------------------------------
 
-    async def _peer_worker(
-            self,
-            peer_id: str,
-            peer_ip: str,
-            client_ctx: aiocoap.Context
-    ) -> None:
-        """
-        ROBUST peer worker mit Backoff und Exception Handling.
-        Nach Forum-Best-Practices.
-        """
+    async def _peer_worker(self, peer_id: str, peer_ip: str) -> None:
         backoff = self._base_interval
         st = self._peer.setdefault(peer_id, PeerStats())
         st.state = "DOWN"
 
+        fail_streak = 0
+        client_ctx = await aiocoap.Context.create_client_context()
+
         log.info("[%s] Starting peer worker for %s (%s)", self.node_id, peer_id, peer_ip)
 
-        while True:
-            uri = f"coap://{peer_ip}/sync/beacon"
+        try:
+            while True:
+                uri = f"coap://{peer_ip}/sync/beacon"
 
-            t1_m = time.monotonic()
-            payload = {
-                "src": self.node_id,
-                "dst": peer_id,
-                "t1": t1_m,
-                "boot_epoch": self._boot_epoch,
-                "offset": self._offset,
-            }
+                t1_m = time.monotonic()
+                payload = {
+                    "src": self.node_id,
+                    "dst": peer_id,
+                    "t1": t1_m,
+                    "boot_epoch": self._boot_epoch,
+                    "offset": self._offset,
+                }
 
-            req = aiocoap.Message(
-                code=aiocoap.POST,
-                uri=uri,
-                payload=json.dumps(payload).encode()
-            )
-
-            try:
-                # ROBUST: Hard timeout!
-                resp = await asyncio.wait_for(
-                    client_ctx.request(req).response,
-                    timeout=self._coap_timeout
+                req = aiocoap.Message(
+                    code=aiocoap.POST,
+                    uri=uri,
+                    payload=json.dumps(payload).encode("utf-8")
                 )
 
-                t4_m = time.monotonic()
+                try:
+                    resp = await asyncio.wait_for(
+                        client_ctx.request(req).response,
+                        timeout=self._coap_timeout
+                    )
+                    t4_m = time.monotonic()
 
-                data = json.loads(resp.payload.decode())
-                t2_m = float(data["t2"])
-                t3_m = float(data["t3"])
-                peer_offset = float(data["offset"])
-                peer_boot_epoch = float(data.get("boot_epoch"))
+                    data = json.loads(resp.payload.decode("utf-8"))
+                    t2_m = float(data["t2"])
+                    t3_m = float(data["t3"])
+                    peer_offset = float(data["offset"])
+                    peer_boot_epoch = float(data.get("boot_epoch", 0.0))
 
-                t1 = t1_m + self._boot_epoch
-                t4 = t4_m + self._boot_epoch
-                t2 = t2_m + peer_boot_epoch
-                t3 = t3_m + peer_boot_epoch
+                    t1 = t1_m + self._boot_epoch
+                    t4 = t4_m + self._boot_epoch
+                    t2 = t2_m + peer_boot_epoch
+                    t3 = t3_m + peer_boot_epoch
 
-                rtt = (t4 - t1) - (t3 - t2)
-                theta = ((t2 - t1) + (t3 - t4)) / 2.0
+                    rtt = (t4 - t1) - (t3 - t2)
+                    theta = ((t2 - t1) + (t3 - t4)) / 2.0
 
-                log.info("[%s] %s rtt=%.3fms theta=%.3fms", self.node_id, peer_id, rtt * 1000.0, theta * 1000.0)
+                    if st.state != "UP":
+                        log.info("[%s] Peer %s is UP", self.node_id, peer_id)
+                        st.state = "UP"
 
-                # SUCCESS!
-                if st.state is not "UP":
-                    log.info("[%s] Peer %s is UP", self.node_id, peer_id)
-                    st.state = "UP"
+                    fail_streak = 0
+                    backoff = self._base_interval
 
-                self._beacon_count += 1
-                st.good_samples += 1
-                st.theta_last = theta
-                st.last_theta_epoch = time.time()
-                self._update_link_jitter(peer_id, rtt)
+                    self._beacon_count += 1
+                    st.good_samples += 1
+                    st.theta_last = theta
+                    st.last_theta_epoch = time.time()
+                    self._update_link_jitter(peer_id, rtt)
 
-                # Bootstrap
-                did_bs = self._try_bootstrap(peer_id, peer_offset, theta)
+                    did_bs = self._try_bootstrap(peer_id, peer_offset, theta)
+                    if not did_bs and self._measurement_queue is not None:
+                        await self._measurement_queue.put((peer_id, rtt, theta, peer_offset))
 
-                # Queue measurement for control
-                if not did_bs:
-                    q = self._measurement_queue
-                    if q is not None:
-                        await q.put((peer_id, rtt, theta, peer_offset))
+                    await self._log_link_metrics(peer_id, rtt, theta, client_ctx,
+                                                 t1_s=t1, t2_s=t2, t3_s=t3, t4_s=t4)
 
-                # Log metrics
-                await self._log_link_metrics(peer_id, rtt, theta, client_ctx, t1_s=t1, t2_s=t2, t3_s=t3, t4_s=t4)
+                    await asyncio.sleep(self._base_interval)
 
-                # Reset backoff
-                backoff = self._base_interval
-                await asyncio.sleep(self._base_interval)
+                except asyncio.TimeoutError:
+                    fail_streak += 1
+                    st.state = "DOWN"
+                    log.warning("[%s] Peer %s timeout (streak=%d, backoff=%.1fs)",
+                                self.node_id, peer_id, fail_streak, backoff)
 
-            except asyncio.TimeoutError:
-                # EXPECTED wenn Peer down
-                # FIX: Always log first failure (don't check st.state)
-                log.warning("[%s] Peer %s timeout (backoff=%.1fs)", self.node_id, peer_id, backoff)
-                st.state = "DOWN"
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self._max_backoff)
+                    if fail_streak >= 5:
+                        await client_ctx.shutdown()
+                        client_ctx = await aiocoap.Context.create_client_context()
+                        fail_streak = 0
 
-            except Exception as e:
-                # Network error, parse error, etc.
-                # FIX: Always log errors (including Connection Refused)
-                log.warning("[%s] Peer %s error: %s (backoff=%.1fs)",
-                            self.node_id, peer_id, type(e).__name__, backoff)
-                st.state = "DOWN"
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self._max_backoff)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._max_backoff)
+                    continue
+
+                except asyncio.CancelledError:
+                    raise
+
+                except Exception as e:
+                    fail_streak += 1
+                    st.state = "DOWN"
+                    log.warning("[%s] Peer %s error: %r (streak=%d, backoff=%.1fs)",
+                                self.node_id, peer_id, e, fail_streak, backoff)
+
+                    if fail_streak >= 5:
+                        await client_ctx.shutdown()
+                        client_ctx = await aiocoap.Context.create_client_context()
+                        fail_streak = 0
+
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._max_backoff)
+                    continue
+
+        finally:
+            try:
+                await client_ctx.shutdown()
+            except Exception:
+                pass
 
     async def _clock_tick_loop(self) -> None:
         """

@@ -1,683 +1,788 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="de">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MeshTime Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MeshTime Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
+
 <body class="bg-gray-900 text-gray-100">
-    
-    <div class="container mx-auto p-6 max-w-7xl">
-        
-        <!-- Header -->
-        <div class="mb-8">
-            <h1 class="text-4xl font-bold mb-2">MeshTime Dashboard</h1>
-            <p class="text-gray-400">Real-time synchronization, link quality, and controller analysis</p>
-        </div>
-        
-        <!-- Status Cards -->
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <div class="bg-gray-800 rounded-lg p-4">
-                <div class="text-sm text-gray-400 mb-1">Sync Quality</div>
-                <div id="stat-quality" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">max deviation (ms)</div>
-            </div>
-            
-            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-red-500">
-                <div class="text-sm text-gray-400 mb-1">Node A</div>
-                <div id="stat-a" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">current deviation (ms)</div>
-            </div>
-            
-            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-green-500">
-                <div class="text-sm text-gray-400 mb-1">Node B</div>
-                <div id="stat-b" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">current deviation (ms)</div>
-            </div>
-            
-            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-blue-500">
-                <div class="text-sm text-gray-400 mb-1">Node C</div>
-                <div id="stat-c" class="text-2xl font-bold">--</div>
-                <div class="text-xs text-gray-500">current deviation (ms)</div>
-            </div>
-        </div>
-        
-        <!-- CATEGORY 1: Synchronization Quality -->
-        <div class="bg-gray-800 rounded-lg p-6 mb-8">
-            <h2 class="text-2xl font-bold mb-6 flex items-center">
-                <span class="text-3xl mr-3">📊</span>
-                Synchronization Quality
-            </h2>
-            
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Convergence Timeline</h3>
-                    <canvas id="convergence-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Deviation Distribution</h3>
-                    <canvas id="histogram-chart"></canvas>
-                </div>
-            </div>
-        </div>
-        
-        <!-- CATEGORY 2: Link Quality Metrics -->
-        <div class="bg-gray-800 rounded-lg p-6 mb-8">
-            <h2 class="text-2xl font-bold mb-6 flex items-center">
-                <span class="text-3xl mr-3">🔗</span>
-                Link Quality Metrics
-            </h2>
-            
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">RTT Timeline</h3>
-                    <canvas id="rtt-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Link Asymmetry</h3>
-                    <canvas id="asymmetry-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Jitter (Rolling Std)</h3>
-                    <canvas id="jitter-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Link Statistics</h3>
-                    <canvas id="stats-chart"></canvas>
-                </div>
-            </div>
-        </div>
-        
-        <!-- CATEGORY 3: Controller Diagnostics -->
-        <div class="bg-gray-800 rounded-lg p-6 mb-8">
-            <h2 class="text-2xl font-bold mb-6 flex items-center">
-                <span class="text-3xl mr-3">⚙️</span>
-                Controller Diagnostics
-            </h2>
-            
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Desired vs Applied Δ</h3>
-                    <canvas id="controller-delta-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">Slew Clipping Rate</h3>
-                    <canvas id="controller-clip-chart"></canvas>
-                </div>
-            </div>
-        </div>
-        
-        <!-- CATEGORY 4: Kalman Filter Internals -->
-        <div class="bg-gray-800 rounded-lg p-6 mb-8">
-            <h2 class="text-2xl font-bold mb-6 flex items-center">
-                <span class="text-3xl mr-3">🔬</span>
-                Kalman Filter Internals
-            </h2>
-            
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">1) Kalman State (Offset, Drift)</h3>
-                    <canvas id="kalman-state-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">2) Kalman Covariance (P)</h3>
-                    <canvas id="kalman-cov-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">3) Innovation (Residuals)</h3>
-                    <canvas id="kalman-innov-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">4) NIS (Normalized Innovation Squared)</h3>
-                    <canvas id="kalman-nis-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">5) Effective Measurement Noise (R)</h3>
-                    <canvas id="kalman-r-chart"></canvas>
-                </div>
-                
-                <div>
-                    <h3 class="text-lg font-semibold mb-3">6) Controller Slew Detail</h3>
-                    <canvas id="kalman-slew-chart"></canvas>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Footer Info -->
-        <div class="text-center text-sm text-gray-500">
-            <span id="update-info">Updating...</span> | 
-            Window: 600s | 
-            Last update: <span id="time-info">--</span>
-        </div>
-        
+  <div class="container mx-auto p-6 max-w-7xl">
+
+    <div class="mb-8">
+      <h1 class="text-4xl font-bold mb-2">MeshTime Dashboard</h1>
+      <p class="text-gray-400">Real-time synchronization, link quality, and controller analysis</p>
     </div>
-    
-    <script>
-        let charts = {};
-        
-        // Color schemes
-        const colors = {
-            'A': {line: 'rgb(200, 50, 50)', fill: 'rgba(200, 50, 50, 0.3)'},
-            'B': {line: 'rgb(50, 200, 50)', fill: 'rgba(50, 200, 50, 0.3)'},
-            'C': {line: 'rgb(100, 149, 237)', fill: 'rgba(100, 149, 237, 0.3)'}
-        };
-        
-        const linkColors = {
-            'A-B': {line: 'rgb(255, 255, 0)', fill: 'rgba(255, 255, 0, 0.3)'},
-            'A-C': {line: 'rgb(255, 0, 255)', fill: 'rgba(255, 0, 255, 0.3)'},
-            'B-C': {line: 'rgb(0, 255, 255)', fill: 'rgba(0, 255, 255, 0.3)'}
-        };
-        
-        // Chart.js base config
-        const baseOptions = {
-            responsive: true,
-            maintainAspectRatio: true,
-            aspectRatio: 2,
-            animation: false,
-            scales: {
-                x: {
-                    type: 'linear',
-                    ticks: { 
-                        color: '#9ca3af',
-                        callback: function(value) {
-                            const date = new Date(value * 1000);
-                            return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
-                        }
-                    },
-                    grid: { color: '#374151' }
-                },
-                y: {
-                    ticks: { color: '#9ca3af' },
-                    grid: { color: '#374151' }
-                }
-            },
-            plugins: {
-                legend: { labels: { color: '#9ca3af' } }
-            }
-        };
-        
-        // Initialize all charts
-        function initCharts() {
-            charts.convergence = new Chart(document.getElementById('convergence-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Deviation (ms)', color: '#9ca3af'}}}}
-            });
-            
-            charts.histogram = new Chart(document.getElementById('histogram-chart'), {
-                type: 'bar',
-                data: {labels: [], datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, x: {ticks: {color: '#9ca3af'}, grid: {color: '#374151'}, title: {display: true, text: 'Deviation (ms)', color: '#9ca3af'}}, y: {...baseOptions.scales.y, title: {display: true, text: 'Count', color: '#9ca3af'}}}}
-            });
-            
-            charts.rtt = new Chart(document.getElementById('rtt-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'RTT (ms)', color: '#9ca3af'}}}}
-            });
-            
-            charts.asymmetry = new Chart(document.getElementById('asymmetry-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Asymmetry (ms)', color: '#9ca3af'}}}}
-            });
-            
-            charts.jitter = new Chart(document.getElementById('jitter-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Jitter (ms)', color: '#9ca3af'}}}}
-            });
-            
-            charts.stats = new Chart(document.getElementById('stats-chart'), {
-                type: 'bar',
-                data: {labels: ['A-B', 'A-C', 'B-C'], datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, x: {ticks: {color: '#9ca3af'}, grid: {color: '#374151'}}, y: {...baseOptions.scales.y, title: {display: true, text: 'Avg RTT (ms)', color: '#9ca3af'}}}, plugins: {legend: {display: false}}}
-            });
-            
-            charts.controllerDelta = new Chart(document.getElementById('controller-delta-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Δ (ms)', color: '#9ca3af'}}}}
-            });
-            
-            charts.controllerClip = new Chart(document.getElementById('controller-clip-chart'), {
-                type: 'bar',
-                data: {labels: ['A', 'B', 'C'], datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, x: {ticks: {color: '#9ca3af'}, grid: {color: '#374151'}}, y: {...baseOptions.scales.y, title: {display: true, text: 'Clip Rate (%)', color: '#9ca3af'}}}, plugins: {legend: {display: false}}}
-            });
-            
-            // Kalman Filter Internals charts
-            charts.kalmanState = new Chart(document.getElementById('kalman-state-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'x_offset (ms)', color: '#9ca3af'}}, y2: {type: 'linear', position: 'right', grid: {drawOnChartArea: false}, ticks: {color: '#9ca3af'}, title: {display: true, text: 'x_drift (ppm)', color: '#9ca3af'}}}}
-            });
-            
-            charts.kalmanCov = new Chart(document.getElementById('kalman-cov-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {type: 'logarithmic', ticks: {color: '#9ca3af'}, grid: {color: '#374151'}, title: {display: true, text: 'p_offset (ms²)', color: '#9ca3af'}}, y2: {type: 'logarithmic', position: 'right', grid: {drawOnChartArea: false}, ticks: {color: '#9ca3af'}, title: {display: true, text: 'p_drift (ppm²)', color: '#9ca3af'}}}}
-            });
-            
-            charts.kalmanInnov = new Chart(document.getElementById('kalman-innov-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Innovation (ms)', color: '#9ca3af'}}}}
-            });
-            
-            charts.kalmanNIS = new Chart(document.getElementById('kalman-nis-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'NIS', color: '#9ca3af'}}}}
-            });
-            
-            charts.kalmanR = new Chart(document.getElementById('kalman-r-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {type: 'logarithmic', ticks: {color: '#9ca3af'}, grid: {color: '#374151'}, title: {display: true, text: 'r_eff (ms²)', color: '#9ca3af'}}}}
-            });
-            
-            charts.kalmanSlew = new Chart(document.getElementById('kalman-slew-chart'), {
-                type: 'line',
-                data: {datasets: []},
-                options: {...baseOptions, scales: {...baseOptions.scales, y: {...baseOptions.scales.y, title: {display: true, text: 'Δ (ms)', color: '#9ca3af'}}}}
-            });
+
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+      <div class="bg-gray-800 rounded-lg p-4">
+        <div class="text-sm text-gray-400 mb-1">Sync Quality</div>
+        <div id="stat-quality" class="text-2xl font-bold">--</div>
+        <div class="text-xs text-gray-500">max deviation (ms)</div>
+      </div>
+
+      <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-red-500">
+        <div class="text-sm text-gray-400 mb-1">Node A</div>
+        <div id="stat-a" class="text-2xl font-bold">--</div>
+        <div class="text-xs text-gray-500">current deviation (ms)</div>
+      </div>
+
+      <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-green-500">
+        <div class="text-sm text-gray-400 mb-1">Node B</div>
+        <div id="stat-b" class="text-2xl font-bold">--</div>
+        <div class="text-xs text-gray-500">current deviation (ms)</div>
+      </div>
+
+      <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-blue-500">
+        <div class="text-sm text-gray-400 mb-1">Node C</div>
+        <div id="stat-c" class="text-2xl font-bold">--</div>
+        <div class="text-xs text-gray-500">current deviation (ms)</div>
+      </div>
+    </div>
+
+    <div class="bg-gray-800 rounded-lg p-6 mb-8">
+      <h2 class="text-2xl font-bold mb-6 flex items-center">
+        <span class="text-3xl mr-3">📊</span> Synchronization Quality
+      </h2>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div>
+          <h3 class="text-lg font-semibold mb-3">Convergence Timeline</h3>
+          <canvas id="convergence-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">Deviation Distribution</h3>
+          <canvas id="histogram-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-gray-800 rounded-lg p-6 mb-8">
+      <h2 class="text-2xl font-bold mb-6 flex items-center">
+        <span class="text-3xl mr-3">🔗</span> Link Quality Metrics
+      </h2>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div>
+          <h3 class="text-lg font-semibold mb-3">RTT Timeline</h3>
+          <canvas id="rtt-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">Link Asymmetry</h3>
+          <canvas id="asymmetry-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">Jitter (Rolling Std)</h3>
+          <canvas id="jitter-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">Link Statistics</h3>
+          <canvas id="stats-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-gray-800 rounded-lg p-6 mb-8">
+      <h2 class="text-2xl font-bold mb-6 flex items-center">
+        <span class="text-3xl mr-3">⚙️</span> Controller Diagnostics
+      </h2>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div>
+          <h3 class="text-lg font-semibold mb-3">Desired vs Applied Δ</h3>
+          <canvas id="controller-delta-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">Slew Clipping Rate</h3>
+          <canvas id="controller-clip-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-gray-800 rounded-lg p-6 mb-8">
+      <h2 class="text-2xl font-bold mb-6 flex items-center">
+        <span class="text-3xl mr-3">🔬</span> Kalman Filter Internals
+      </h2>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div>
+          <h3 class="text-lg font-semibold mb-3">1) Kalman State (Offset, Drift)</h3>
+          <canvas id="kalman-state-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">2) Kalman Covariance (P)</h3>
+          <canvas id="kalman-cov-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">3) Innovation (Residuals)</h3>
+          <canvas id="kalman-innov-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">4) NIS (Normalized Innovation Squared)</h3>
+          <canvas id="kalman-nis-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">5) Effective Measurement Noise (R)</h3>
+          <canvas id="kalman-r-chart"></canvas>
+        </div>
+        <div>
+          <h3 class="text-lg font-semibold mb-3">6) Controller Slew Detail</h3>
+          <canvas id="kalman-slew-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="text-center text-sm text-gray-500">
+      <span id="update-info">Starting…</span> |
+      Window: 600s |
+      Last update: <span id="time-info">--</span>
+    </div>
+  </div>
+
+<script>
+  let charts = {};
+
+  const colors = {
+    'A': {line: 'rgb(200, 50, 50)', fill: 'rgba(200, 50, 50, 0.3)'},
+    'B': {line: 'rgb(50, 200, 50)', fill: 'rgba(50, 200, 50, 0.3)'},
+    'C': {line: 'rgb(100, 149, 237)', fill: 'rgba(100, 149, 237, 0.3)'}
+  };
+
+  const linkColors = {
+    'A-B': {line: 'rgb(255, 255, 0)', fill: 'rgba(255, 255, 0, 0.3)'},
+    'A-C': {line: 'rgb(255, 0, 255)', fill: 'rgba(255, 0, 255, 0.3)'},
+    'B-C': {line: 'rgb(0, 255, 255)', fill: 'rgba(0, 255, 255, 0.3)'}
+  };
+
+  const baseOptions = {
+    responsive: true,
+    maintainAspectRatio: true,
+    aspectRatio: 2,
+    animation: false,
+    scales: {
+      x: {
+        type: 'linear',
+        ticks: {
+          color: '#9ca3af',
+          callback: function(value) {
+            const date = new Date(value * 1000);
+            return date.toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'});
+          }
+        },
+        grid: { color: '#374151' }
+      },
+      y: {
+        ticks: { color: '#9ca3af' },
+        grid: { color: '#374151' }
+      }
+    },
+    plugins: { legend: { labels: { color: '#9ca3af' } } }
+  };
+
+  // --------------------------------------------------------------------------
+  // Fetch helpers: timeout + abort previous in-flight per endpoint
+  // --------------------------------------------------------------------------
+  const inflight = new Map(); // url -> AbortController
+
+  async function fetchJSON(url, timeoutMs=1500) {
+    // abort previous request to same URL to prevent piling up
+    const prev = inflight.get(url);
+    if (prev) prev.abort();
+
+    const ctrl = new AbortController();
+    inflight.set(url, ctrl);
+
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      return await res.json();
+    } finally {
+      clearTimeout(timer);
+      // Only clear if still current controller
+      if (inflight.get(url) === ctrl) inflight.delete(url);
+    }
+  }
+
+  function nowStr() {
+    return new Date().toLocaleTimeString('de-DE');
+  }
+
+  // --------------------------------------------------------------------------
+  // Charts init
+  // --------------------------------------------------------------------------
+  function initCharts() {
+    charts.convergence = new Chart(document.getElementById('convergence-chart'), {
+      type: 'line',
+      data: {datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          y: {...baseOptions.scales.y, title: {display: true, text: 'Deviation (ms)', color: '#9ca3af'}}
         }
-        
-        // Update sync quality charts
-        async function updateSync() {
-            const data = await fetch('/api/sync').then(r => r.json());
-            
-            // Update stats cards
-            document.getElementById('stat-quality').textContent = 
-                data.stats.max_abs_ms ? data.stats.max_abs_ms.toFixed(3) : '--';
-            
-            ['A', 'B', 'C'].forEach(nid => {
-                const elem = document.getElementById(`stat-${nid.toLowerCase()}`);
-                if (data.stats.nodes[nid] && data.stats.nodes[nid].current_ms !== null) {
-                    elem.textContent = data.stats.nodes[nid].current_ms.toFixed(3);
-                } else {
-                    elem.textContent = '--';
-                }
-            });
-            
-            // Convergence timeline
-            const timeDatasets = ['A', 'B', 'C'].map(nid => ({
-                label: `Node ${nid}`,
-                data: data.timeseries.timestamps.map((t, i) => ({
-                    x: t,
-                    y: data.timeseries.deviations[nid][i]
-                })),
-                borderColor: colors[nid].line,
-                backgroundColor: colors[nid].fill,
-                borderWidth: 1,
-                pointRadius: 0,
-                spanGaps: false
-            }));
-            
-            charts.convergence.data.datasets = timeDatasets;
-            charts.convergence.update('none');
-            
-            // Histogram
-            const binCenters = data.histogram.bin_edges.slice(0, -1).map((edge, i) => 
-                ((edge + data.histogram.bin_edges[i + 1]) / 2).toFixed(2)
-            );
-            
-            const histDatasets = ['A', 'B', 'C'].map(nid => ({
-                label: `Node ${nid}`,
-                data: data.histogram.counts[nid],
-                backgroundColor: colors[nid].fill,
-                borderColor: colors[nid].line,
-                borderWidth: 1
-            }));
-            
-            charts.histogram.data.labels = binCenters;
-            charts.histogram.data.datasets = histDatasets;
-            charts.histogram.update('none');
+      }
+    });
+
+    charts.histogram = new Chart(document.getElementById('histogram-chart'), {
+      type: 'bar',
+      data: {labels: [], datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          x: {ticks: {color:'#9ca3af'}, grid:{color:'#374151'}, title:{display:true, text:'Deviation (ms)', color:'#9ca3af'}},
+          y: {...baseOptions.scales.y, title:{display:true, text:'Count', color:'#9ca3af'}}
         }
-        
-        // Update link quality charts
-        async function updateLinks() {
-            const data = await fetch('/api/links').then(r => r.json());
-            
-            // RTT chart
-            const rttDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
-                const linkData = data.timeseries[linkId];
-                return {
-                    label: linkId,
-                    data: linkData.timestamps.map((t, i) => ({x: t, y: linkData.rtt[i]})),
-                    borderColor: linkColors[linkId].line,
-                    backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                };
-            });
-            
-            charts.rtt.data.datasets = rttDatasets;
-            charts.rtt.update('none');
-            
-            // Asymmetry chart
-            const asymDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
-                const linkData = data.timeseries[linkId];
-                return {
-                    label: linkId,
-                    data: linkData.timestamps.map((t, i) => ({x: t, y: linkData.asymmetry[i]})),
-                    borderColor: linkColors[linkId].line,
-                    backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                };
-            });
-            
-            charts.asymmetry.data.datasets = asymDatasets;
-            charts.asymmetry.update('none');
-            
-            // Jitter chart
-            const jitterDatasets = ['A-B', 'A-C', 'B-C'].map(linkId => {
-                const jitterData = data.jitter[linkId];
-                return {
-                    label: linkId,
-                    data: jitterData.timestamps.map((t, i) => ({x: t, y: jitterData.jitter[i]})),
-                    borderColor: linkColors[linkId].line,
-                    backgroundColor: linkColors[linkId].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                };
-            });
-            
-            charts.jitter.data.datasets = jitterDatasets;
-            charts.jitter.update('none');
-            
-            // Stats chart
-            const avgRtts = ['A-B', 'A-C', 'B-C'].map(linkId => data.stats[linkId].avg_rtt);
-            
-            charts.stats.data.datasets = [{
-                label: 'Avg RTT',
-                data: avgRtts,
-                backgroundColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].fill),
-                borderColor: ['A-B', 'A-C', 'B-C'].map(id => linkColors[id].line),
-                borderWidth: 1
-            }];
-            charts.stats.update('none');
+      }
+    });
+
+    charts.rtt = new Chart(document.getElementById('rtt-chart'), {
+      type: 'line',
+      data: {datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          y: {...baseOptions.scales.y, title:{display:true, text:'RTT (ms)', color:'#9ca3af'}}
         }
-        
-        // Update controller diagnostics charts
-        async function updateController() {
-            const data = await fetch('/api/controller').then(r => r.json());
-            
-            // Delta chart (desired vs applied)
-            const deltaDatasets = [];
-            ['A', 'B', 'C'].forEach(nid => {
-                const nodeData = data.timeseries[nid];
-                
-                deltaDatasets.push({
-                    label: `${nid} desired`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.desired[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    borderDash: [5, 5],
-                    spanGaps: false
-                });
-                
-                deltaDatasets.push({
-                    label: `${nid} applied`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.applied[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                });
-            });
-            
-            charts.controllerDelta.data.datasets = deltaDatasets;
-            charts.controllerDelta.update('none');
-            
-            // Clip rate chart
-            const clipRates = ['A', 'B', 'C'].map(nid => data.stats[nid].clip_rate * 100);
-            
-            charts.controllerClip.data.datasets = [{
-                label: 'Clip Rate',
-                data: clipRates,
-                backgroundColor: ['A', 'B', 'C'].map(nid => colors[nid].fill),
-                borderColor: ['A', 'B', 'C'].map(nid => colors[nid].line),
-                borderWidth: 1
-            }];
-            charts.controllerClip.update('none');
+      }
+    });
+
+    charts.asymmetry = new Chart(document.getElementById('asymmetry-chart'), {
+      type: 'line',
+      data: {datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          y: {...baseOptions.scales.y, title:{display:true, text:'Asymmetry (ms)', color:'#9ca3af'}}
         }
-        
-        // Update Kalman Filter Internals charts
-        async function updateKalman() {
-            // Chart 1: State (offset, drift)
-            const stateData = await fetch('/api/kalman/state').then(r => r.json());
-            const stateDatasets = [];
-            ['A', 'B', 'C'].forEach(nid => {
-                const nodeData = stateData.data[nid];
-                stateDatasets.push({
-                    label: `${nid} x_offset`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.x_offset_ms[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    yAxisID: 'y',
-                    spanGaps: false
-                });
-                stateDatasets.push({
-                    label: `${nid} x_drift`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.x_drift_ppm[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    borderDash: [5, 5],
-                    yAxisID: 'y2',
-                    spanGaps: false
-                });
-            });
-            charts.kalmanState.data.datasets = stateDatasets;
-            charts.kalmanState.update('none');
-            
-            // Chart 2: Covariance (P)
-            const covData = await fetch('/api/kalman/covariance').then(r => r.json());
-            const covDatasets = [];
-            ['A', 'B', 'C'].forEach(nid => {
-                const nodeData = covData.data[nid];
-                covDatasets.push({
-                    label: `${nid} p_offset`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.p_offset_ms2[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    yAxisID: 'y',
-                    spanGaps: false
-                });
-                covDatasets.push({
-                    label: `${nid} p_drift`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.p_drift_ppm2[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    borderDash: [5, 5],
-                    yAxisID: 'y2',
-                    spanGaps: false
-                });
-            });
-            charts.kalmanCov.data.datasets = covDatasets;
-            charts.kalmanCov.update('none');
-            
-            // Chart 3: Innovation
-            const innovData = await fetch('/api/kalman/innovation').then(r => r.json());
-            const innovDatasets = [];
-            ['A', 'B', 'C'].forEach(nid => {
-                const nodeData = innovData.data[nid];
-                innovDatasets.push({
-                    label: `${nid} innov_med`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.innov_med_ms[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                });
-                innovDatasets.push({
-                    label: `${nid} innov_p95`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.innov_p95_ms[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    borderDash: [5, 5],
-                    spanGaps: false
-                });
-            });
-            charts.kalmanInnov.data.datasets = innovDatasets;
-            charts.kalmanInnov.update('none');
-            
-            // Chart 4: NIS
-            const nisData = await fetch('/api/kalman/nis').then(r => r.json());
-            const nisDatasets = [];
-            ['A', 'B', 'C'].forEach(nid => {
-                const nodeData = nisData.data[nid];
-                nisDatasets.push({
-                    label: `${nid} nis_med`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.nis_med[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                });
-                nisDatasets.push({
-                    label: `${nid} nis_p95`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.nis_p95[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    borderDash: [5, 5],
-                    spanGaps: false
-                });
-            });
-            charts.kalmanNIS.data.datasets = nisDatasets;
-            charts.kalmanNIS.update('none');
-            
-            // Chart 5: Effective R
-            const rData = await fetch('/api/kalman/r_eff').then(r => r.json());
-            const rDatasets = [];
-            ['A', 'B', 'C'].forEach(nid => {
-                const nodeData = rData.data[nid];
-                rDatasets.push({
-                    label: `${nid} r_eff`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.r_eff_ms2[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                });
-            });
-            charts.kalmanR.data.datasets = rDatasets;
-            charts.kalmanR.update('none');
-            
-            // Chart 6: Slew detail (reuse controller data)
-            const ctrlData = await fetch('/api/controller').then(r => r.json());
-            const slewDatasets = [];
-            ['A', 'B', 'C'].forEach(nid => {
-                const nodeData = ctrlData.timeseries[nid];
-                
-                // Desired (dashed)
-                slewDatasets.push({
-                    label: `${nid} desired`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.desired[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    borderDash: [5, 5],
-                    spanGaps: false
-                });
-                
-                // Applied (solid)
-                slewDatasets.push({
-                    label: `${nid} applied`,
-                    data: nodeData.timestamps.map((t, i) => ({x: t, y: nodeData.applied[i]})),
-                    borderColor: colors[nid].line,
-                    backgroundColor: colors[nid].fill,
-                    borderWidth: 1,
-                    pointRadius: 0,
-                    spanGaps: false
-                });
-                
-                // Clipped markers (scatter)
-                const clippedPoints = [];
-                nodeData.timestamps.forEach((t, i) => {
-                    if (nodeData.clipped[i] === 1) {
-                        const y = nodeData.applied[i] !== null ? nodeData.applied[i] : nodeData.desired[i];
-                        if (y !== null) clippedPoints.push({x: t, y: y});
-                    }
-                });
-                
-                if (clippedPoints.length > 0) {
-                    slewDatasets.push({
-                        label: `${nid} clipped`,
-                        data: clippedPoints,
-                        type: 'scatter',
-                        borderColor: colors[nid].line,
-                        backgroundColor: colors[nid].line,
-                        pointRadius: 4,
-                        pointHoverRadius: 6
-                    });
-                }
-            });
-            charts.kalmanSlew.data.datasets = slewDatasets;
-            charts.kalmanSlew.update('none');
+      }
+    });
+
+    charts.jitter = new Chart(document.getElementById('jitter-chart'), {
+      type: 'line',
+      data: {datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          y: {...baseOptions.scales.y, title:{display:true, text:'Jitter (ms)', color:'#9ca3af'}}
         }
-        
-        // Main refresh function
-        async function refresh() {
-            try {
-                await Promise.all([
-                    updateSync(),
-                    updateLinks(),
-                    updateController(),
-                    updateKalman()
-                ]);
-                
-                const now = new Date().toLocaleTimeString('de-DE');
-                document.getElementById('update-info').textContent = 'Live';
-                document.getElementById('time-info').textContent = now;
-            } catch (error) {
-                console.error('Refresh error:', error);
-                document.getElementById('update-info').textContent = 'Error';
-            }
+      }
+    });
+
+    charts.stats = new Chart(document.getElementById('stats-chart'), {
+      type: 'bar',
+      data: {labels: ['A-B','A-C','B-C'], datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          x: {ticks:{color:'#9ca3af'}, grid:{color:'#374151'}},
+          y: {...baseOptions.scales.y, title:{display:true, text:'Avg RTT (ms)', color:'#9ca3af'}}
+        },
+        plugins: {legend: {display:false}}
+      }
+    });
+
+    charts.controllerDelta = new Chart(document.getElementById('controller-delta-chart'), {
+      type: 'line',
+      data: {datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          y: {...baseOptions.scales.y, title:{display:true, text:'Δ (ms)', color:'#9ca3af'}}
         }
-        
-        // Initialize and start
-        window.addEventListener('load', () => {
-            initCharts();
-            refresh();
-            setInterval(refresh, 2500);
+      }
+    });
+
+    charts.controllerClip = new Chart(document.getElementById('controller-clip-chart'), {
+      type: 'bar',
+      data: {labels: ['A','B','C'], datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          x: {ticks:{color:'#9ca3af'}, grid:{color:'#374151'}},
+          y: {...baseOptions.scales.y, title:{display:true, text:'Clip Rate (%)', color:'#9ca3af'}}
+        },
+        plugins: {legend: {display:false}}
+      }
+    });
+
+    charts.kalmanState = new Chart(document.getElementById('kalman-state-chart'), {
+      type: 'line',
+      data: {datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          y: {...baseOptions.scales.y, title:{display:true, text:'x_offset (ms)', color:'#9ca3af'}},
+          y2: {type:'linear', position:'right', grid:{drawOnChartArea:false}, ticks:{color:'#9ca3af'},
+               title:{display:true, text:'x_drift (ppm)', color:'#9ca3af'}}
+        }
+      }
+    });
+
+    charts.kalmanCov = new Chart(document.getElementById('kalman-cov-chart'), {
+      type: 'line',
+      data: {datasets: []},
+      options: {...baseOptions,
+        scales: {...baseOptions.scales,
+          y: {type:'logarithmic', ticks:{color:'#9ca3af'}, grid:{color:'#374151'},
+              title:{display:true, text:'p_offset (ms²)', color:'#9ca3af'}},
+          y2:{type:'logarithmic', position:'right', grid:{drawOnChartArea:false}, ticks:{color:'#9ca3af'},
+              title:{display:true, text:'p_drift (ppm²)', color:'#9ca3af'}}
+        }
+      }
+    });
+
+    charts.kalmanInnov = new Chart(document.getElementById('kalman-innov-chart'), {
+      type:'line',
+      data:{datasets:[]},
+      options:{...baseOptions,
+        scales:{...baseOptions.scales,
+          y:{...baseOptions.scales.y, title:{display:true, text:'Innovation (ms)', color:'#9ca3af'}}
+        }
+      }
+    });
+
+    charts.kalmanNIS = new Chart(document.getElementById('kalman-nis-chart'), {
+      type:'line',
+      data:{datasets:[]},
+      options:{...baseOptions,
+        scales:{...baseOptions.scales,
+          y:{...baseOptions.scales.y, title:{display:true, text:'NIS', color:'#9ca3af'}}
+        }
+      }
+    });
+
+    charts.kalmanR = new Chart(document.getElementById('kalman-r-chart'), {
+      type:'line',
+      data:{datasets:[]},
+      options:{...baseOptions,
+        scales:{...baseOptions.scales,
+          y:{type:'logarithmic', ticks:{color:'#9ca3af'}, grid:{color:'#374151'},
+             title:{display:true, text:'r_eff (ms²)', color:'#9ca3af'}}
+        }
+      }
+    });
+
+    charts.kalmanSlew = new Chart(document.getElementById('kalman-slew-chart'), {
+      type:'line',
+      data:{datasets:[]},
+      options:{...baseOptions,
+        scales:{...baseOptions.scales,
+          y:{...baseOptions.scales.y, title:{display:true, text:'Δ (ms)', color:'#9ca3af'}}
+        }
+      }
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // Data caches (controller reused by slew plot)
+  // --------------------------------------------------------------------------
+  let controllerCache = null;
+  let controllerCacheTs = 0;
+
+  // --------------------------------------------------------------------------
+  // Update functions
+  // --------------------------------------------------------------------------
+  async function updateSync() {
+    const data = await fetchJSON('/api/sync', 1500);
+
+    document.getElementById('stat-quality').textContent =
+      (data.stats.max_abs_ms != null) ? data.stats.max_abs_ms.toFixed(3) : '--';
+
+    ['A','B','C'].forEach(nid => {
+      const el = document.getElementById(`stat-${nid.toLowerCase()}`);
+      const v = data.stats.nodes?.[nid]?.current_ms;
+      el.textContent = (v != null) ? Number(v).toFixed(3) : '--';
+    });
+
+    const ds = ['A','B','C'].map(nid => ({
+      label: `Node ${nid}`,
+      data: data.timeseries.timestamps.map((t,i)=>({x:t, y: data.timeseries.deviations[nid][i]})),
+      borderColor: colors[nid].line,
+      backgroundColor: colors[nid].fill,
+      borderWidth: 1,
+      pointRadius: 0,
+      spanGaps: false
+    }));
+    charts.convergence.data.datasets = ds;
+    charts.convergence.update('none');
+
+    const binCenters = data.histogram.bin_edges.slice(0,-1).map((edge,i)=>
+      ((edge + data.histogram.bin_edges[i+1])/2).toFixed(2)
+    );
+    const hds = ['A','B','C'].map(nid => ({
+      label: `Node ${nid}`,
+      data: data.histogram.counts[nid],
+      backgroundColor: colors[nid].fill,
+      borderColor: colors[nid].line,
+      borderWidth: 1
+    }));
+    charts.histogram.data.labels = binCenters;
+    charts.histogram.data.datasets = hds;
+    charts.histogram.update('none');
+  }
+
+  async function updateLinks() {
+    const data = await fetchJSON('/api/links', 2000);
+
+    const rttDS = ['A-B','A-C','B-C'].map(id => {
+      const d = data.timeseries[id];
+      return {
+        label: id,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.rtt[i]})),
+        borderColor: linkColors[id].line,
+        backgroundColor: linkColors[id].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        spanGaps: false
+      };
+    });
+    charts.rtt.data.datasets = rttDS;
+    charts.rtt.update('none');
+
+    const asymDS = ['A-B','A-C','B-C'].map(id => {
+      const d = data.timeseries[id];
+      return {
+        label: id,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.asymmetry[i]})),
+        borderColor: linkColors[id].line,
+        backgroundColor: linkColors[id].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        spanGaps: false
+      };
+    });
+    charts.asymmetry.data.datasets = asymDS;
+    charts.asymmetry.update('none');
+
+    const jitDS = ['A-B','A-C','B-C'].map(id => {
+      const d = data.jitter[id];
+      return {
+        label: id,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.jitter[i]})),
+        borderColor: linkColors[id].line,
+        backgroundColor: linkColors[id].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        spanGaps: false
+      };
+    });
+    charts.jitter.data.datasets = jitDS;
+    charts.jitter.update('none');
+
+    const avgRtts = ['A-B','A-C','B-C'].map(id => data.stats[id].avg_rtt);
+    charts.stats.data.datasets = [{
+      label: 'Avg RTT',
+      data: avgRtts,
+      backgroundColor: ['A-B','A-C','B-C'].map(id => linkColors[id].fill),
+      borderColor: ['A-B','A-C','B-C'].map(id => linkColors[id].line),
+      borderWidth: 1
+    }];
+    charts.stats.update('none');
+  }
+
+  async function updateController() {
+    const data = await fetchJSON('/api/controller', 1500);
+    controllerCache = data;
+    controllerCacheTs = Date.now();
+
+    const ds = [];
+    ['A','B','C'].forEach(nid => {
+      const d = data.timeseries[nid];
+      ds.push({
+        label: `${nid} desired`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.desired[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        borderDash: [5,5],
+        spanGaps: false
+      });
+      ds.push({
+        label: `${nid} applied`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.applied[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        spanGaps: false
+      });
+    });
+    charts.controllerDelta.data.datasets = ds;
+    charts.controllerDelta.update('none');
+
+    const clipRates = ['A','B','C'].map(nid => (data.stats[nid].clip_rate || 0) * 100);
+    charts.controllerClip.data.datasets = [{
+      label: 'Clip Rate',
+      data: clipRates,
+      backgroundColor: ['A','B','C'].map(nid => colors[nid].fill),
+      borderColor: ['A','B','C'].map(nid => colors[nid].line),
+      borderWidth: 1
+    }];
+    charts.controllerClip.update('none');
+  }
+
+  async function updateKalman() {
+    const k = await fetchJSON('/api/kalman/all', 2500);
+
+    // 1) State
+    const stateDS = [];
+    ['A','B','C'].forEach(nid => {
+      const d = k.data[nid];
+      stateDS.push({
+        label: `${nid} x_offset`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.x_offset_ms[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        yAxisID: 'y',
+        spanGaps: false
+      });
+      stateDS.push({
+        label: `${nid} x_drift`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.x_drift_ppm[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        borderDash: [5,5],
+        yAxisID: 'y2',
+        spanGaps: false
+      });
+    });
+    charts.kalmanState.data.datasets = stateDS;
+    charts.kalmanState.update('none');
+
+    // 2) Covariance
+    const covDS = [];
+    ['A','B','C'].forEach(nid => {
+      const d = k.data[nid];
+      covDS.push({
+        label: `${nid} p_offset`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.p_offset_ms2[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        yAxisID: 'y',
+        spanGaps: false
+      });
+      covDS.push({
+        label: `${nid} p_drift`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.p_drift_ppm2[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        borderDash: [5,5],
+        yAxisID: 'y2',
+        spanGaps: false
+      });
+    });
+    charts.kalmanCov.data.datasets = covDS;
+    charts.kalmanCov.update('none');
+
+    // 3) Innovation
+    const innovDS = [];
+    ['A','B','C'].forEach(nid => {
+      const d = k.data[nid];
+      innovDS.push({
+        label: `${nid} innov_med`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.innov_med_ms[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        spanGaps: false
+      });
+      innovDS.push({
+        label: `${nid} innov_p95`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.innov_p95_ms[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        borderDash: [5,5],
+        spanGaps: false
+      });
+    });
+    charts.kalmanInnov.data.datasets = innovDS;
+    charts.kalmanInnov.update('none');
+
+    // 4) NIS
+    const nisDS = [];
+    ['A','B','C'].forEach(nid => {
+      const d = k.data[nid];
+      nisDS.push({
+        label: `${nid} nis_med`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.nis_med[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        spanGaps: false
+      });
+      nisDS.push({
+        label: `${nid} nis_p95`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.nis_p95[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        borderDash: [5,5],
+        spanGaps: false
+      });
+    });
+    charts.kalmanNIS.data.datasets = nisDS;
+    charts.kalmanNIS.update('none');
+
+    // 5) R_eff
+    const rDS = [];
+    ['A','B','C'].forEach(nid => {
+      const d = k.data[nid];
+      rDS.push({
+        label: `${nid} r_eff`,
+        data: d.timestamps.map((t,i)=>({x:t, y:d.r_eff_ms2[i]})),
+        borderColor: colors[nid].line,
+        backgroundColor: colors[nid].fill,
+        borderWidth: 1,
+        pointRadius: 0,
+        spanGaps: false
+      });
+    });
+    charts.kalmanR.data.datasets = rDS;
+    charts.kalmanR.update('none');
+
+    // 6) Slew detail from cached controller (NO extra fetch)
+    const ctrl = controllerCache;
+    if (ctrl && ctrl.timeseries) {
+      const slewDS = [];
+      ['A','B','C'].forEach(nid => {
+        const d = ctrl.timeseries[nid];
+
+        slewDS.push({
+          label: `${nid} desired`,
+          data: d.timestamps.map((t,i)=>({x:t, y:d.desired[i]})),
+          borderColor: colors[nid].line,
+          backgroundColor: colors[nid].fill,
+          borderWidth: 1,
+          pointRadius: 0,
+          borderDash: [5,5],
+          spanGaps: false
         });
-    </script>
-    
+
+        slewDS.push({
+          label: `${nid} applied`,
+          data: d.timestamps.map((t,i)=>({x:t, y:d.applied[i]})),
+          borderColor: colors[nid].line,
+          backgroundColor: colors[nid].fill,
+          borderWidth: 1,
+          pointRadius: 0,
+          spanGaps: false
+        });
+
+        const clippedPoints = [];
+        d.timestamps.forEach((t,i) => {
+          if (d.clipped[i] === 1) {
+            const y = (d.applied[i] != null) ? d.applied[i] : d.desired[i];
+            if (y != null) clippedPoints.push({x:t, y:y});
+          }
+        });
+
+        if (clippedPoints.length) {
+          slewDS.push({
+            label: `${nid} clipped`,
+            data: clippedPoints,
+            type: 'scatter',
+            borderColor: colors[nid].line,
+            backgroundColor: colors[nid].line,
+            pointRadius: 4,
+            pointHoverRadius: 6
+          });
+        }
+      });
+
+      charts.kalmanSlew.data.datasets = slewDS;
+      charts.kalmanSlew.update('none');
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Polling (decoupled) + backoff
+  // --------------------------------------------------------------------------
+  let stopped = false;
+  let backoffMs = 0;
+  let backoffTimer = null;
+
+  const running = {
+    sync: false,
+    links: false,
+    controller: false,
+    kalman: false
+  };
+
+  function setStatus(text) {
+    document.getElementById('update-info').textContent = text;
+    document.getElementById('time-info').textContent = nowStr();
+  }
+
+  function scheduleBackoff() {
+    if (backoffTimer) return;
+    backoffMs = Math.min(backoffMs ? backoffMs * 2 : 2000, 30000);
+    setStatus(`Error (retry in ${(backoffMs/1000).toFixed(0)}s)`);
+    backoffTimer = setTimeout(() => {
+      backoffTimer = null;
+      // one "kick" per loop
+      pollSync();
+      pollController();
+      pollLinks();
+      pollKalman();
+      setStatus("Live");
+    }, backoffMs);
+  }
+
+  async function safeRun(key, fn) {
+    if (stopped) return;
+    if (backoffTimer) return;       // if in backoff, do nothing
+    if (running[key]) return;       // prevent overlap
+    running[key] = true;
+    try {
+      await fn();
+      setStatus("Live");
+      backoffMs = 0;                // success resets backoff
+    } catch (e) {
+      console.error(`[${key}]`, e);
+      scheduleBackoff();
+    } finally {
+      running[key] = false;
+    }
+  }
+
+  // Intervals:
+  //  - sync: 2.5s
+  //  - controller: 2.5s
+  //  - links: 7.5s
+  //  - kalman: 15s
+  const T_SYNC = 2500;
+  const T_CTRL = 2500;
+  const T_LINK = 7500;
+  const T_KAL  = 15000;
+
+  let tSync=null, tCtrl=null, tLink=null, tKal=null;
+
+  function pollSync()      { safeRun('sync', updateSync); }
+  function pollController(){ safeRun('controller', updateController); }
+  function pollLinks()     { safeRun('links', updateLinks); }
+  function pollKalman()    { safeRun('kalman', updateKalman); }
+
+  function startPolling() {
+    // initial burst (but controlled)
+    pollSync();
+    pollController();
+    pollLinks();
+    pollKalman();
+
+    tSync = setInterval(pollSync, T_SYNC);
+    tCtrl = setInterval(pollController, T_CTRL);
+    tLink = setInterval(pollLinks, T_LINK);
+    tKal  = setInterval(pollKalman, T_KAL);
+  }
+
+  window.addEventListener('load', () => {
+    initCharts();
+    startPolling();
+  });
+</script>
 </body>
 </html>

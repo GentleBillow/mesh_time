@@ -30,7 +30,7 @@ from flask import Flask, jsonify, render_template, request
 from pathlib import Path
 
 # project root = /home/pi/mesh_time
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 if (ROOT_DIR / "mesh_data.sqlite").exists() and (ROOT_DIR / "config" / "nodes.json").exists():
     pass
 else:

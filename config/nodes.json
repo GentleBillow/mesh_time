@@ -2,10 +2,10 @@
   "sync": {
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 250,
+    "max_slew_per_second_ms": 20,
 
-    "coap_timeout_s": 1.5,
-    "beacon_period_s": 1,
+    "coap_timeout_s": 1.2,
+    "beacon_period_s": 0.8,
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8,
 
@@ -13,33 +13,33 @@
     "min_samples_before_log": 10,
     "log_before_warmup": true,
 
-    "jitter_window": 60,
-    "min_samples_for_jitter": 25,
+    "jitter_window": 90,
+    "min_samples_for_jitter": 30,
 
-    "max_weight": 2000.0,
+    "max_weight": 8000.0,
 
     "kalman": {
       "use_offset_gauge": true,
-      "r_offset_gauge": 4,
+      "r_offset_gauge": 25,
 
       "use_bias_gauge": true,
-      "r_bias_gauge": 800,
+      "r_bias_gauge": 2000,
 
-      "q_offset": 1e-8,
-      "q_drift": 1e-13,
+      "q_offset": 3e-8,
+      "q_drift": 3e-14,
       "q_bias": 2e-8,
 
-      "r_base": 5e-3,
+      "r_base": 2e-3,
 
       "adaptive_r": {
-        "R_min": 1e-5,
+        "R_min": 5e-6,
         "c_rtt": 1
       }
     },
 
-    "ui_window_s": 600,
-    "ui_bin_s": 1.5,
-    "ui_max_points": 6000
+    "ui_window_s": 300,
+    "ui_bin_s": 2,
+    "ui_max_points": 3000
   },
 
   "A": {

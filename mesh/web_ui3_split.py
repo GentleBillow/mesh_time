@@ -190,15 +190,16 @@ def load_snapshot(window_s: float) -> Snapshot:
             if has_k:
                 k_rows = conn.execute(
                     """
-                    SELECT created_at, node_id,
+                    SELECT created_at_s AS created_at, node_id,
                            x_offset_ms, x_drift_ppm,
                            p_offset_ms2, p_drift_ppm2,
                            innov_med_ms, innov_p95_ms,
                            nis_med, nis_p95,
                            r_eff_ms2
                     FROM diag_kalman
-                    WHERE created_at >= ?
-                    ORDER BY created_at ASC
+                    WHERE created_at_s >= ?
+                    ORDER BY created_at_s ASC
+
                     """,
                     (t_min,),
                 ).fetchall()
@@ -210,12 +211,12 @@ def load_snapshot(window_s: float) -> Snapshot:
             if has_c:
                 c_rows = conn.execute(
                     """
-                    SELECT created_at, node_id,
+                    SELECT created_at_s AS created_at, node_id,
                            delta_desired_ms, delta_applied_ms,
                            slew_clipped
                     FROM diag_controller
-                    WHERE created_at >= ?
-                    ORDER BY created_at ASC
+                    WHERE created_at_s >= ?
+                    ORDER BY created_at_s ASC
                     """,
                     (t_min,),
                 ).fetchall()

@@ -4,7 +4,7 @@
 
     "max_slew_per_second_ms": 250,
 
-    "coap_timeout_s": 0.6,
+    "coap_timeout_s": 1.5,
     "beacon_period_s": 0.5,
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8,
@@ -16,18 +16,18 @@
     "jitter_window": 60,
     "min_samples_for_jitter": 25,
 
-    "max_weight": 5000.0,
+    "max_weight": 2000.0,
 
     "kalman": {
       "use_offset_gauge": true,
       "r_offset_gauge": 4,
 
       "use_bias_gauge": true,
-      "r_bias_gauge": 400,
+      "r_bias_gauge": 800,
 
       "q_offset": 1e-7,
       "q_drift": 1e-13,
-      "q_bias": 1e-8,
+      "q_bias": 2e-8,
 
       "r_base": 5e-3,
 

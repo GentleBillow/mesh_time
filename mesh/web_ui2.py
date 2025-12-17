@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# mesh/web_ui.py
+# mesh/web_ui3_split.py
 # MeshTime Dashboard v2: "One glance" Diagnose (window=10min, no buttons)
 #
 # Fixes vs previous:

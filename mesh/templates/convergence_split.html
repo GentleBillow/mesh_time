@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>MeshTime – Kalman Internals</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 18px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 10px 12px; }
+    .title { font-weight: 700; margin: 14px 0 6px; }
+    canvas { width: 100%; max-width: 1100px; height: 340px; }
+    .hint { color: #666; font-size: 0.92rem; }
+    .small { font-size: 0.9rem; color:#444; }
+    input { width: 90px; }
+  </style>
+</head>
+<body>
+
+  <div class="row">
+    <div class="card">
+      <div class="small"><b>Status</b></div>
+      <div id="status">lade…</div>
+    </div>
+
+    <div class="card">
+      <div class="small"><b>Window</b> (Sek.)</div>
+      <div class="row">
+        <input id="window_s" type="number" min="30" step="30" value="600"/>
+        <button id="apply">anwenden</button>
+      </div>
+      <div class="hint">Tipp: 600 = 10min</div>
+    </div>
+  </div>
+
+  <div class="title">1) Kalman State (Offset, Drift)</div>
+  <canvas id="c_state"></canvas>
+
+  <div class="title">2) Kalman Covariance (P)</div>
+  <canvas id="c_cov"></canvas>
+
+  <div class="title">3) Innovation (median / p95)</div>
+  <canvas id="c_innov"></canvas>
+
+  <div class="title">4) NIS (median / p95)</div>
+  <canvas id="c_nis"></canvas>
+
+  <div class="title">5) Effective R (r_eff_ms²)</div>
+  <canvas id="c_r"></canvas>
+
+  <div class="title">8) Controller Slew (desired vs applied + clipped)</div>
+  <canvas id="c_slew"></canvas>
+
+<script>
+/* -----------------------
+   Helpers
+------------------------ */
+async function fetchJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(`HTTP ${r.status} @ ${url}`);
+  return await r.json();
+}
+
+function withAlpha(hex, a=0.65) {
+  const h = (hex || "#888888").replace("#","");
+  const r = parseInt(h.slice(0,2),16);
+  const g = parseInt(h.slice(2,4),16);
+  const b = parseInt(h.slice(4,6),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function ptsXY(t, y) {
+  const out = [];
+  const n = Math.min(t.length, y.length);
+  for (let i=0; i<n; i++) {
+    const xi = t[i];
+    const yi = y[i];
+    if (xi == null || yi == null || Number.isNaN(xi) || Number.isNaN(yi)) continue;
+    out.push({x: xi, y: yi});
+  }
+  return out;
+}
+
+function mkLineDataset(label, colorHex, dataXY, yAxisID="y", dashed=false) {
+  return {
+    label,
+    data: dataXY,
+    parsing: false,
+    borderColor: withAlpha(colorHex, 0.65),
+    backgroundColor: withAlpha(colorHex, 0.65),
+    borderWidth: 2,
+    pointRadius: 0,
+    tension: 0.15,
+    yAxisID,
+    borderDash: dashed ? [6,4] : []
+  };
+}
+
+function mkScatterDataset(label, colorHex, dataXY, yAxisID="y") {
+  return {
+    type: "scatter",
+    label,
+    data: dataXY,
+    parsing: false,
+    borderColor: withAlpha(colorHex, 0.65),
+    backgroundColor: withAlpha(colorHex, 0.65),
+    pointRadius: 3,
+    pointHoverRadius: 5,
+    yAxisID
+  };
+}
+
+function baseOptions(extra={}) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    normalized: true,
+    interaction: { mode: "nearest", intersect: false },
+    plugins: {
+      legend: { position: "top" },
+      tooltip: { callbacks: {
+        title: (items) => {
+          if (!items?.length) return "";
+          const x = items[0].parsed.x;
+          // x is epoch seconds -> show local time-ish without needing adapters
+          const d = new Date(x * 1000);
+          return d.toLocaleString();
+        }
+      } }
+    },
+    scales: {
+      x: {
+        type: "linear",
+        ticks: {
+          callback: (v) => {
+            const d = new Date(v * 1000);
+            return d.toLocaleTimeString();
+          },
+          maxTicksLimit: 8
+        }
+      },
+      y: { type: "linear" }
+    },
+    ...extra
+  };
+}
+
+/* -----------------------
+   Charts init
+------------------------ */
+const charts = {};
+
+charts.state = new Chart(
+  document.getElementById("c_state"),
+  {
+    type: "line",
+    data: { datasets: [] },
+    options: baseOptions({
+      scales: {
+        x: baseOptions().scales.x,
+        y: { type: "linear", title: { display:true, text:"x_offset (ms)" } },
+        y2: { type: "linear", position:"right", grid:{ drawOnChartArea:false }, title:{ display:true, text:"x_drift (ppm)" } }
+      }
+    })
+  }
+);
+
+charts.cov = new Chart(
+  document.getElementById("c_cov"),
+  {
+    type: "line",
+    data: { datasets: [] },
+    options: baseOptions({
+      scales: {
+        x: baseOptions().scales.x,
+        y: { type:"linear", title:{display:true, text:"p_offset (ms²)"} },
+        y2:{ type:"linear", position:"right", grid:{ drawOnChartArea:false }, title:{display:true, text:"p_drift (ppm²)"} }
+      }
+    })
+  }
+);
+
+charts.innov = new Chart(
+  document.getElementById("c_innov"),
+  {
+    type: "line",
+    data: { datasets: [] },
+    options: baseOptions({
+      scales: {
+        x: baseOptions().scales.x,
+        y: { type:"linear", title:{display:true, text:"innovation (ms)"} }
+      }
+    })
+  }
+);
+
+charts.nis = new Chart(
+  document.getElementById("c_nis"),
+  {
+    type: "line",
+    data: { datasets: [] },
+    options: baseOptions({
+      scales: {
+        x: baseOptions().scales.x,
+        y: { type:"linear", title:{display:true, text:"NIS"} }
+      }
+    })
+  }
+);
+
+charts.r = new Chart(
+  document.getElementById("c_r"),
+  {
+    type: "line",
+    data: { datasets: [] },
+    options: baseOptions({
+      scales: {
+        x: baseOptions().scales.x,
+        y: { type:"linear", title:{display:true, text:"r_eff (ms²)"} }
+      }
+    })
+  }
+);
+
+charts.slew = new Chart(
+  document.getElementById("c_slew"),
+  {
+    type: "line",
+    data: { datasets: [] },
+    options: baseOptions({
+      scales: {
+        x: baseOptions().scales.x,
+        y: { type:"linear", title:{display:true, text:"Δ (ms)"} }
+      }
+    })
+  }
+);
+
+/* -----------------------
+   Data load + render
+------------------------ */
+let META = null;
+
+function urlWithWindow(path) {
+  const ws = document.getElementById("window_s").value || "600";
+  const u = new URL(path, window.location.origin);
+  u.searchParams.set("window_s", ws);
+  return u.toString();
+}
+
+async function loadMeta() {
+  META = await fetchJSON(urlWithWindow("/api/meta"));
+  const statusEl = document.getElementById("status");
+  statusEl.textContent = `nodes=${META.nodes.length} | window=${META.window_s}s`;
+}
+
+function colorOf(node) {
+  return (META && META.colors && META.colors[node]) ? META.colors[node] : "#888888";
+}
+
+async function updateKalmanState() {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/state"));
+  const ds = [];
+  for (const r of rows) {
+    const c = colorOf(r.node);
+    ds.push(mkLineDataset(`${r.node} x_offset`, c, ptsXY(r.t, r.x_offset_ms), "y", false));
+    ds.push(mkLineDataset(`${r.node} x_drift`,  c, ptsXY(r.t, r.x_drift_ppm), "y2", true));
+  }
+  charts.state.data.datasets = ds;
+  charts.state.update();
+}
+
+async function updateKalmanCov() {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/cov"));
+  const ds = [];
+  for (const r of rows) {
+    const c = colorOf(r.node);
+    ds.push(mkLineDataset(`${r.node} p_offset`, c, ptsXY(r.t, r.p_offset_ms2), "y", false));
+    ds.push(mkLineDataset(`${r.node} p_drift`,  c, ptsXY(r.t, r.p_drift_ppm2), "y2", true));
+  }
+  charts.cov.data.datasets = ds;
+  charts.cov.update();
+}
+
+async function updateKalmanInnov() {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/innov"));
+  const ds = [];
+  for (const r of rows) {
+    const c = colorOf(r.node);
+    ds.push(mkLineDataset(`${r.node} innov_med`, c, ptsXY(r.t, r.innov_med_ms), "y", false));
+    ds.push(mkLineDataset(`${r.node} innov_p95`, c, ptsXY(r.t, r.innov_p95_ms), "y", true));
+  }
+  charts.innov.data.datasets = ds;
+  charts.innov.update();
+}
+
+async function updateKalmanNIS() {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/nis"));
+  const ds = [];
+  for (const r of rows) {
+    const c = colorOf(r.node);
+    ds.push(mkLineDataset(`${r.node} nis_med`, c, ptsXY(r.t, r.nis_med), "y", false));
+    ds.push(mkLineDataset(`${r.node} nis_p95`, c, ptsXY(r.t, r.nis_p95), "y", true));
+  }
+  charts.nis.data.datasets = ds;
+  charts.nis.update();
+}
+
+async function updateKalmanR() {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/kalman/r"));
+  const ds = [];
+  for (const r of rows) {
+    const c = colorOf(r.node);
+    ds.push(mkLineDataset(`${r.node} r_eff`, c, ptsXY(r.t, r.r_eff_ms2), "y", false));
+  }
+  charts.r.data.datasets = ds;
+  charts.r.update();
+}
+
+async function updateControllerSlew() {
+  const rows = await fetchJSON(urlWithWindow("/api/chart/controller/slew"));
+  const ds = [];
+  for (const r of rows) {
+    const c = colorOf(r.node);
+    const desiredXY = ptsXY(r.t, r.delta_desired_ms);
+    const appliedXY = ptsXY(r.t, r.delta_applied_ms);
+
+    ds.push(mkLineDataset(`${r.node} desired`, c, desiredXY, "y", true));
+    ds.push(mkLineDataset(`${r.node} applied`,  c, appliedXY, "y", false));
+
+    // clipped markers: points at applied (fallback desired) where slew_clipped==1
+    const clippedPts = [];
+    const n = Math.min(r.t.length, r.slew_clipped.length, r.delta_applied_ms.length, r.delta_desired_ms.length);
+    for (let i=0; i<n; i++) {
+      if (r.slew_clipped[i] !== 1) continue;
+      const x = r.t[i];
+      let y = r.delta_applied_ms[i];
+      if (y == null || Number.isNaN(y)) y = r.delta_desired_ms[i];
+      if (x == null || y == null || Number.isNaN(x) || Number.isNaN(y)) continue;
+      clippedPts.push({x, y});
+    }
+    if (clippedPts.length) {
+      ds.push(mkScatterDataset(`${r.node} clipped`, c, clippedPts, "y"));
+    }
+  }
+  charts.slew.data.datasets = ds;
+  charts.slew.update();
+}
+
+async function tick() {
+  try {
+    if (!META) await loadMeta();
+    await Promise.all([
+      updateKalmanState(),
+      updateKalmanCov(),
+      updateKalmanInnov(),
+      updateKalmanNIS(),
+      updateKalmanR(),
+      updateControllerSlew()
+    ]);
+    document.getElementById("status").textContent =
+      `nodes=${META.nodes.length} | window=${META.window_s}s | updated=${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    document.getElementById("status").textContent = `ERROR: ${e}`;
+  }
+}
+
+/* -----------------------
+   Controls
+------------------------ */
+document.getElementById("apply").addEventListener("click", async () => {
+  META = null;      // force reload meta with new window
+  await tick();
+});
+
+setInterval(tick, 1000);
+tick();
+</script>
+
+</body>
+</html>

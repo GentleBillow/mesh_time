@@ -182,7 +182,7 @@ class SyncModule:
         self._telemetry_sink_ip = telemetry_sink_ip
 
         # Telemetry runtime state (set in start())
-        self._client_ctx: Optional[aiocoap.Context] = None
+        self._telemetry_ctx: Optional[aiocoap.Context] = None
 
         # Cache last kalman diag (safe per instance)
         self._last_kalman_diag: Dict[str, Any] = {}
@@ -509,7 +509,7 @@ class SyncModule:
         ):
             async def _send_diag() -> None:
                 try:
-                    ctx = self._client_ctx
+                    ctx = self._telemetry_ctx
 
                     # mesh_clock
                     mc = {
@@ -832,7 +832,7 @@ class SyncModule:
                         log.debug("[%s] mesh_clock tick insert failed: %s", self.node_id, e)
 
                 # telemetry (A/B -> C) if no local storage
-                elif self._telemetry_sink_ip is not None and self._client_ctx is not None:
+                elif self._telemetry_sink_ip is not None and self._telemetry_ctx is not None:
                     try:
                         mc = {
                             "node_id": self.node_id,
@@ -847,7 +847,7 @@ class SyncModule:
                             uri=f"coap://{self._telemetry_sink_ip}/relay/ingest/mesh_clock",
                             payload=json.dumps(mc).encode("utf-8"),
                         )
-                        await asyncio.wait_for(self._client_ctx.request(req).response, timeout=self._coap_timeout)
+                        await asyncio.wait_for(self._telemetry_ctx.request(req).response, timeout=self._coap_timeout)
                     except asyncio.TimeoutError:
                         log.debug("[%s] mesh_clock tick telemetry timeout", self.node_id)
                     except Exception as e:
@@ -911,8 +911,7 @@ class SyncModule:
     # ROBUST: Start/Stop
     # -----------------------------------------------------------------
 
-    async def start(self, client_ctx: aiocoap.Context) -> None:
-        self._client_ctx = client_ctx
+    async def start(self) -> None:
 
         self._loop = asyncio.get_running_loop()
         if self._measurement_queue is None:
@@ -921,6 +920,10 @@ class SyncModule:
         if IS_WINDOWS:
             log.info("[%s] Skipping workers (Windows)", self.node_id)
             return
+
+        # only create telemetry ctx if we need it
+        if self._storage is None and self._telemetry_sink_ip is not None:
+            self._telemetry_ctx = await aiocoap.Context.create_client_context()
 
         # ALWAYS: clock tick (so root=C im Dashboard nie leer ist)
         self._worker_tasks.append(spawn_task(self._clock_tick_loop(), f"{self.node_id}:clock_tick"))
@@ -935,7 +938,7 @@ class SyncModule:
                 log.warning("[%s] No IP for peer %s", self.node_id, peer_id)
                 continue
             self._worker_tasks.append(
-                spawn_task(self._peer_worker(peer_id, peer_ip, client_ctx), f"{self.node_id}:peer:{peer_id}")
+                spawn_task(self._peer_worker(peer_id, peer_ip), f"{self.node_id}:peer:{peer_id}")
             )
 
         log.info("[%s] Started %d workers", self.node_id, len(self._worker_tasks))
@@ -951,5 +954,5 @@ class SyncModule:
         self._worker_tasks.clear()
         self._measurement_queue = None
         self._loop = None
-        self._client_ctx = None
+        self._telemetry_ctx = None
         self._last_kalman_diag = {}

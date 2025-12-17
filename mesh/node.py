@@ -164,16 +164,12 @@ class MeshNode:
             await self._stop.wait()
             return
 
-        ctx = await self._ensure_client_ctx()
-        if ctx is None:
-            return
-
         try:
-            await self.sync.start(ctx)
+            await self.sync.start()
             await self._stop.wait()
         finally:
             await self.sync.stop()
-            await self._shutdown_client_ctx()
+
 
     async def sensor_loop(self) -> None:
         assert self._stop is not None

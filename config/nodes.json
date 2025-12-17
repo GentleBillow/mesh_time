@@ -5,7 +5,7 @@
     "max_slew_per_second_ms": 250,
 
     "coap_timeout_s": 1.5,
-    "beacon_period_s": 0.5,
+    "beacon_period_s": 1,
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8,
 

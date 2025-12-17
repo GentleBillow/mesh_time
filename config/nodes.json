@@ -22,12 +22,12 @@
       "use_offset_gauge": true,
       "r_offset_gauge": 4,
 
-      "use_bias_gauge": false,
-      "r_bias_gauge": 1e-2,
+      "use_bias_gauge": true,
+      "r_bias_gauge": 400,
 
       "q_offset": 1e-7,
       "q_drift": 1e-13,
-      "q_bias": 3e-9,
+      "q_bias": 1e-8,
 
       "r_base": 5e-3,
 

@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MeshTime Convergence Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body class="bg-gray-900 text-gray-100">
+
+    <div class="container mx-auto p-6">
+
+        <!-- Header -->
+        <div class="mb-8">
+            <h1 class="text-4xl font-bold mb-2">MeshTime Convergence</h1>
+            <p class="text-gray-400">Real-time synchronization analysis</p>
+        </div>
+
+        <!-- Status Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <!-- Overall Stats -->
+            <div class="bg-gray-800 rounded-lg p-4">
+                <div class="text-sm text-gray-400 mb-1">Sync Quality</div>
+                <div id="stat-quality" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">max deviation (ms)</div>
+            </div>
+
+            <!-- Node A -->
+            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-red-500">
+                <div class="text-sm text-gray-400 mb-1">Node A</div>
+                <div id="stat-a" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">current deviation (ms)</div>
+            </div>
+
+            <!-- Node B -->
+            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-green-500">
+                <div class="text-sm text-gray-400 mb-1">Node B</div>
+                <div id="stat-b" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">current deviation (ms)</div>
+            </div>
+
+            <!-- Node C -->
+            <div class="bg-gray-800 rounded-lg p-4 border-l-4 border-blue-500">
+                <div class="text-sm text-gray-400 mb-1">Node C</div>
+                <div id="stat-c" class="text-2xl font-bold">--</div>
+                <div class="text-xs text-gray-500">current deviation (ms)</div>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- Timeline Chart (70%) -->
+            <div class="lg:col-span-2 bg-gray-800 rounded-lg p-6">
+                <h2 class="text-xl font-bold mb-4">Convergence Timeline</h2>
+                <canvas id="timeline-chart"></canvas>
+            </div>
+
+            <!-- Histogram (30%) -->
+            <div class="bg-gray-800 rounded-lg p-6">
+                <h2 class="text-xl font-bold mb-4">Deviation Distribution</h2>
+                <canvas id="histogram-chart"></canvas>
+            </div>
+
+        </div>
+
+        <!-- Footer Info -->
+        <div class="mt-6 text-center text-sm text-gray-500">
+            <span id="update-info">Updating...</span> |
+            Window: <span id="window-info">--</span>s |
+            Samples: <span id="samples-info">--</span>
+        </div>
+
+    </div>
+
+    <script>
+        // ====================================================================
+        // Chart.js Configuration
+        // ====================================================================
+
+        let timelineChart = null;
+        let histogramChart = null;
+
+        function createTimelineChart() {
+            const ctx = document.getElementById('timeline-chart');
+            timelineChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: []
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    aspectRatio: 2.5,
+                    animation: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: '#9ca3af',
+                                font: { size: 12 }
+                            }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) label += ': ';
+                                    if (context.parsed.y !== null) {
+                                        label += context.parsed.y.toFixed(3) + ' ms';
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'minute',
+                                displayFormats: {
+                                    minute: 'HH:mm'
+                                }
+                            },
+                            ticks: { color: '#9ca3af' },
+                            grid: { color: '#374151' }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Deviation from Median (ms)',
+                                color: '#9ca3af'
+                            },
+                            ticks: { color: '#9ca3af' },
+                            grid: { color: '#374151' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function createHistogramChart() {
+            const ctx = document.getElementById('histogram-chart');
+            histogramChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: []
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    aspectRatio: 1,
+                    animation: false,
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: '#9ca3af',
+                                font: { size: 11 }
+                            }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: function(items) {
+                                    if (items.length > 0) {
+                                        return items[0].label + ' ms';
+                                    }
+                                    return '';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Deviation (ms)',
+                                color: '#9ca3af'
+                            },
+                            ticks: {
+                                color: '#9ca3af',
+                                maxTicksLimit: 8,
+                                callback: function(value) {
+                                    return parseFloat(this.getLabelForValue(value)).toFixed(2);
+                                }
+                            },
+                            grid: { color: '#374151' }
+                        },
+                        y: {
+                            title: {
+                                display: true,
+                                text: 'Count',
+                                color: '#9ca3af'
+                            },
+                            ticks: { color: '#9ca3af' },
+                            grid: { color: '#374151' }
+                        }
+                    }
+                }
+            });
+        }
+
+        // ====================================================================
+        // Data Update
+        // ====================================================================
+
+        function updateCharts(data) {
+            if (data.error) {
+                console.warn('No data:', data.error);
+                return;
+            }
+
+            const { timeseries, histogram, stats, colors, window_s } = data;
+
+            // Update stats display
+            document.getElementById('stat-quality').textContent =
+                stats.max_abs_ms ? stats.max_abs_ms.toFixed(3) : '--';
+
+            ['A', 'B', 'C'].forEach(nid => {
+                const node = stats.nodes[nid];
+                const devMs = node && node.current_dev_ms !== null
+                    ? node.current_dev_ms.toFixed(3)
+                    : '--';
+                document.getElementById(`stat-${nid.toLowerCase()}`).textContent = devMs;
+            });
+
+            document.getElementById('window-info').textContent = window_s;
+            document.getElementById('samples-info').textContent = stats.n_samples;
+
+            // Update timeline chart
+            const timeLabels = timeseries.timestamps.map(t => new Date(t * 1000));
+
+            const timeDatasets = ['A', 'B', 'C'].map(nid => ({
+                label: `Node ${nid}`,
+                data: timeseries.deviations[nid],
+                borderColor: colors[nid].line,
+                backgroundColor: colors[nid].fill,
+                borderWidth: 2,
+                pointRadius: 0,
+                spanGaps: false
+            }));
+
+            timelineChart.data.labels = timeLabels;
+            timelineChart.data.datasets = timeDatasets;
+            timelineChart.update('none');
+
+            // Update histogram chart
+            const binEdges = histogram.bin_edges;
+            const binCenters = [];
+            for (let i = 0; i < binEdges.length - 1; i++) {
+                binCenters.push(((binEdges[i] + binEdges[i+1]) / 2).toFixed(3));
+            }
+
+            const histDatasets = ['C', 'B', 'A'].map(nid => ({  // C-B-A order for layering
+                label: `Node ${nid}`,
+                data: histogram.counts[nid],
+                backgroundColor: colors[nid].fill,
+                borderColor: colors[nid].line,
+                borderWidth: 1
+            }));
+
+            histogramChart.data.labels = binCenters;
+            histogramChart.data.datasets = histDatasets;
+            histogramChart.update('none');
+
+            // Update timestamp
+            const now = new Date().toLocaleTimeString();
+            document.getElementById('update-info').textContent = `Updated: ${now}`;
+        }
+
+        // ====================================================================
+        // Auto-refresh
+        // ====================================================================
+
+        async function fetchData() {
+            try {
+                const response = await fetch('/api/convergence');
+                const data = await response.json();
+                updateCharts(data);
+            } catch (err) {
+                console.error('Fetch error:', err);
+            }
+        }
+
+        // ====================================================================
+        // Init
+        // ====================================================================
+
+        window.addEventListener('load', () => {
+            createTimelineChart();
+            createHistogramChart();
+
+            // Initial fetch
+            fetchData();
+
+            // Auto-refresh every 3 seconds
+            setInterval(fetchData, 3000);
+        });
+
+    </script>
+
+</body>
+</html>

@@ -25,7 +25,7 @@
       "use_bias_gauge": true,
       "r_bias_gauge": 800,
 
-      "q_offset": 1e-7,
+      "q_offset": 1e-8,
       "q_drift": 1e-13,
       "q_bias": 2e-8,
 

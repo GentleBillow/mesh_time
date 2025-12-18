@@ -4,17 +4,17 @@
   },
 
   "sync": {
-    "ingest_ntp_every": 3,
-    "ingest_mesh_clock_every": 2,
-    "ingest_link_every": 8,
-    "ingest_obs_link_every": 8,
-    "ingest_diag_controller_every": 5,
-    "ingest_diag_kalman_every": 8,
-    "ingest_sensor_every": 3,
+    "ingest_ntp_every": 2,
+    "ingest_mesh_clock_every": 1,
+    "ingest_link_every": 10,
+    "ingest_obs_link_every": 10,
+    "ingest_diag_controller_every": 10,
+    "ingest_diag_kalman_every": 10,
+    "ingest_sensor_every": 5,
 
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 100,
+    "max_slew_per_second_ms": 250,
 
     "coap_timeout_s": 1.2,
     "beacon_period_s": 0.8,

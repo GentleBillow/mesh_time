@@ -15,6 +15,9 @@ from typing import Any, Dict, Optional
 import aiocoap
 import aiocoap.resource as resource
 
+from aiocoap.numbers.codes import Code
+
+
 JSON_CF = aiocoap.numbers.media_types_rev.get("application/json", 0)
 
 
@@ -63,6 +66,8 @@ class SyncBeaconResource(resource.Resource):
       }
     """
 
+
+
     def __init__(self, node):
         super().__init__()
         self.node = node
@@ -75,9 +80,14 @@ class SyncBeaconResource(resource.Resource):
             sync_cfg = {}
         self._debug = bool(sync_cfg.get("coap_debug", False))
 
+
     async def render_post(self, request):
         t2 = time.monotonic()
         data = _safe_json(request.payload)
+
+        # --- secure measurement endpoint (optional via PSK) ---
+        if not self.node.sync.verify_beacon(data):
+            return aiocoap.Message(code=Code.UNAUTHORIZED)
 
         src = data.get("src")
         dst = data.get("dst", self.node.id)
@@ -119,7 +129,7 @@ class DisturbResource(resource.Resource):
     POST /sync/disturb
 
     JSON:
-      { "delta": <float seconds> }
+      { "src": "<sender_id>", "dst": "<receiver_id>", "delta": <float seconds>, "auth": "<hmac>" }
     """
 
     def __init__(self, node):
@@ -128,6 +138,11 @@ class DisturbResource(resource.Resource):
 
     async def render_post(self, request):
         data = _safe_json(request.payload)
+
+        # Require auth if PSK enabled
+        if not self.node.sync.verify_disturb(data):
+            return aiocoap.Message(code=Code.UNAUTHORIZED)
+
         try:
             delta = float(data.get("delta", 0.0))
         except Exception:
@@ -137,6 +152,7 @@ class DisturbResource(resource.Resource):
             self.node.sync.inject_disturbance(delta)
 
         return aiocoap.Message(code=aiocoap.CHANGED)
+
 
 
 class StatusResource(resource.Resource):

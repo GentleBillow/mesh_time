@@ -15,6 +15,10 @@ from typing import Dict, List, Optional, Tuple, Any, Callable
 
 import concurrent.futures
 
+import hashlib
+import hmac
+
+
 import aiocoap
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -172,6 +176,7 @@ class SyncModule:
             sync_cfg: Optional[Dict[str, Any]] = None,
             storage=None,
             telemetry_sink_ip: Optional[str] = None,
+            psk: Optional[str] = None,
     ) -> None:
         sync_cfg = sync_cfg or {}
 
@@ -180,6 +185,8 @@ class SyncModule:
         self.neighbor_ips = dict(neighbor_ips)
         self._storage = storage
         self._telemetry_sink_ip = telemetry_sink_ip
+        self._psk = (psk or "").strip() or None
+
 
         # Telemetry runtime state (set in start())
         self._telemetry_ctx: Optional[aiocoap.Context] = None
@@ -253,6 +260,70 @@ class SyncModule:
         self._measurement_queue: Optional[asyncio.Queue] = None
         self._worker_tasks: List[asyncio.Task] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _beacon_mac_payload(self, data: Dict[str, Any]) -> bytes:
+        """
+        Canonical bytes for HMAC over the fields that must not be forged.
+        Keep it stable: same formatting everywhere.
+        """
+        src = str(data.get("src", ""))
+        dst = str(data.get("dst", ""))
+        t1 = float(data.get("t1", 0.0))
+        boot_epoch = float(data.get("boot_epoch", 0.0))
+        offset = float(data.get("offset", 0.0))
+
+        # stable canonical string
+        s = f"{src}|{dst}|{t1:.9f}|{boot_epoch:.6f}|{offset:.9f}"
+        return s.encode("utf-8")
+
+    def sign_beacon(self, data: Dict[str, Any]) -> Optional[str]:
+        """Return hex HMAC, or None if PSK disabled."""
+        if not self._psk:
+            return None
+        mac = hmac.new(self._psk.encode("utf-8"), self._beacon_mac_payload(data), hashlib.sha256)
+        return mac.hexdigest()
+
+    def verify_beacon(self, data: Dict[str, Any]) -> bool:
+        """Verify HMAC if PSK enabled. Backward-compatible when PSK is None."""
+        if not self._psk:
+            return True  # security disabled → accept
+        got = str(data.get("auth", "") or "")
+        if not got:
+            return False
+        exp = self.sign_beacon({k: data.get(k) for k in ("src", "dst", "t1", "boot_epoch", "offset")})
+        if exp is None:
+            return False
+        return hmac.compare_digest(got, exp)
+
+    def _disturb_mac_payload(self, data: Dict[str, Any]) -> bytes:
+        """
+        Canonical bytes for HMAC over disturb command.
+        Keep stable formatting everywhere.
+        """
+        src = str(data.get("src", ""))
+        delta = float(data.get("delta", 0.0))
+        # include target too (prevents copy between nodes)
+        dst = str(data.get("dst", ""))
+        s = f"{src}|{dst}|{delta:.9f}"
+        return s.encode("utf-8")
+
+    def sign_disturb(self, data: Dict[str, Any]) -> Optional[str]:
+        if not self._psk:
+            return None
+        mac = hmac.new(self._psk.encode("utf-8"), self._disturb_mac_payload(data), hashlib.sha256)
+        return mac.hexdigest()
+
+    def verify_disturb(self, data: Dict[str, Any]) -> bool:
+        if not self._psk:
+            return True
+        got = str(data.get("auth", "") or "")
+        if not got:
+            return False
+        exp = self.sign_disturb({k: data.get(k) for k in ("src", "dst", "delta")})
+        if exp is None:
+            return False
+        return hmac.compare_digest(got, exp)
+
 
     # -----------------------------------------------------------------
     # Public API
@@ -779,6 +850,10 @@ class SyncModule:
                     "boot_epoch": self._boot_epoch,
                     "offset": self._offset,
                 }
+
+                auth = self.sign_beacon(payload)
+                if auth is not None:
+                    payload["auth"] = auth
 
                 req = aiocoap.Message(
                     code=aiocoap.POST,

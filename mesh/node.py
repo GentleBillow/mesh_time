@@ -70,6 +70,9 @@ class MeshNode:
         if self.storage is None:
             telemetry_ip = self.telemetry_sink_ip
 
+        security_cfg = (self.global_cfg.get("security", {}) or {})
+        psk = (security_cfg.get("psk") or "").strip() or None
+
         self.sync = SyncModule(
             node_id=self.id,
             neighbors=self.neighbors,
@@ -77,7 +80,9 @@ class MeshNode:
             sync_cfg=sync_cfg,
             storage=self.storage,
             telemetry_sink_ip=telemetry_ip,
+            psk=psk,  # <-- HIER NEU
         )
+        log.info("[%s] PSK %s", self.id, "ENABLED" if psk else "DISABLED")
 
         # --- CoAP contexts ---
         self._coap_server_ctx: Optional[aiocoap.Context] = None

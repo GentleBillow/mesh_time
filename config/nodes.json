@@ -1,8 +1,12 @@
 {
+  "security": {
+    "psk": "TrustTheDrift_NotTheWallClock"
+  },
+
   "sync": {
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 50,
+    "max_slew_per_second_ms": 30,
 
     "coap_timeout_s": 1.2,
     "beacon_period_s": 0.8,
@@ -43,7 +47,7 @@
   },
 
   "A": {
-    "ip": "192.168.178.59",
+    "ip": "172.16.32.171",
     "parent": "C",
     "telemetry_sink": "C",
     "neighbors": ["C", "B"],
@@ -53,7 +57,7 @@
   },
 
   "C": {
-    "ip": "192.168.178.49",
+    "ip": "172.16.32.136",
     "parent": null,
     "telemetry_sink": "C",
     "neighbors": ["A", "B"],
@@ -65,7 +69,7 @@
   },
 
   "B": {
-    "ip": "192.168.178.60",
+    "ip": "172.16.32.172",
     "parent": "C",
     "telemetry_sink": "C",
     "neighbors": ["A", "C"],

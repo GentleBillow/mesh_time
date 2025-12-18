@@ -6,10 +6,10 @@
   "sync": {
     "ingest_ntp_every": 5,
     "ingest_mesh_clock_every": 5,
-    "ingest_link_every": 20,
-    "ingest_obs_link_every": 20,
-    "ingest_diag_controller_every": 20,
-    "ingest_diag_kalman_every": 20,
+    "ingest_link_every": 10,
+    "ingest_obs_link_every": 10,
+    "ingest_diag_controller_every": 10,
+    "ingest_diag_kalman_every": 10,
     "ingest_sensor_every": 5,
 
     "controller": "kalman",
@@ -17,7 +17,7 @@
     "max_slew_per_second_ms": 100,
 
     "coap_timeout_s": 1.2,
-    "beacon_period_s": 1,
+    "beacon_period_s": 2,
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8,
 
@@ -38,7 +38,7 @@
       "r_bias_gauge": 2000,
 
       "q_offset": 1e-8,
-      "q_drift": 3e-8,
+      "q_drift": 3e-10,
       "q_bias": 5e-8,
 
       "r_base": 2e-5,

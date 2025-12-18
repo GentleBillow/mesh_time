@@ -44,7 +44,7 @@
       "r_base": 2e-5,
 
       "adaptive_r": {
-        "R_min": 8e-6,
+        "R_min": 1e-5,
         "c_rtt": 1
       }
     },

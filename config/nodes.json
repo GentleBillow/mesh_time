@@ -14,7 +14,7 @@
 
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 50,
+    "max_slew_per_second_ms": 100,
 
     "coap_timeout_s": 1.2,
     "beacon_period_s": 1,
@@ -25,23 +25,23 @@
     "min_samples_before_log": 10,
     "log_before_warmup": true,
 
-    "jitter_window": 90,
-    "min_samples_for_jitter": 30,
+    "jitter_window": 50,
+    "min_samples_for_jitter": 25,
 
     "max_weight": 5000.0,
 
     "kalman": {
       "use_offset_gauge": true,
-      "r_offset_gauge": 5,
+      "r_offset_gauge": 20,
 
       "use_bias_gauge": true,
       "r_bias_gauge": 2000,
 
-      "q_offset": 5e-8,
-      "q_drift": 3e-14,
+      "q_offset": 1e-8,
+      "q_drift": 3e-13,
       "q_bias": 5e-8,
 
-      "r_base": 1e-3,
+      "r_base": 2e-5,
 
       "adaptive_r": {
         "R_min": 8e-6,

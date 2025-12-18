@@ -5,11 +5,11 @@
 
   "sync": {
     "ingest_ntp_every": 5,
-    "ingest_mesh_clock_every": 5,
-    "ingest_link_every": 10,
-    "ingest_obs_link_every": 10,
-    "ingest_diag_controller_every": 10,
-    "ingest_diag_kalman_every": 10,
+    "ingest_mesh_clock_every": 1,
+    "ingest_link_every": 20,
+    "ingest_obs_link_every": 20,
+    "ingest_diag_controller_every": 20,
+    "ingest_diag_kalman_every": 20,
     "ingest_sensor_every": 5,
 
     "controller": "kalman",

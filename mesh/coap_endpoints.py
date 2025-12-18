@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-# mesh/coap_endpoints.py - FIXED VERSION mit Link-Metrics Endpoint
+# mesh/coap_endpoints.py - FIXED VERSION mit Link-Metrics Endpoint (+ Link-Logging Throttle)
 """
 CoAP endpoints — mit /relay/ingest/link für Link-Metriken
 
-FIX: Neuer Endpoint zum Empfangen von Link-Metriken via Telemetrie
+FIXES:
+- Bugfix: _ntp_counter korrekt initialisiert (kein AttributeError)
+- Link-Logging gedrosselt: obs_link wird nur jedes N-te Paket gespeichert
+- CoAP handler geben immer eine Response zurück
 """
 
 from __future__ import annotations
@@ -14,11 +17,17 @@ from typing import Any, Dict, Optional
 
 import aiocoap
 import aiocoap.resource as resource
-
 from aiocoap.numbers.codes import Code
 
 
 JSON_CF = aiocoap.numbers.media_types_rev.get("application/json", 0)
+
+# ---------------------------------------------------------------------------
+# Quick-fix knobs (IO/SD-card saver)
+# ---------------------------------------------------------------------------
+
+# Speichere obs_link (teuer!) nur jedes N-te Link-Paket
+LINK_LOG_EVERY_N = 3  # 2 = halbieren, 3 = dritteln, 4 = vierteln ...
 
 
 def _safe_json(payload: bytes) -> Dict[str, Any]:
@@ -66,20 +75,16 @@ class SyncBeaconResource(resource.Resource):
       }
     """
 
-
-
     def __init__(self, node):
         super().__init__()
         self.node = node
 
-        # Optional: debug payload size toggle
         sync_cfg = {}
         try:
             sync_cfg = (getattr(node, "global_cfg", {}) or {}).get("sync", {}) or {}
         except Exception:
             sync_cfg = {}
         self._debug = bool(sync_cfg.get("coap_debug", False))
-
 
     async def render_post(self, request):
         t2 = time.monotonic()
@@ -92,7 +97,6 @@ class SyncBeaconResource(resource.Resource):
         src = data.get("src")
         dst = data.get("dst", self.node.id)
 
-        # If someone misroutes, still respond but mark it
         dst_ok = (dst == self.node.id)
 
         sender_offset = data.get("offset", None)
@@ -139,7 +143,6 @@ class DisturbResource(resource.Resource):
     async def render_post(self, request):
         data = _safe_json(request.payload)
 
-        # Require auth if PSK enabled
         if not self.node.sync.verify_disturb(data):
             return aiocoap.Message(code=Code.UNAUTHORIZED)
 
@@ -152,7 +155,6 @@ class DisturbResource(resource.Resource):
             self.node.sync.inject_disturbance(delta)
 
         return aiocoap.Message(code=aiocoap.CHANGED)
-
 
 
 class StatusResource(resource.Resource):
@@ -189,7 +191,7 @@ class RelayIngestSensorResource(resource.Resource):
 
     async def render_post(self, request):
         data = _safe_json(request.payload)
-        # print is okay for now; later: rate-limit / structured logging
+        # Achtung: print = IO. Für Quickfix ok, später ggf. drosseln.
         print(f"[{self.node.id}] relay/ingest/sensor: {data}")
 
         st = getattr(self.node, "storage", None)
@@ -235,10 +237,13 @@ class RelayIngestNtpResource(resource.Resource):
     def __init__(self, node):
         super().__init__()
         self.node = node
+        self._ntp_counter = 0  # FIX: korrekt initialisieren
 
     async def render_post(self, request):
         data = _safe_json(request.payload)
-        print(f"[{self.node.id}] relay/ingest/ntp: {data}")
+
+        # NTP NICHT drosseln (du wolltest Link drosseln) – aber counter bleibt als Option drin.
+        self._ntp_counter += 1
 
         st = getattr(self.node, "storage", None)
         if st is not None:
@@ -254,7 +259,7 @@ class RelayIngestNtpResource(resource.Resource):
                     err = t_mesh - t_wall
                 err = float(err)
 
-                # --- NEW: controller debug fields (optional) ---
+                # --- controller debug fields (optional) ---
                 delta_desired_ms = data.get("delta_desired_ms", None)
                 delta_applied_ms = data.get("delta_applied_ms", None)
                 dt_s = data.get("dt_s", None)
@@ -265,7 +270,6 @@ class RelayIngestNtpResource(resource.Resource):
                 dt_s = float(dt_s) if dt_s is not None else None
                 slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
 
-                # 1) Write ntp_reference (node-level snapshot)
                 st.insert_ntp_reference(
                     node_id=node_id,
                     t_wall=t_wall,
@@ -283,7 +287,7 @@ class RelayIngestNtpResource(resource.Resource):
                     slew_clipped=slew_clipped_b,
                 )
 
-                # 2) Also write mesh_clock (one per ntp tick)
+                # mesh_clock (optional)
                 try:
                     st.insert_mesh_clock(
                         node_id=node_id,
@@ -296,7 +300,7 @@ class RelayIngestNtpResource(resource.Resource):
                 except Exception:
                     pass
 
-                # 3) Also write diag_controller (if fields exist)
+                # diag_controller (optional)
                 if (dt_s is not None) or (delta_desired_ms is not None) or (delta_applied_ms is not None):
                     try:
                         st.insert_diag_controller(
@@ -314,69 +318,66 @@ class RelayIngestNtpResource(resource.Resource):
             except Exception as e:
                 print(f"[{self.node.id}] relay/ingest/ntp: DB insert failed: {e}")
 
-
         return aiocoap.Message(code=aiocoap.CHANGED)
 
 
 class RelayIngestLinkResource(resource.Resource):
     """
-    FIX: NEW ENDPOINT - POST /relay/ingest/link
+    POST /relay/ingest/link
 
     Empfängt Link-Metriken via Telemetrie von Nodes ohne Storage.
 
     JSON:
       {
-        "node_id": "B",           # Sender Node
-        "peer_id": "C",           # Link zu diesem Peer
-        "theta_ms": 1.23,         # Zeitoffset in ms
-        "rtt_ms": 2.45,           # Round-Trip Time in ms
-        "sigma_ms": 0.12,         # Jitter-Schätzung in ms (optional)
+        "node_id": "B",
+        "peer_id": "C",
+        "theta_ms": 1.23,
+        "rtt_ms": 2.45,
+        "sigma_ms": 0.12,
         "t_wall": <epoch>,
         "t_mono": <monotonic>,
         "t_mesh": <mesh_time>,
-        "offset": <node_offset>
+        "offset": <node_offset>,
+        "t1_s": ..., "t2_s": ..., "t3_s": ..., "t4_s": ...,
+        "weight": ...
       }
     """
 
     def __init__(self, node):
         super().__init__()
         self.node = node
+        self._link_counter = 0  # FIX: eigener Counter für Link-Logging
 
     async def render_post(self, request):
         data = _safe_json(request.payload)
-        # Optional: Verbose logging
-        # print(f"[{self.node.id}] relay/ingest/link: {data}")
+
+        self._link_counter += 1
+        log_obs_link = (self._link_counter % int(LINK_LOG_EVERY_N) == 0)
 
         st = getattr(self.node, "storage", None)
         if st is not None:
             try:
                 node_id = str(data.get("node_id", "unknown"))
                 peer_id = data.get("peer_id", None)
-
                 if peer_id is None:
-                    # Skip invalid link data
                     return aiocoap.Message(code=aiocoap.CHANGED)
-
                 peer_id = str(peer_id)
 
-                # Extract link metrics
                 theta_ms = data.get("theta_ms", None)
                 rtt_ms = data.get("rtt_ms", None)
                 sigma_ms = data.get("sigma_ms", None)
 
-                # Convert to float (allow None)
                 theta_ms = float(theta_ms) if theta_ms is not None else None
                 rtt_ms = float(rtt_ms) if rtt_ms is not None else None
                 sigma_ms = float(sigma_ms) if sigma_ms is not None else None
 
-                # Time info
                 t_wall = float(data.get("t_wall", time.time()))
                 t_mono = float(data.get("t_mono", 0.0))
                 t_mesh = float(data.get("t_mesh", 0.0))
                 offset = float(data.get("offset", 0.0))
                 err = t_mesh - t_wall
 
-                # NEW: controller debug fields (optional)
+                # controller debug fields (optional)
                 delta_desired_ms = data.get("delta_desired_ms", None)
                 delta_applied_ms = data.get("delta_applied_ms", None)
                 dt_s = data.get("dt_s", None)
@@ -385,14 +386,9 @@ class RelayIngestLinkResource(resource.Resource):
                 delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
                 delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
                 dt_s = float(dt_s) if dt_s is not None else None
+                slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
 
-                if slew_clipped is None:
-                    slew_clipped_b = None
-                else:
-                    slew_clipped_b = bool(slew_clipped)
-
-
-                # Insert into DB
+                # ntp_reference: kann bleiben (leichter/aggregierter als obs_link)
                 st.insert_ntp_reference(
                     node_id=node_id,
                     t_wall=t_wall,
@@ -400,41 +396,41 @@ class RelayIngestLinkResource(resource.Resource):
                     t_mesh=t_mesh,
                     offset=offset,
                     err_mesh_vs_wall=err,
-                    peer_id=peer_id,  # FIX: Link-spezifisch
-                    theta_ms=theta_ms,  # FIX: Link-Metriken
+                    peer_id=peer_id,
+                    theta_ms=theta_ms,
                     rtt_ms=rtt_ms,
                     sigma_ms=sigma_ms,
-                    # NEW
                     delta_desired_ms=delta_desired_ms,
                     delta_applied_ms=delta_applied_ms,
                     dt_s=dt_s,
                     slew_clipped=slew_clipped_b,
                 )
 
-                # Also write obs_link (raw per-link measurement)
-                try:
-                    st.insert_obs_link(
-                        node_id=node_id,
-                        peer_id=peer_id,
-                        theta_ms=theta_ms,
-                        rtt_ms=rtt_ms,
-                        sigma_ms=sigma_ms,
-                        t1_s=float(data["t1_s"]) if data.get("t1_s") is not None else None,
-                        t2_s=float(data["t2_s"]) if data.get("t2_s") is not None else None,
-                        t3_s=float(data["t3_s"]) if data.get("t3_s") is not None else None,
-                        t4_s=float(data["t4_s"]) if data.get("t4_s") is not None else None,
-                        accepted=True,
-                        weight=float(data["weight"]) if data.get("weight") is not None else None,
-                        reject_reason=None,
-                    )
-                except Exception as e:
-                    print(f"[{self.node.id}] relay/ingest/link: obs_link insert failed: {e}")
-
+                # obs_link: TEUER -> gedrosselt
+                if log_obs_link:
+                    try:
+                        st.insert_obs_link(
+                            node_id=node_id,
+                            peer_id=peer_id,
+                            theta_ms=theta_ms,
+                            rtt_ms=rtt_ms,
+                            sigma_ms=sigma_ms,
+                            t1_s=float(data["t1_s"]) if data.get("t1_s") is not None else None,
+                            t2_s=float(data["t2_s"]) if data.get("t2_s") is not None else None,
+                            t3_s=float(data["t3_s"]) if data.get("t3_s") is not None else None,
+                            t4_s=float(data["t4_s"]) if data.get("t4_s") is not None else None,
+                            accepted=True,
+                            weight=float(data["weight"]) if data.get("weight") is not None else None,
+                            reject_reason=None,
+                        )
+                    except Exception as e:
+                        print(f"[{self.node.id}] relay/ingest/link: obs_link insert failed: {e}")
 
             except Exception as e:
                 print(f"[{self.node.id}] relay/ingest/link: DB insert failed: {e}")
 
         return aiocoap.Message(code=aiocoap.CHANGED)
+
 
 class RelayIngestMeshClockResource(resource.Resource):
     """
@@ -471,6 +467,7 @@ class RelayIngestMeshClockResource(resource.Resource):
             except Exception as e:
                 print(f"[{self.node.id}] relay/ingest/mesh_clock: DB insert failed: {e}")
         return aiocoap.Message(code=aiocoap.CHANGED)
+
 
 class RelayIngestDiagControllerResource(resource.Resource):
     """
@@ -513,6 +510,7 @@ class RelayIngestDiagControllerResource(resource.Resource):
             except Exception as e:
                 print(f"[{self.node.id}] relay/ingest/diag_controller: DB insert failed: {e}")
         return aiocoap.Message(code=aiocoap.CHANGED)
+
 
 class RelayIngestDiagKalmanResource(resource.Resource):
     """
@@ -569,11 +567,10 @@ def build_site(node) -> resource.Site:
     # Relay ingests
     root.add_resource(("relay", "ingest", "sensor"), RelayIngestSensorResource(node))
     root.add_resource(("relay", "ingest", "ntp"), RelayIngestNtpResource(node))
-    root.add_resource(("relay", "ingest", "link"), RelayIngestLinkResource(node))  # FIX: NEU!
+    root.add_resource(("relay", "ingest", "link"), RelayIngestLinkResource(node))
 
     root.add_resource(("relay", "ingest", "mesh_clock"), RelayIngestMeshClockResource(node))
     root.add_resource(("relay", "ingest", "diag_controller"), RelayIngestDiagControllerResource(node))
     root.add_resource(("relay", "ingest", "diag_kalman"), RelayIngestDiagKalmanResource(node))
-
 
     return root

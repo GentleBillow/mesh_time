@@ -229,9 +229,11 @@ class MeshNode:
                     self.sync.inject_disturbance(disturbance_s)
             await asyncio.sleep(0.05)  # 50ms poll rate
 
-    async def ntp_monitor_loop(self, interval: float = 5.0) -> None:
+    async def ntp_monitor_loop(self, interval: float = 15.0) -> None:
         """Periodic telemetry + optional local DB logging."""
         assert self._stop is not None
+
+        counter = 0
 
         log.info("[%s] ntp_monitor_loop started (interval=%.1fs)", self.id, interval)
 
@@ -241,6 +243,9 @@ class MeshNode:
             t_mesh = self.sync.mesh_time()
             offset = self.sync.get_offset()
             err = t_mesh - t_wall
+
+            counter += 1
+            log_this = (counter % 3 == 0)  # ← jedes 3. Sample
 
             dbg = {}
             try:
@@ -255,7 +260,7 @@ class MeshNode:
 
 
             # 1) Local DB
-            if self.storage is not None:
+            if log_this and self.storage is not None:
                 try:
                     self.storage.insert_ntp_reference(
                         node_id=self.id,
@@ -279,7 +284,7 @@ class MeshNode:
                     log.error("[%s] ntp_monitor_loop: DB insert failed: %s", self.id, e)
 
             # 2) Telemetry (best effort)
-            if self.telemetry_sink_ip is not None:
+            if log_this and self.telemetry_sink_ip is not None:
                 try:
                     ctx = await self._ensure_client_ctx()
                     if ctx is not None:

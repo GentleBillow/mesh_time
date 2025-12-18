@@ -17,7 +17,7 @@
     "max_slew_per_second_ms": 250,
 
     "coap_timeout_s": 1.2,
-    "beacon_period_s": 0.8,
+    "beacon_period_s": 0.4,
     "beacon_slot_ms": 50.0,
     "beacon_n_slots": 8,
 
@@ -32,7 +32,7 @@
 
     "kalman": {
       "use_offset_gauge": true,
-      "r_offset_gauge": 10,
+      "r_offset_gauge": 5,
 
       "use_bias_gauge": true,
       "r_bias_gauge": 2000,
@@ -41,10 +41,10 @@
       "q_drift": 3e-14,
       "q_bias": 5e-8,
 
-      "r_base": 2e-3,
+      "r_base": 5e-4,
 
       "adaptive_r": {
-        "R_min": 5e-6,
+        "R_min": 2e-6,
         "c_rtt": 1
       }
     },

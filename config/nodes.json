@@ -14,7 +14,7 @@
 
     "controller": "kalman",
 
-    "max_slew_per_second_ms": 30,
+    "max_slew_per_second_ms": 100,
 
     "coap_timeout_s": 1.2,
     "beacon_period_s": 0.8,

@@ -237,86 +237,91 @@ class RelayIngestNtpResource(resource.Resource):
     def __init__(self, node):
         super().__init__()
         self.node = node
-        self._ntp_counter = 0  # FIX: korrekt initialisieren
+        self._ntp_counter = 0     # FIX
+        self._ntp_every_n = 3     # DB drosseln: 2 halbieren, 3 dritteln, ...
 
     async def render_post(self, request):
         data = _safe_json(request.payload)
 
-        # NTP NICHT drosseln (du wolltest Link drosseln) – aber counter bleibt als Option drin.
+        # --- THROTTLE DB WRITES (quick fix for SD / ext4 journal) ---
         self._ntp_counter += 1
+        log_this = (self._ntp_counter % self._ntp_every_n == 0)
 
         st = getattr(self.node, "storage", None)
-        if st is not None:
+        if (st is None) or (not log_this):
+            return aiocoap.Message(code=aiocoap.CHANGED)
+
+        try:
+            node_id = str(data.get("node_id", "unknown"))
+            t_wall = float(data.get("t_wall", time.time()))
+            t_mono = float(data.get("t_mono", 0.0))
+            t_mesh = float(data.get("t_mesh", 0.0))
+            offset = float(data.get("offset", 0.0))
+
+            err = data.get("err_mesh_vs_wall", None)
+            if err is None:
+                err = t_mesh - t_wall
+            err = float(err)
+
+            # controller debug fields (optional)
+            delta_desired_ms = data.get("delta_desired_ms", None)
+            delta_applied_ms = data.get("delta_applied_ms", None)
+            dt_s = data.get("dt_s", None)
+            slew_clipped = data.get("slew_clipped", None)
+
+            delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
+            delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
+            dt_s = float(dt_s) if dt_s is not None else None
+            slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
+
+            # 1) ntp_reference (node-level snapshot)
+            st.insert_ntp_reference(
+                node_id=node_id,
+                t_wall=t_wall,
+                t_mono=t_mono,
+                t_mesh=t_mesh,
+                offset=offset,
+                err_mesh_vs_wall=err,
+                peer_id=None,
+                theta_ms=None,
+                rtt_ms=None,
+                sigma_ms=None,
+                delta_desired_ms=delta_desired_ms,
+                delta_applied_ms=delta_applied_ms,
+                dt_s=dt_s,
+                slew_clipped=slew_clipped_b,
+            )
+
+            # 2) mesh_clock (optional)
             try:
-                node_id = str(data.get("node_id", "unknown"))
-                t_wall = float(data.get("t_wall", time.time()))
-                t_mono = float(data.get("t_mono", 0.0))
-                t_mesh = float(data.get("t_mesh", 0.0))
-                offset = float(data.get("offset", 0.0))
-
-                err = data.get("err_mesh_vs_wall", None)
-                if err is None:
-                    err = t_mesh - t_wall
-                err = float(err)
-
-                # --- controller debug fields (optional) ---
-                delta_desired_ms = data.get("delta_desired_ms", None)
-                delta_applied_ms = data.get("delta_applied_ms", None)
-                dt_s = data.get("dt_s", None)
-                slew_clipped = data.get("slew_clipped", None)
-
-                delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
-                delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
-                dt_s = float(dt_s) if dt_s is not None else None
-                slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
-
-                st.insert_ntp_reference(
+                st.insert_mesh_clock(
                     node_id=node_id,
-                    t_wall=t_wall,
-                    t_mono=t_mono,
-                    t_mesh=t_mesh,
-                    offset=offset,
-                    err_mesh_vs_wall=err,
-                    peer_id=None,
-                    theta_ms=None,
-                    rtt_ms=None,
-                    sigma_ms=None,
-                    delta_desired_ms=delta_desired_ms,
-                    delta_applied_ms=delta_applied_ms,
-                    dt_s=dt_s,
-                    slew_clipped=slew_clipped_b,
+                    t_wall_s=t_wall,
+                    t_mono_s=t_mono,
+                    t_mesh_s=t_mesh,
+                    offset_s=offset,
+                    err_mesh_vs_wall_s=err,
                 )
+            except Exception:
+                pass
 
-                # mesh_clock (optional)
+            # 3) diag_controller (optional)
+            if (dt_s is not None) or (delta_desired_ms is not None) or (delta_applied_ms is not None):
                 try:
-                    st.insert_mesh_clock(
+                    st.insert_diag_controller(
                         node_id=node_id,
-                        t_wall_s=t_wall,
-                        t_mono_s=t_mono,
-                        t_mesh_s=t_mesh,
-                        offset_s=offset,
-                        err_mesh_vs_wall_s=err,
+                        dt_s=dt_s,
+                        delta_desired_ms=delta_desired_ms,
+                        delta_applied_ms=delta_applied_ms,
+                        slew_clipped=slew_clipped_b,
+                        max_slew_ms_s=None,
+                        eff_eta=None,
                     )
                 except Exception:
                     pass
 
-                # diag_controller (optional)
-                if (dt_s is not None) or (delta_desired_ms is not None) or (delta_applied_ms is not None):
-                    try:
-                        st.insert_diag_controller(
-                            node_id=node_id,
-                            dt_s=dt_s,
-                            delta_desired_ms=delta_desired_ms,
-                            delta_applied_ms=delta_applied_ms,
-                            slew_clipped=slew_clipped_b,
-                            max_slew_ms_s=None,
-                            eff_eta=None,
-                        )
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                print(f"[{self.node.id}] relay/ingest/ntp: DB insert failed: {e}")
+        except Exception as e:
+            print(f"[{self.node.id}] relay/ingest/ntp: DB insert failed: {e}")
 
         return aiocoap.Message(code=aiocoap.CHANGED)
 

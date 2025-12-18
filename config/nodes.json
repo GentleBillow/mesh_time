@@ -4,6 +4,14 @@
   },
 
   "sync": {
+    "ingest_ntp_every": 3,
+    "ingest_mesh_clock_every": 2,
+    "ingest_link_every": 8,
+    "ingest_obs_link_every": 8,
+    "ingest_diag_controller_every": 5,
+    "ingest_diag_kalman_every": 8,
+    "ingest_sensor_every": 3,
+
     "controller": "kalman",
 
     "max_slew_per_second_ms": 30,

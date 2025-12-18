@@ -122,7 +122,7 @@ class SyncBeaconResource(resource.Resource):
         resp: Dict[str, Any] = {
             "t2": t2,
             "t3": t3,
-            "boot_epoch": _boot_epoch_now(),
+            "boot_epoch": float(getattr(self.node.sync, "_boot_epoch", _boot_epoch_now())),
             "offset": float(self.node.sync.get_offset()),
         }
 

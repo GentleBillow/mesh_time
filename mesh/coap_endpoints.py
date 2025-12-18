@@ -1,34 +1,35 @@
 # -*- coding: utf-8 -*-
-# mesh/coap_endpoints.py - FIXED VERSION mit Link-Metrics Endpoint (+ Link-Logging Throttle)
+# mesh/coap_endpoints.py
 """
-CoAP endpoints — mit /relay/ingest/link für Link-Metriken
+CoAP endpoints — Sync + Telemetry ingest
 
-FIXES:
-- Bugfix: _ntp_counter korrekt initialisiert (kein AttributeError)
-- Link-Logging gedrosselt: obs_link wird nur jedes N-te Paket gespeichert
-- CoAP handler geben immer eine Response zurück
+Fixes / features:
+- Robust JSON parsing
+- PSK hooks stay in SyncModule (verify_beacon / verify_disturb)
+- Throttle ingest on the sink node (reduces SQLite fsync/jbd2 commits)
+- Fix counters + always return a response
+- Optional debug payload on /sync/beacon
 """
 
 from __future__ import annotations
 
 import json
 import time
+import logging
 from typing import Any, Dict, Optional
 
 import aiocoap
 import aiocoap.resource as resource
 from aiocoap.numbers.codes import Code
 
+log = logging.getLogger("meshtime.coap")
 
 JSON_CF = aiocoap.numbers.media_types_rev.get("application/json", 0)
 
-# ---------------------------------------------------------------------------
-# Quick-fix knobs (IO/SD-card saver)
-# ---------------------------------------------------------------------------
 
-# Speichere obs_link (teuer!) nur jedes N-te Link-Paket
-LINK_LOG_EVERY_N = 3  # 2 = halbieren, 3 = dritteln, 4 = vierteln ...
-
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
 def _safe_json(payload: bytes) -> Dict[str, Any]:
     if not payload:
@@ -39,7 +40,6 @@ def _safe_json(payload: bytes) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def _json_response(obj: Dict[str, Any], code=aiocoap.CONTENT) -> aiocoap.Message:
     return aiocoap.Message(
         code=code,
@@ -47,43 +47,41 @@ def _json_response(obj: Dict[str, Any], code=aiocoap.CONTENT) -> aiocoap.Message
         content_format=JSON_CF,
     )
 
-
 def _boot_epoch_now() -> float:
-    # epoch at monotonic=0
+    # epoch at monotonic=0 (approx)
     return time.time() - time.monotonic()
 
+def _get_sync_cfg(node) -> Dict[str, Any]:
+    try:
+        return (getattr(node, "global_cfg", {}) or {}).get("sync", {}) or {}
+    except Exception:
+        return {}
+
+def _every_n(counter: int, n: int) -> bool:
+    """Return True every n-th event (n<=1 => always True)."""
+    try:
+        n = int(n)
+    except Exception:
+        n = 1
+    if n <= 1:
+        return True
+    return (counter % n) == 0
+
+
+# -----------------------------------------------------------------------------
+# Sync endpoints
+# -----------------------------------------------------------------------------
 
 class SyncBeaconResource(resource.Resource):
     """
     POST /sync/beacon
-
-    Request JSON:
-      {
-        "src": "<sender_id>",
-        "dst": "<receiver_id>",
-        "t1":  <sender_monotonic>,
-        "boot_epoch": <sender_boot_epoch>,     # strongly recommended
-        "offset": <sender_offset_seconds>
-      }
-
-    Response JSON:
-      {
-        "t2": <receiver_monotonic_at_receive>,
-        "t3": <receiver_monotonic_before_reply>,
-        "boot_epoch": <receiver_boot_epoch>,
-        "offset": <receiver_offset_seconds>
-      }
+    Secured optionally via PSK in SyncModule.verify_beacon().
     """
 
     def __init__(self, node):
         super().__init__()
         self.node = node
-
-        sync_cfg = {}
-        try:
-            sync_cfg = (getattr(node, "global_cfg", {}) or {}).get("sync", {}) or {}
-        except Exception:
-            sync_cfg = {}
+        sync_cfg = _get_sync_cfg(node)
         self._debug = bool(sync_cfg.get("coap_debug", False))
 
     async def render_post(self, request):
@@ -97,6 +95,7 @@ class SyncBeaconResource(resource.Resource):
         src = data.get("src")
         dst = data.get("dst", self.node.id)
 
+        # If someone misroutes, still respond but mark it
         dst_ok = (dst == self.node.id)
 
         sender_offset = data.get("offset", None)
@@ -131,9 +130,7 @@ class SyncBeaconResource(resource.Resource):
 class DisturbResource(resource.Resource):
     """
     POST /sync/disturb
-
-    JSON:
-      { "src": "<sender_id>", "dst": "<receiver_id>", "delta": <float seconds>, "auth": "<hmac>" }
+    Secured optionally via PSK in SyncModule.verify_disturb().
     """
 
     def __init__(self, node):
@@ -171,31 +168,35 @@ class StatusResource(resource.Resource):
         return _json_response(snapshot, code=aiocoap.CONTENT)
 
 
+# -----------------------------------------------------------------------------
+# Relay ingest endpoints (sink node writes into SQLite)
+# -----------------------------------------------------------------------------
+
 class RelayIngestSensorResource(resource.Resource):
     """
     POST /relay/ingest/sensor
-
-    Example JSON:
-      {
-        "node_id": "B",
-        "t_mesh": 1234.567,
-        "monotonic": 1230.123,
-        "value": 42.0,
-        "extra": {...}
-      }
     """
 
     def __init__(self, node):
         super().__init__()
         self.node = node
+        self._counter = 0
+        sync_cfg = _get_sync_cfg(node)
+        # e.g. 3 => write only every 3rd
+        self._every = int(sync_cfg.get("ingest_sensor_every", 1))
+        self._log_payload = bool(sync_cfg.get("ingest_log_sensor", False))
 
     async def render_post(self, request):
+        self._counter += 1
         data = _safe_json(request.payload)
-        # Achtung: print = IO. Für Quickfix ok, später ggf. drosseln.
-        print(f"[{self.node.id}] relay/ingest/sensor: {data}")
 
         st = getattr(self.node, "storage", None)
-        if st is not None:
+        do_write = _every_n(self._counter, self._every)
+
+        if self._log_payload and do_write:
+            log.info("[%s] ingest/sensor %s", self.node.id, data)
+
+        if st is not None and do_write:
             try:
                 node_id = str(data.get("node_id", "unknown"))
                 t_mesh = float(data.get("t_mesh", 0.0))
@@ -203,7 +204,6 @@ class RelayIngestSensorResource(resource.Resource):
                 monotonic_f: Optional[float] = float(monotonic) if monotonic is not None else None
                 value = data.get("value", None)
                 value_f = float(value) if value is not None else 0.0
-
                 raw_json = json.dumps(data)
 
                 st.insert_reading(
@@ -214,7 +214,7 @@ class RelayIngestSensorResource(resource.Resource):
                     raw_json=raw_json,
                 )
             except Exception as e:
-                print(f"[{self.node.id}] relay/ingest/sensor: DB insert failed: {e}")
+                log.warning("[%s] ingest/sensor DB insert failed: %s", self.node.id, type(e).__name__)
 
         return aiocoap.Message(code=aiocoap.CHANGED)
 
@@ -222,106 +222,109 @@ class RelayIngestSensorResource(resource.Resource):
 class RelayIngestNtpResource(resource.Resource):
     """
     POST /relay/ingest/ntp
-
-    JSON:
-      {
-        "node_id": "B",
-        "t_wall":  <float epoch seconds>,
-        "t_mono":  <float monotonic seconds>,
-        "t_mesh":  <float mesh time seconds>,
-        "offset":  <float seconds>,
-        "err_mesh_vs_wall": <float seconds>   # optional
-      }
+    (node-level snapshots; optional controller debug fields)
     """
 
     def __init__(self, node):
         super().__init__()
         self.node = node
-        self._ntp_counter = 0     # FIX
-        self._ntp_every_n = 3     # DB drosseln: 2 halbieren, 3 dritteln, ...
+        self._counter = 0
+        sync_cfg = _get_sync_cfg(node)
+
+        # Main knob you asked for:
+        self._every = int(sync_cfg.get("ingest_ntp_every", 3))  # default: dritteln
+        self._log_payload = bool(sync_cfg.get("ingest_log_ntp", False))
+
+        # If you want mesh_clock less frequent than ntp_reference:
+        self._mesh_clock_every = int(sync_cfg.get("ingest_mesh_clock_every", 1))
+
+        # diag_controller is usually redundant-heavy:
+        self._diag_controller_every = int(sync_cfg.get("ingest_diag_controller_every", 2))
 
     async def render_post(self, request):
+        self._counter += 1
         data = _safe_json(request.payload)
 
-        # --- THROTTLE DB WRITES (quick fix for SD / ext4 journal) ---
-        self._ntp_counter += 1
-        log_this = (self._ntp_counter % self._ntp_every_n == 0)
-
         st = getattr(self.node, "storage", None)
-        if (st is None) or (not log_this):
-            return aiocoap.Message(code=aiocoap.CHANGED)
+        do_write = _every_n(self._counter, self._every)
 
-        try:
-            node_id = str(data.get("node_id", "unknown"))
-            t_wall = float(data.get("t_wall", time.time()))
-            t_mono = float(data.get("t_mono", 0.0))
-            t_mesh = float(data.get("t_mesh", 0.0))
-            offset = float(data.get("offset", 0.0))
+        if self._log_payload and do_write:
+            log.info("[%s] ingest/ntp %s", self.node.id, data)
 
-            err = data.get("err_mesh_vs_wall", None)
-            if err is None:
-                err = t_mesh - t_wall
-            err = float(err)
-
-            # controller debug fields (optional)
-            delta_desired_ms = data.get("delta_desired_ms", None)
-            delta_applied_ms = data.get("delta_applied_ms", None)
-            dt_s = data.get("dt_s", None)
-            slew_clipped = data.get("slew_clipped", None)
-
-            delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
-            delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
-            dt_s = float(dt_s) if dt_s is not None else None
-            slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
-
-            # 1) ntp_reference (node-level snapshot)
-            st.insert_ntp_reference(
-                node_id=node_id,
-                t_wall=t_wall,
-                t_mono=t_mono,
-                t_mesh=t_mesh,
-                offset=offset,
-                err_mesh_vs_wall=err,
-                peer_id=None,
-                theta_ms=None,
-                rtt_ms=None,
-                sigma_ms=None,
-                delta_desired_ms=delta_desired_ms,
-                delta_applied_ms=delta_applied_ms,
-                dt_s=dt_s,
-                slew_clipped=slew_clipped_b,
-            )
-
-            # 2) mesh_clock (optional)
+        if st is not None and do_write:
             try:
-                st.insert_mesh_clock(
+                node_id = str(data.get("node_id", "unknown"))
+                t_wall = float(data.get("t_wall", time.time()))
+                t_mono = float(data.get("t_mono", 0.0))
+                t_mesh = float(data.get("t_mesh", 0.0))
+                offset = float(data.get("offset", 0.0))
+
+                err = data.get("err_mesh_vs_wall", None)
+                if err is None:
+                    err = t_mesh - t_wall
+                err = float(err)
+
+                # Controller debug (optional)
+                delta_desired_ms = data.get("delta_desired_ms", None)
+                delta_applied_ms = data.get("delta_applied_ms", None)
+                dt_s = data.get("dt_s", None)
+                slew_clipped = data.get("slew_clipped", None)
+
+                delta_desired_ms = float(delta_desired_ms) if delta_desired_ms is not None else None
+                delta_applied_ms = float(delta_applied_ms) if delta_applied_ms is not None else None
+                dt_s = float(dt_s) if dt_s is not None else None
+                slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
+
+                # 1) ntp_reference
+                st.insert_ntp_reference(
                     node_id=node_id,
-                    t_wall_s=t_wall,
-                    t_mono_s=t_mono,
-                    t_mesh_s=t_mesh,
-                    offset_s=offset,
-                    err_mesh_vs_wall_s=err,
+                    t_wall=t_wall,
+                    t_mono=t_mono,
+                    t_mesh=t_mesh,
+                    offset=offset,
+                    err_mesh_vs_wall=err,
+                    peer_id=None,
+                    theta_ms=None,
+                    rtt_ms=None,
+                    sigma_ms=None,
+                    delta_desired_ms=delta_desired_ms,
+                    delta_applied_ms=delta_applied_ms,
+                    dt_s=dt_s,
+                    slew_clipped=slew_clipped_b,
                 )
-            except Exception:
-                pass
 
-            # 3) diag_controller (optional)
-            if (dt_s is not None) or (delta_desired_ms is not None) or (delta_applied_ms is not None):
-                try:
-                    st.insert_diag_controller(
-                        node_id=node_id,
-                        dt_s=dt_s,
-                        delta_desired_ms=delta_desired_ms,
-                        delta_applied_ms=delta_applied_ms,
-                        slew_clipped=slew_clipped_b,
-                        max_slew_ms_s=None,
-                        eff_eta=None,
-                    )
-                except Exception:
-                    pass
+                # 2) mesh_clock (used by /api/sync) — optionally further downsampled
+                if _every_n(self._counter, self._mesh_clock_every):
+                    try:
+                        st.insert_mesh_clock(
+                            node_id=node_id,
+                            t_wall_s=t_wall,
+                            t_mono_s=t_mono,
+                            t_mesh_s=t_mesh,
+                            offset_s=offset,
+                            err_mesh_vs_wall_s=err,
+                        )
+                    except Exception:
+                        pass
 
-        except Exception as e:
-            print(f"[{self.node.id}] relay/ingest/ntp: DB insert failed: {e}")
+                # 3) diag_controller (optional & downsampled)
+                if (dt_s is not None) or (delta_desired_ms is not None) or (delta_applied_ms is not None):
+                    if _every_n(self._counter, self._diag_controller_every):
+                        try:
+                            st.insert_diag_controller(
+                                node_id=node_id,
+                                dt_s=dt_s,
+                                delta_desired_ms=delta_desired_ms,
+                                delta_applied_ms=delta_applied_ms,
+                                slew_clipped=slew_clipped_b,
+                                max_slew_ms_s=None,
+                                eff_eta=None,
+                            )
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                log.warning("[%s] ingest/ntp DB insert failed: %s", self.node.id, type(e).__name__)
 
         return aiocoap.Message(code=aiocoap.CHANGED)
 
@@ -329,38 +332,34 @@ class RelayIngestNtpResource(resource.Resource):
 class RelayIngestLinkResource(resource.Resource):
     """
     POST /relay/ingest/link
-
-    Empfängt Link-Metriken via Telemetrie von Nodes ohne Storage.
-
-    JSON:
-      {
-        "node_id": "B",
-        "peer_id": "C",
-        "theta_ms": 1.23,
-        "rtt_ms": 2.45,
-        "sigma_ms": 0.12,
-        "t_wall": <epoch>,
-        "t_mono": <monotonic>,
-        "t_mesh": <mesh_time>,
-        "offset": <node_offset>,
-        "t1_s": ..., "t2_s": ..., "t3_s": ..., "t4_s": ...,
-        "weight": ...
-      }
+    Per-link measurements (heavy!) -> THIS is usually the biggest write storm.
     """
 
     def __init__(self, node):
         super().__init__()
         self.node = node
-        self._link_counter = 0  # FIX: eigener Counter für Link-Logging
+        self._counter = 0
+        sync_cfg = _get_sync_cfg(node)
+
+        # Your main lever for the sink:
+        self._every = int(sync_cfg.get("ingest_link_every", 6))  # default: /6
+
+        # Obs_link table tends to be the *largest* churn (timestamps x 4 etc.)
+        self._obs_every = int(sync_cfg.get("ingest_obs_link_every", 6))
+
+        self._log_payload = bool(sync_cfg.get("ingest_log_link", False))
 
     async def render_post(self, request):
+        self._counter += 1
         data = _safe_json(request.payload)
 
-        self._link_counter += 1
-        log_obs_link = (self._link_counter % int(LINK_LOG_EVERY_N) == 0)
-
         st = getattr(self.node, "storage", None)
-        if st is not None:
+        do_write = _every_n(self._counter, self._every)
+
+        if self._log_payload and do_write:
+            log.info("[%s] ingest/link %s", self.node.id, data)
+
+        if st is not None and do_write:
             try:
                 node_id = str(data.get("node_id", "unknown"))
                 peer_id = data.get("peer_id", None)
@@ -382,7 +381,7 @@ class RelayIngestLinkResource(resource.Resource):
                 offset = float(data.get("offset", 0.0))
                 err = t_mesh - t_wall
 
-                # controller debug fields (optional)
+                # Controller debug (optional)
                 delta_desired_ms = data.get("delta_desired_ms", None)
                 delta_applied_ms = data.get("delta_applied_ms", None)
                 dt_s = data.get("dt_s", None)
@@ -393,14 +392,14 @@ class RelayIngestLinkResource(resource.Resource):
                 dt_s = float(dt_s) if dt_s is not None else None
                 slew_clipped_b = None if slew_clipped is None else bool(slew_clipped)
 
-                # ntp_reference: kann bleiben (leichter/aggregierter als obs_link)
+                # ntp_reference (link-specific fields)
                 st.insert_ntp_reference(
                     node_id=node_id,
                     t_wall=t_wall,
                     t_mono=t_mono,
                     t_mesh=t_mesh,
                     offset=offset,
-                    err_mesh_vs_wall=err,
+                    err_mesh_vs_wall=float(err),
                     peer_id=peer_id,
                     theta_ms=theta_ms,
                     rtt_ms=rtt_ms,
@@ -411,8 +410,8 @@ class RelayIngestLinkResource(resource.Resource):
                     slew_clipped=slew_clipped_b,
                 )
 
-                # obs_link: TEUER -> gedrosselt
-                if log_obs_link:
+                # obs_link (raw per-link measurement) — optionally even more aggressive downsampling
+                if _every_n(self._counter, self._obs_every):
                     try:
                         st.insert_obs_link(
                             node_id=node_id,
@@ -429,10 +428,10 @@ class RelayIngestLinkResource(resource.Resource):
                             reject_reason=None,
                         )
                     except Exception as e:
-                        print(f"[{self.node.id}] relay/ingest/link: obs_link insert failed: {e}")
+                        log.warning("[%s] ingest/link obs_link insert failed: %s", self.node.id, type(e).__name__)
 
             except Exception as e:
-                print(f"[{self.node.id}] relay/ingest/link: DB insert failed: {e}")
+                log.warning("[%s] ingest/link DB insert failed: %s", self.node.id, type(e).__name__)
 
         return aiocoap.Message(code=aiocoap.CHANGED)
 
@@ -440,16 +439,22 @@ class RelayIngestLinkResource(resource.Resource):
 class RelayIngestMeshClockResource(resource.Resource):
     """
     POST /relay/ingest/mesh_clock
+    If you already write mesh_clock via /relay/ingest/ntp, you can throttle this hard or disable on sender side.
     """
 
     def __init__(self, node):
         super().__init__()
         self.node = node
+        self._counter = 0
+        sync_cfg = _get_sync_cfg(node)
+        self._every = int(sync_cfg.get("ingest_mesh_clock_endpoint_every", 6))  # default: /6
 
     async def render_post(self, request):
+        self._counter += 1
         data = _safe_json(request.payload)
+
         st = getattr(self.node, "storage", None)
-        if st is not None:
+        if st is not None and _every_n(self._counter, self._every):
             try:
                 node_id = str(data.get("node_id", "unknown"))
                 t_wall_s = float(data.get("t_wall_s", time.time()))
@@ -470,7 +475,8 @@ class RelayIngestMeshClockResource(resource.Resource):
                     err_mesh_vs_wall_s=err,
                 )
             except Exception as e:
-                print(f"[{self.node.id}] relay/ingest/mesh_clock: DB insert failed: {e}")
+                log.warning("[%s] ingest/mesh_clock DB insert failed: %s", self.node.id, type(e).__name__)
+
         return aiocoap.Message(code=aiocoap.CHANGED)
 
 
@@ -482,11 +488,16 @@ class RelayIngestDiagControllerResource(resource.Resource):
     def __init__(self, node):
         super().__init__()
         self.node = node
+        self._counter = 0
+        sync_cfg = _get_sync_cfg(node)
+        self._every = int(sync_cfg.get("ingest_diag_controller_endpoint_every", 3))  # default: /3
 
     async def render_post(self, request):
+        self._counter += 1
         data = _safe_json(request.payload)
+
         st = getattr(self.node, "storage", None)
-        if st is not None:
+        if st is not None and _every_n(self._counter, self._every):
             try:
                 node_id = str(data.get("node_id", "unknown"))
                 dt_s = data.get("dt_s", None)
@@ -513,7 +524,8 @@ class RelayIngestDiagControllerResource(resource.Resource):
                     eff_eta=eff_eta,
                 )
             except Exception as e:
-                print(f"[{self.node.id}] relay/ingest/diag_controller: DB insert failed: {e}")
+                log.warning("[%s] ingest/diag_controller DB insert failed: %s", self.node.id, type(e).__name__)
+
         return aiocoap.Message(code=aiocoap.CHANGED)
 
 
@@ -525,11 +537,16 @@ class RelayIngestDiagKalmanResource(resource.Resource):
     def __init__(self, node):
         super().__init__()
         self.node = node
+        self._counter = 0
+        sync_cfg = _get_sync_cfg(node)
+        self._every = int(sync_cfg.get("ingest_diag_kalman_every", 5))  # default: /5
 
     async def render_post(self, request):
+        self._counter += 1
         data = _safe_json(request.payload)
+
         st = getattr(self.node, "storage", None)
-        if st is not None:
+        if st is not None and _every_n(self._counter, self._every):
             try:
                 node_id = str(data.get("node_id", "unknown"))
                 n_meas = int(data.get("n_meas", 0))
@@ -552,14 +569,16 @@ class RelayIngestDiagKalmanResource(resource.Resource):
                     r_eff_ms2=f("r_eff_ms2"),
                 )
             except Exception as e:
-                print(f"[{self.node.id}] relay/ingest/diag_kalman: DB insert failed: {e}")
+                log.warning("[%s] ingest/diag_kalman DB insert failed: %s", self.node.id, type(e).__name__)
+
         return aiocoap.Message(code=aiocoap.CHANGED)
 
 
+# -----------------------------------------------------------------------------
+# Build site
+# -----------------------------------------------------------------------------
+
 def build_site(node) -> resource.Site:
-    """
-    Build the CoAP resource tree for a node.
-    """
     root = resource.Site()
 
     # Sync endpoints
